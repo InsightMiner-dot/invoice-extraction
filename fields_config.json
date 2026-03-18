@@ -1,0 +1,216 @@
+{
+  "_comment": "FIELD CONFIGURATION — single source of truth. Edit this file to add/remove/alias fields. No code changes needed.",
+  "_instructions": [
+    "aliases: all label variations LLM should look for on the document (case-insensitive)",
+    "required: if true, missing value is flagged in validation",
+    "csv_column: exact column header written to output CSV",
+    "is_line_item: true = appears per row in line_items, false = appears once in header",
+    "To ADD a new field: add a new key block with aliases and csv_column. Pipeline picks it up automatically.",
+    "STRICT MODE: LLM will ONLY extract text present on document. It will NEVER infer, calculate, or assume values."
+  ],
+
+  "header_fields": {
+
+    "file_name": {
+      "csv_column": "File Name",
+      "aliases": [],
+      "required": true,
+      "source": "system",
+      "_note": "Auto-populated from file path. Not extracted from document."
+    },
+
+    "supplier_name": {
+      "csv_column": "Supplier Name",
+      "aliases": [
+        "vendor name", "vendor", "supplier", "billed by", "from",
+        "seller", "shipper name", "carrier name", "company name",
+        "service provider", "issued by"
+      ],
+      "required": true
+    },
+
+    "invoice_number": {
+      "csv_column": "Invoice Number",
+      "aliases": [
+        "invoice no", "invoice #", "inv no", "inv #", "invoice id",
+        "bill number", "bill no", "reference number", "ref no",
+        "document number", "doc no", "voucher number"
+      ],
+      "required": true
+    },
+
+    "invoice_date": {
+      "csv_column": "Invoice Date",
+      "aliases": [
+        "date", "invoice date", "bill date", "issued date",
+        "date of invoice", "billing date", "transaction date", "tax invoice date"
+      ],
+      "required": true
+    },
+
+    "supplier_address": {
+      "csv_column": "Supplier Address",
+      "aliases": [
+        "vendor address", "from address", "seller address", "billed from",
+        "our address", "company address", "registered address", "head office"
+      ],
+      "required": false
+    },
+
+    "remit_to": {
+      "csv_column": "Remit To",
+      "aliases": [
+        "remit to", "payment to", "pay to", "remittance address",
+        "send payment to", "wire to", "remit payment to", "payment address"
+      ],
+      "required": false
+    },
+
+    "ship_to": {
+      "csv_column": "Ship To",
+      "aliases": [
+        "ship to", "deliver to", "delivery address", "shipped to",
+        "consignee", "destination name", "delivery name", "deliver at"
+      ],
+      "required": false
+    },
+
+    "shipper_address": {
+      "csv_column": "Shipper Address",
+      "aliases": [
+        "shipper address", "shipping address", "ship to address",
+        "consignee address", "delivery address", "delivered at address"
+      ],
+      "required": false
+    },
+
+    "bill_to": {
+      "csv_column": "Bill To (with Address)",
+      "aliases": [
+        "bill to", "billed to", "customer", "client", "invoice to",
+        "billing address", "sold to", "buyer", "purchaser"
+      ],
+      "required": false
+    },
+
+    "origin": {
+      "csv_column": "Origin",
+      "aliases": [
+        "origin", "pickup", "pick up", "from city", "from location",
+        "loading point", "point of origin", "shipper city",
+        "collected from", "source", "from port", "port of loading"
+      ],
+      "required": false
+    },
+
+    "destination": {
+      "csv_column": "Destination",
+      "aliases": [
+        "destination", "delivery", "to city", "to location",
+        "delivery point", "drop off", "consignee city", "delivered to",
+        "to port", "port of discharge", "final destination"
+      ],
+      "required": false
+    },
+
+    "total_miles": {
+      "csv_column": "Total Miles",
+      "aliases": [
+        "total miles", "miles", "mileage", "distance", "total distance",
+        "km", "kilometres", "total km", "trip distance"
+      ],
+      "required": false
+    },
+
+    "total_pieces": {
+      "csv_column": "Total Pieces",
+      "aliases": [
+        "total pieces", "total pcs", "pieces", "pcs", "total units",
+        "total packages", "total pkgs", "quantity total", "total qty",
+        "no of packages", "number of pieces"
+      ],
+      "required": false
+    },
+
+    "total_invoice_amount": {
+      "csv_column": "Total Invoice Amount",
+      "aliases": [
+        "total", "invoice total", "total amount", "amount due", "total due",
+        "net payable", "balance due", "grand total", "total charges",
+        "total invoice amount", "payable amount", "amount payable",
+        "total payable", "net amount payable"
+      ],
+      "required": true
+    },
+
+    "currency": {
+      "csv_column": "Currency",
+      "aliases": [
+        "currency", "cur", "ccy", "currency code", "invoice currency"
+      ],
+      "required": false
+    }
+
+  },
+
+  "line_item_fields": {
+
+    "description": {
+      "csv_column": "Description",
+      "aliases": [
+        "description", "desc", "service", "item", "particulars",
+        "details", "charge description", "commodity", "freight description",
+        "nature of service", "item description", "goods description"
+      ],
+      "required": true
+    },
+
+    "volume_quantity": {
+      "csv_column": "Volume/Quantity",
+      "aliases": [
+        "quantity", "qty", "volume", "vol", "count", "units",
+        "pieces", "pcs", "weight", "wt", "no of units", "nos"
+      ],
+      "required": false
+    },
+
+    "uom": {
+      "csv_column": "UOM",
+      "aliases": [
+        "uom", "unit", "unit of measure", "per", "measure",
+        "each", "ea", "lbs", "kg", "cwt", "mt", "pallet", "box", "carton"
+      ],
+      "required": false
+    },
+
+    "rate": {
+      "csv_column": "Cost/Rate",
+      "aliases": [
+        "rate", "cost", "price", "unit price", "cost per unit",
+        "rate per unit", "unit rate", "charge", "tariff", "basic rate"
+      ],
+      "required": false
+    },
+
+    "amount": {
+      "csv_column": "Amount",
+      "aliases": [
+        "amount", "total", "line total", "extended", "ext",
+        "charge", "net amount", "value", "line amount"
+      ],
+      "required": false
+    }
+
+  },
+
+  "tax_line_items": {
+    "_note": "Tax charges are extracted as separate line items with description = tax type found on document.",
+    "known_tax_labels": [
+      "tax", "gst", "cgst", "sgst", "igst", "vat", "hst", "pst", "qst",
+      "service tax", "sales tax", "excise duty", "cess", "surcharge",
+      "tds", "withholding tax", "freight tax", "fuel surcharge tax",
+      "state tax", "federal tax", "county tax", "import duty"
+    ],
+    "_instruction": "Any line matching a known_tax_label (or any label containing 'tax', 'duty', 'surcharge', 'cess') should be extracted as a separate line item row, not merged into other lines."
+  }
+}
