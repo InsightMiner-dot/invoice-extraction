@@ -1,0 +1,836 @@
+"""
+Invoice Extractor — Streamlit UI
+Azure Document Intelligence + Azure OpenAI gpt-4o-mini
+
+UI: 100% native Streamlit — no custom HTML, no CSS, no st.markdown hacks.
+Focus: working functionality first.
+"""
+
+import os
+import json
+import csv
+import io
+import re
+import time
+import hashlib
+import concurrent.futures
+from datetime import datetime
+from collections import defaultdict
+
+import streamlit as st
+import pandas as pd
+from dotenv import load_dotenv
+
+# override=True ensures .env always wins over pre-existing system env vars
+load_dotenv(override=True)
+
+# ── Azure clients — init once at startup, shared across all calls ─────────────
+try:
+    from azure.ai.formrecognizer import DocumentAnalysisClient
+    from azure.core.credentials import AzureKeyCredential
+    from openai import AzureOpenAI, RateLimitError
+
+    DI_CLIENT = DocumentAnalysisClient(
+        endpoint=os.getenv("AZURE_DI_ENDPOINT", ""),
+        credential=AzureKeyCredential(os.getenv("AZURE_DI_KEY", "")),
+    )
+    LLM_CLIENT = AzureOpenAI(
+        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT", ""),
+        api_key=os.getenv("AZURE_OPENAI_KEY", ""),
+        api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview"),
+    )
+    CLIENTS_OK    = True
+    CLIENTS_ERROR = None
+except Exception as _e:
+    DI_CLIENT     = None
+    LLM_CLIENT    = None
+    CLIENTS_OK    = False
+    CLIENTS_ERROR = str(_e)
+
+st.set_page_config(
+    page_title="Invoice Extractor",
+    page_icon="🧾",
+    layout="wide",
+)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIG HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_config(path: str) -> dict:
+    with open(path) as f:
+        return json.load(f)
+
+
+def build_csv_columns(config: dict) -> list[str]:
+    header_cols = [v["csv_column"] for v in config["header_fields"].values()]
+    li_cols     = [v["csv_column"] for v in config["line_item_fields"].values()]
+    # File Name | Page(s) | Invoice Split # | <rest of header> | <line items> | Confidence
+    return header_cols[:1] + ["Page(s)", "Invoice Split #"] + header_cols[1:] + li_cols + ["Confidence"]
+
+
+def build_extraction_schema(config: dict) -> dict:
+    header_schema = {
+        k: {
+            "type": "string or null",
+            "aliases_to_look_for": v["aliases"],
+            "csv_column": v["csv_column"],
+        }
+        for k, v in config["header_fields"].items()
+        if not v.get("source") == "system"
+    }
+    li_schema = {
+        k: {
+            "type": "string or null",
+            "aliases_to_look_for": v["aliases"],
+            "csv_column": v["csv_column"],
+        }
+        for k, v in config["line_item_fields"].items()
+    }
+    li_schema["page_number"] = {
+        "type": "integer",
+        "description": "1-based page number where this line item row appears",
+    }
+    return {
+        "header": header_schema,
+        "line_items": {
+            "_description": (
+                "All charge rows. Every tax/GST/CGST/SGST/IGST/surcharge/cess/duty "
+                "MUST be its own separate line_item. Set page_number on every item."
+            ),
+            "_tax_labels": config["tax_line_items"]["known_tax_labels"],
+            "fields": li_schema,
+        },
+    }
+
+
+def file_hash(data: bytes) -> str:
+    return hashlib.md5(data).hexdigest()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AZURE DI — page-aware layout extraction
+# ══════════════════════════════════════════════════════════════════════════════
+
+def extract_layout_by_page(pdf_bytes: bytes) -> tuple[list[dict], int]:
+    poller = DI_CLIENT.begin_analyze_document("prebuilt-layout", pdf_bytes)
+    result = poller.result()
+    total  = len(result.pages)
+
+    page_lines: dict[int, list] = defaultdict(list)
+    for page in result.pages:
+        for line in page.lines:
+            page_lines[page.page_number].append(line.content)
+
+    page_tables: dict[int, list] = defaultdict(list)
+    for t_idx, table in enumerate(result.tables):
+        rows: dict[int, dict] = {}
+        first_page = 1
+        for cell in table.cells:
+            if cell.bounding_regions:
+                first_page = cell.bounding_regions[0].page_number
+            rows.setdefault(cell.row_index, {})[cell.column_index] = cell.content
+        t_lines = [
+            " | ".join(rows[r].get(c, "").strip() for c in sorted(rows[r]))
+            for r in sorted(rows)
+        ]
+        page_tables[first_page].append((t_idx + 1, t_lines))
+
+    pages_data = []
+    for pnum in sorted(page_lines):
+        parts = [f"=== PAGE {pnum} ==="]
+        parts.extend(page_lines[pnum])
+        for t_num, t_lines in page_tables.get(pnum, []):
+            parts.append(f"--- Table {t_num} ---")
+            parts.extend(t_lines)
+        pages_data.append({"page_num": pnum, "text": "\n".join(parts)})
+
+    return pages_data, total
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MULTI-INVOICE DETECTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+INV_PATTERNS = [
+    r'\b(?:invoice|inv|bill)\s*(?:no|num|number|#|:)?\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-\/]{2,20})\b',
+    r'\b([A-Z]{2,5}[-\/]?\d{4,12})\b',
+    r'\b(INV[-\/]?\d{3,12})\b',
+]
+
+
+def detect_invoice_per_page(pages_data: list[dict]) -> dict[int, str | None]:
+    out = {}
+    for p in pages_data:
+        found = None
+        for pat in INV_PATTERNS:
+            m = re.search(pat, p["text"], re.IGNORECASE)
+            if m:
+                found = m.group(1).upper().strip()
+                break
+        out[p["page_num"]] = found
+    return out
+
+
+def group_pages_into_segments(page_inv_map: dict[int, str | None]) -> list[dict]:
+    """
+    Same inv# → extend current segment.
+    New inv# → close current, start new.
+    No inv# detected → continuation of current segment.
+    """
+    groups, curr_inv, curr_pages = [], None, []
+    for pnum in sorted(page_inv_map):
+        detected = page_inv_map[pnum]
+        if detected is None:
+            curr_pages.append(pnum)
+        elif detected == curr_inv:
+            curr_pages.append(pnum)
+        else:
+            if curr_pages:
+                groups.append({"invoice_number": curr_inv, "pages": curr_pages})
+            curr_inv, curr_pages = detected, [pnum]
+    if curr_pages:
+        groups.append({"invoice_number": curr_inv, "pages": curr_pages})
+    return groups
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LLM EXTRACTION — with retry on rate limit
+# ══════════════════════════════════════════════════════════════════════════════
+
+SYSTEM_PROMPT = """You are a strict invoice data extraction engine.
+
+RULES:
+1. ONLY extract values explicitly present as text in the document.
+2. NEVER infer, calculate, guess, or assume any value.
+3. Return null for any field not found — never guess.
+4. Extract EVERY line row as a separate object in line_items.
+5. TAX RULE: Any line with tax/GST/CGST/SGST/IGST/VAT/surcharge/cess/duty
+   → its own separate line_item with exact label as description.
+6. Set page_number (int, 1-based) on every line_item.
+7. Return ONLY valid JSON. No markdown, no explanation."""
+
+
+def extract_with_llm(
+    segment_text: str, schema: dict, page_hint: str, max_retries: int = 3
+) -> dict:
+    user_msg = (
+        f"Extract all invoice data from pages: {page_hint}\n\n"
+        f"Return JSON matching this structure:\n{json.dumps(schema, indent=2)}\n\n"
+        f"Rules:\n"
+        f"- null for missing fields (not empty string).\n"
+        f"- Tax/GST/CGST/SGST/IGST/surcharge → separate line_item rows only.\n"
+        f"- page_number on every line item.\n"
+        f"- Do NOT infer. Extract only text present on the document.\n\n"
+        f"=== DOCUMENT PAGES ===\n{segment_text}"
+    )
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = LLM_CLIENT.chat.completions.create(
+                model=os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini"),
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user",   "content": user_msg},
+                ],
+                temperature=0,
+                max_tokens=4096,
+                response_format={"type": "json_object"},
+            )
+            return json.loads(resp.choices[0].message.content)
+        except RateLimitError:
+            if attempt < max_retries:
+                time.sleep(2 ** attempt)   # 2s, 4s, 8s
+            else:
+                raise
+        except json.JSONDecodeError:
+            if attempt < max_retries:
+                time.sleep(1)
+            else:
+                raise
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VALIDATION + CONFIDENCE SCORING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def validate_and_score(
+    extracted: dict, config: dict,
+    file_name: str, pages: list[int], split_num: int,
+) -> tuple[dict, float, list[str]]:
+    issues, checks = [], 0
+    header     = extracted.get("header", {})
+    line_items = extracted.get("line_items", [])
+
+    for key, meta in config["header_fields"].items():
+        if meta.get("source") == "system":
+            continue
+        if meta.get("required"):
+            checks += 1
+            val = header.get(key)
+            if not val or str(val).strip().lower() in ("null", "none", ""):
+                issues.append(f"Missing required: {meta['csv_column']}")
+
+    checks += 1
+    if not line_items:
+        issues.append("No line items extracted")
+
+    try:
+        total_str = header.get("total_invoice_amount")
+        if total_str and line_items:
+            checks += 1
+            total_val = float(re.sub(r"[^\d.]", "", str(total_str)))
+            line_sum  = sum(
+                float(re.sub(r"[^\d.]", "", str(li.get("amount") or "")))
+                for li in line_items
+                if li.get("amount") and str(li.get("amount")).strip() not in ("", "null", "None")
+            )
+            if line_sum > 0 and abs(line_sum - total_val) / max(total_val, 1) > 0.05:
+                issues.append(f"Amount mismatch: lines={line_sum:.2f} total={total_val:.2f}")
+    except (ValueError, TypeError):
+        pass
+
+    confidence = round(1 - (len(issues) / max(checks, 1)), 2)
+    header["file_name"] = file_name
+    header["pages"]     = ",".join(str(p) for p in sorted(pages))
+    header["split_num"] = str(split_num)
+    return extracted, confidence, issues
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FLATTEN → CSV ROWS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def flatten_to_rows(extracted: dict, config: dict, confidence: float) -> list[dict]:
+    """One CSV row per line item. Header fields repeat on every row."""
+    header     = extracted.get("header", {})
+    line_items = extracted.get("line_items", [])
+
+    # Build header portion of every row
+    base = {}
+    for key, meta in config["header_fields"].items():
+        val = header.get(key)
+        base[meta["csv_column"]] = (
+            "" if val is None or str(val).lower() in ("null", "none") else str(val).strip()
+        )
+    base["Page(s)"]         = header.get("pages", "")
+    base["Invoice Split #"] = header.get("split_num", "1")
+    base["Confidence"]      = str(confidence)
+
+    if not line_items:
+        row = dict(base)
+        for meta in config["line_item_fields"].values():
+            row[meta["csv_column"]] = ""
+        return [row]
+
+    rows = []
+    for li in line_items:
+        row = dict(base)
+        # Use line-item page number if LLM provided it (more precise than invoice range)
+        li_page = li.get("page_number")
+        if li_page and str(li_page).strip() not in ("", "null", "None", "0"):
+            row["Page(s)"] = str(li_page)
+        for key, meta in config["line_item_fields"].items():
+            val = li.get(key)
+            row[meta["csv_column"]] = (
+                "" if val is None or str(val).lower() in ("null", "none") else str(val).strip()
+            )
+        rows.append(row)
+    return rows
+
+
+def to_csv_bytes(rows: list[dict], columns: list[str]) -> bytes:
+    buf = io.StringIO()
+    w   = csv.DictWriter(buf, fieldnames=columns, extrasaction="ignore")
+    w.writeheader()
+    w.writerows(rows)
+    return buf.getvalue().encode()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SINGLE PDF PROCESSOR  (runs inside a thread — fully isolated)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def process_one_pdf(
+    pdf_bytes: bytes,
+    file_name: str,
+    config: dict,
+    schema: dict,
+    threshold: float,
+    log_q: list,       # thread-safe via GIL on list.append
+) -> tuple[list[dict], list[dict]]:
+    """
+    Returns (csv_rows, segment_results).
+    All exceptions caught — never propagates.
+    """
+
+    def log(msg: str, icon: str = "·"):
+        log_q.append(f"{icon}  [{file_name}] {msg}")
+
+    all_rows, seg_results = [], []
+
+    try:
+        log("Azure DI: extracting layout…", "📄")
+        pages_data, total_pages = extract_layout_by_page(pdf_bytes)
+        log(f"{total_pages} page(s) · {sum(len(p['text']) for p in pages_data):,} chars", "✓")
+
+        log("Detecting invoice numbers per page…", "🔍")
+        page_inv_map = detect_invoice_per_page(pages_data)
+        unique_invs  = {v for v in page_inv_map.values() if v}
+        log(f"Invoice numbers found: {unique_invs or '(none — treating as one invoice)'}", "✓")
+
+        groups     = group_pages_into_segments(page_inv_map)
+        multi      = len(groups) > 1
+        page_text  = {p["page_num"]: p["text"] for p in pages_data}
+
+        if multi:
+            log(f"⚠️ {len(groups)} invoice segments detected in this PDF", "⚠️")
+
+        for idx, group in enumerate(groups, 1):
+            seg_pages    = group["pages"]
+            detected_inv = group.get("invoice_number", "—")
+            page_hint    = f"pages {','.join(str(p) for p in seg_pages)} of {total_pages}"
+
+            log(f"Segment {idx}/{len(groups)}: {page_hint} | inv# {detected_inv}", "🤖")
+            seg_text = "\n\n".join(page_text[p] for p in seg_pages if p in page_text)
+
+            try:
+                extracted = extract_with_llm(seg_text, schema, page_hint)
+                extracted, conf, issues = validate_and_score(
+                    extracted, config, file_name, seg_pages, idx
+                )
+                rows   = flatten_to_rows(extracted, config, conf)
+                status = "success" if conf >= threshold else "needs_review"
+                all_rows.extend(rows)
+
+                log(
+                    f"Segment {idx} → {status} | conf={conf:.0%} | {len(rows)} row(s)",
+                    "✅" if status == "success" else "⚠️",
+                )
+                seg_results.append({
+                    "file":          file_name,
+                    "split_num":     idx,
+                    "total_splits":  len(groups),
+                    "pages":         seg_pages,
+                    "detected_inv":  detected_inv,
+                    "status":        status,
+                    "confidence":    conf,
+                    "issues":        issues,
+                    "rows":          len(rows),
+                    "extracted":     extracted,
+                    "multi_invoice": multi,
+                })
+
+            except Exception as seg_err:
+                log(f"Segment {idx} failed: {seg_err}", "❌")
+                seg_results.append({
+                    "file":          file_name,
+                    "split_num":     idx,
+                    "total_splits":  len(groups),
+                    "pages":         seg_pages,
+                    "detected_inv":  detected_inv,
+                    "status":        "error",
+                    "error":         str(seg_err),
+                    "multi_invoice": multi,
+                })
+
+    except Exception as file_err:
+        log(f"File-level failure: {file_err}", "❌")
+        seg_results.append({"file": file_name, "status": "error", "error": str(file_err)})
+
+    log(f"Done — {len(all_rows)} total rows", "🏁")
+    return all_rows, seg_results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SESSION STATE
+# ══════════════════════════════════════════════════════════════════════════════
+
+if "results"     not in st.session_state: st.session_state.results     = []
+if "all_rows"    not in st.session_state: st.session_state.all_rows    = []
+if "file_hashes" not in st.session_state: st.session_state.file_hashes = {}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIDEBAR
+# ══════════════════════════════════════════════════════════════════════════════
+
+with st.sidebar:
+    st.title("⚙️ Settings")
+
+    st.subheader("Azure credentials")
+    # Use module-level CLIENTS_OK which reflects actual client init, not just env var presence.
+    # If .env was loaded with override=True and clients initialised fine, this is True.
+    di_ok  = CLIENTS_OK
+    oai_ok = CLIENTS_OK
+    st.write("Document Intelligence:", "✅ connected" if CLIENTS_OK else "❌ not initialised")
+    st.write("Azure OpenAI:",          "✅ connected" if CLIENTS_OK else "❌ not initialised")
+    if not CLIENTS_OK:
+        st.warning("Azure clients failed to initialise. Check `.env` credentials.")
+        if CLIENTS_ERROR:
+            st.caption(f"Error: {CLIENTS_ERROR}")
+
+    st.divider()
+    st.subheader("Model")
+    st.code(os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini"))
+
+    st.divider()
+    st.subheader("Batch settings")
+    max_workers = st.slider(
+        "Concurrent files", 1, 5, 3,
+        help="PDFs processed in parallel. Keep ≤3 to stay within Azure rate limits.",
+    )
+    threshold = st.slider(
+        "Confidence threshold", 0.0, 1.0,
+        float(os.getenv("CONFIDENCE_THRESHOLD", "0.80")), 0.05,
+        help="Segments below this score are flagged for human review.",
+    )
+
+    st.divider()
+    st.subheader("Fields config")
+    config_path = st.text_input(
+        "Path to fields_config.json",
+        value=os.getenv("FIELDS_CONFIG", "./fields_config.json"),
+    )
+    try:
+        config = load_config(config_path)
+        n_h  = len(config["header_fields"])
+        n_li = len(config["line_item_fields"])
+        st.success(f"Loaded — {n_h} header + {n_li} line-item fields")
+    except Exception as e:
+        st.error(f"Cannot load config: {e}")
+        config = None
+
+    st.divider()
+    if st.button("🗑️ Clear all results"):
+        st.session_state.results     = []
+        st.session_state.all_rows    = []
+        st.session_state.file_hashes = {}
+        st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+st.title("🧾 Invoice Extractor")
+st.caption("Azure Document Intelligence  ·  gpt-4o-mini  ·  Config-driven  ·  Batch processing")
+
+tab_extract, tab_results, tab_config = st.tabs(["Extract", "Results", "Field Config"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB 1 — EXTRACT
+# ─────────────────────────────────────────────────────────────────────────────
+
+with tab_extract:
+
+    uploaded_files = st.file_uploader(
+        "Upload invoice PDFs",
+        type=["pdf"],
+        accept_multiple_files=True,
+        help="Upload one or many PDFs. Re-uploading a file replaces its previous results.",
+    )
+
+    if uploaded_files:
+        st.write(f"**{len(uploaded_files)} file(s) queued:**")
+        for uf in uploaded_files:
+            sz   = round(len(uf.getvalue()) / 1024, 1)
+            reup = (
+                uf.name in st.session_state.file_hashes
+                and st.session_state.file_hashes[uf.name] == file_hash(uf.getvalue())
+            )
+            note = "  _(re-upload — will replace existing rows)_" if reup else ""
+            st.write(f"- `{uf.name}` — {sz} KB{note}")
+
+    st.divider()
+
+    can_run = bool(uploaded_files and config and di_ok and oai_ok)
+    run_btn = st.button("▶ Run extraction", type="primary", disabled=not can_run)
+
+    if not can_run and uploaded_files:
+        if not (di_ok and oai_ok):
+            st.error("Azure credentials not set. Check the sidebar.")
+        if not config:
+            st.error("fields_config.json not loaded. Check the sidebar path.")
+
+    # ── BATCH EXECUTION ───────────────────────────────────────────────────────
+    if run_btn and uploaded_files and config:
+        schema          = build_extraction_schema(config)
+        file_bytes_map  = {uf.name: uf.getvalue() for uf in uploaded_files}
+
+        # Remove stale rows for files being re-processed
+        reprocess = set(file_bytes_map)
+        st.session_state.all_rows = [
+            r for r in st.session_state.all_rows if r.get("File Name") not in reprocess
+        ]
+        st.session_state.results = [
+            r for r in st.session_state.results if r.get("file") not in reprocess
+        ]
+
+        overall_bar  = st.progress(0, text="Starting batch…")
+        log_expander = st.expander("Live log", expanded=True)
+        log_area     = log_expander.empty()
+        log_q: list[str] = []
+
+        new_rows, new_results = [], []
+        completed = 0
+        futures: dict[concurrent.futures.Future, str] = {}
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            for uf in uploaded_files:
+                fut = pool.submit(
+                    process_one_pdf,
+                    uf.getvalue(), uf.name,
+                    config, schema, threshold, log_q,
+                )
+                futures[fut] = uf.name
+
+            pending = set(futures)
+            while pending:
+                done, pending = concurrent.futures.wait(
+                    list(pending), timeout=0.5,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for fut in done:
+                    fname = futures[fut]
+                    completed += 1
+                    overall_bar.progress(
+                        completed / len(uploaded_files),
+                        text=f"Completed {completed}/{len(uploaded_files)}: {fname}",
+                    )
+                    try:
+                        rows, segs = fut.result()
+                        new_rows.extend(rows)
+                        new_results.extend(segs)
+                        st.session_state.file_hashes[fname] = file_hash(file_bytes_map[fname])
+                    except Exception as e:
+                        new_results.append({"file": fname, "status": "error", "error": str(e)})
+
+                if log_q:
+                    log_area.text("\n".join(log_q[-25:]))
+
+        # Final log flush
+        if log_q:
+            log_area.text("\n".join(log_q))
+
+        st.session_state.all_rows.extend(new_rows)
+        st.session_state.results.extend(new_results)
+
+        overall_bar.progress(1.0, text="Batch complete!")
+        time.sleep(0.3)
+        overall_bar.empty()
+        st.rerun()
+
+    # ── BATCH SUMMARY (shown after extraction) ────────────────────────────────
+    if st.session_state.results:
+        st.divider()
+        st.subheader("Batch summary")
+
+        results = st.session_state.results
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total segments",  len(results))
+        c2.metric("✅ Success",      sum(1 for r in results if r.get("status") == "success"))
+        c3.metric("⚠️ Needs review", sum(1 for r in results if r.get("status") == "needs_review"))
+        c4.metric("❌ Errors",       sum(1 for r in results if r.get("status") == "error"))
+
+        # One-row-per-file summary table
+        by_file: dict[str, list] = defaultdict(list)
+        for r in results:
+            by_file[r["file"]].append(r)
+
+        summary = []
+        for fname, segs in by_file.items():
+            confs = [s["confidence"] for s in segs if s.get("confidence")]
+            any_err    = any(s.get("status") == "error"        for s in segs)
+            any_review = any(s.get("status") == "needs_review" for s in segs)
+            summary.append({
+                "File":           fname,
+                "Segments":       len(segs),
+                "Pages":          ", ".join(str(p) for s in segs for p in s.get("pages", [])),
+                "Status":         "❌ error" if any_err else "⚠️ review" if any_review else "✅ success",
+                "Avg confidence": f"{sum(confs)/len(confs):.0%}" if confs else "—",
+                "Rows":           sum(s.get("rows", 0) for s in segs),
+                "Multi-invoice":  "⚠️ Yes" if any(s.get("multi_invoice") for s in segs) else "No",
+            })
+        st.dataframe(pd.DataFrame(summary), use_container_width=True, hide_index=True)
+
+        # Per-segment detail in expanders
+        st.subheader("Segment details")
+        for fname, segs in by_file.items():
+            with st.expander(f"📄 {fname}  ({len(segs)} segment(s))"):
+                for seg in segs:
+                    status = seg.get("status", "error")
+                    conf   = seg.get("confidence", 0) or 0
+                    icon   = {"success": "✅", "needs_review": "⚠️", "error": "❌"}.get(status, "❓")
+
+                    st.write(
+                        f"{icon} **Split #{seg.get('split_num', 1)}**  ·  "
+                        f"pages `{seg.get('pages', [])}`  ·  "
+                        f"inv# `{seg.get('detected_inv', '—')}`  ·  "
+                        f"conf `{conf:.0%}`  ·  "
+                        f"`{seg.get('rows', 0)}` rows"
+                    )
+                    for issue in seg.get("issues", []):
+                        st.caption(f"   ⚠️ {issue}")
+                    if seg.get("error"):
+                        st.error(seg["error"])
+                    if seg.get("extracted"):
+                        with st.expander("Raw extracted JSON", expanded=False):
+                            st.json(seg["extracted"])
+                    st.divider()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB 2 — RESULTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+with tab_results:
+    if not st.session_state.all_rows:
+        st.info("No data yet. Extract invoices in the Extract tab first.")
+    else:
+        csv_cols = build_csv_columns(config) if config else list(st.session_state.all_rows[0].keys())
+        df = pd.DataFrame(st.session_state.all_rows)
+
+        # Reorder columns to match config order
+        ordered = [c for c in csv_cols if c in df.columns]
+        extra   = [c for c in df.columns if c not in ordered]
+        df = df[ordered + extra]
+
+        n_files = df["File Name"].nunique() if "File Name" in df.columns else "?"
+        st.subheader(f"Extracted data — {len(df)} rows from {n_files} file(s)")
+
+        # Filters
+        with st.expander("🔍 Filters", expanded=False):
+            fc1, fc2, fc3, fc4 = st.columns(4)
+            with fc1:
+                if "File Name" in df.columns:
+                    ff = st.multiselect("File name", sorted(df["File Name"].unique()))
+                    if ff:
+                        df = df[df["File Name"].isin(ff)]
+            with fc2:
+                if "Invoice Split #" in df.columns:
+                    sf = st.multiselect("Invoice split #", sorted(df["Invoice Split #"].dropna().unique()))
+                    if sf:
+                        df = df[df["Invoice Split #"].isin(sf)]
+            with fc3:
+                if "Page(s)" in df.columns:
+                    pg = st.text_input("Page number contains", placeholder="e.g. 2")
+                    if pg:
+                        df = df[df["Page(s)"].astype(str).str.contains(pg.strip())]
+            with fc4:
+                if "Description" in df.columns:
+                    kw = st.text_input("Description contains", placeholder="keyword")
+                    if kw:
+                        df = df[df["Description"].str.contains(kw, case=False, na=False)]
+
+        st.dataframe(df, use_container_width=True, height=420, hide_index=True)
+
+        # Downloads
+        st.subheader("Download")
+        dc1, dc2, dc3 = st.columns(3)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        with dc1:
+            st.download_button(
+                "⬇️ CSV",
+                data=to_csv_bytes(df.to_dict("records"), list(df.columns)),
+                file_name=f"invoices_{ts}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        with dc2:
+            buf = io.BytesIO()
+            df.to_excel(buf, index=False, engine="openpyxl")
+            st.download_button(
+                "⬇️ Excel",
+                data=buf.getvalue(),
+                file_name=f"invoices_{ts}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        with dc3:
+            st.download_button(
+                "⬇️ JSON (raw)",
+                data=json.dumps(st.session_state.results, indent=2, default=str).encode(),
+                file_name=f"invoices_{ts}.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+
+        # Needs-review section
+        review_segs = [r for r in st.session_state.results if r.get("status") == "needs_review"]
+        if review_segs:
+            st.divider()
+            st.subheader(f"⚠️ Needs review — {len(review_segs)} segment(s)")
+            for r in review_segs:
+                pages = ", ".join(f"p{p}" for p in r.get("pages", []))
+                with st.expander(
+                    f"{r['file']} — split #{r.get('split_num', 1)} "
+                    f"({pages}) — conf {r.get('confidence', 0):.0%}"
+                ):
+                    for issue in r.get("issues", []):
+                        st.caption(f"• {issue}")
+                    if r.get("extracted"):
+                        st.json(r["extracted"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB 3 — FIELD CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+
+with tab_config:
+    st.subheader("fields_config.json editor")
+    st.caption("Edit fields, aliases, and CSV column names. Changes apply on next extraction run.")
+
+    if config:
+        edited = st.text_area(
+            "Config JSON",
+            value=json.dumps(config, indent=2),
+            height=480,
+        )
+
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            if st.button("✅ Validate", use_container_width=True):
+                try:
+                    p    = json.loads(edited)
+                    miss = {"header_fields", "line_item_fields", "tax_line_items"} - set(p.keys())
+                    if miss:
+                        st.error(f"Missing sections: {miss}")
+                    else:
+                        st.success(
+                            f"Valid — {len(p['header_fields'])} header fields, "
+                            f"{len(p['line_item_fields'])} line-item fields"
+                        )
+                except json.JSONDecodeError as e:
+                    st.error(f"JSON syntax error: {e}")
+        with cc2:
+            if st.button("💾 Save to file", use_container_width=True):
+                try:
+                    json.loads(edited)
+                    with open(config_path, "w") as f:
+                        f.write(edited)
+                    st.success(f"Saved to {config_path}")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Save failed: {e}")
+
+        st.divider()
+        st.write("**CSV column order (auto-built from config):**")
+        st.code(" | ".join(build_csv_columns(config)))
+
+        st.write("**Add a new header field:**")
+        st.code("""{
+  "po_number": {
+    "csv_column": "PO Number",
+    "aliases": ["po number", "purchase order", "po #"],
+    "required": false
+  }
+}""", language="json")
+
+        st.write("**Add a new tax label (auto-extracted as separate line item):**")
+        st.code('"known_tax_labels": ["gst", "cgst", "your_new_tax_here"]', language="json")
+
+    else:
+        st.error(f"Could not load config from `{config_path}`. Check the path in the sidebar.")
