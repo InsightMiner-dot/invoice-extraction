@@ -1,0 +1,252 @@
+import json
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+from azure.ai.documentintelligence import DocumentIntelligenceClient
+from azure.ai.documentintelligence.models import AnalyzeResult
+from azure.ai.documentintelligence.models import AnalyzeDocumentRequest
+from azure.core.credentials import AzureKeyCredential
+
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+ENDPOINT  = "<your-endpoint>"
+KEY       = "<your-key>"
+MODEL_ID  = "prebuilt-invoice"
+PDF_PATH  = "invoice.pdf"        # path to your PDF
+OUTPUT_XL = "invoice_output.xlsx"
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def flatten_polygon(raw_poly: list) -> str:
+    """Return polygon as readable string for Excel."""
+    coords = []
+    for pt in (raw_poly or []):
+        if hasattr(pt, "x"):
+            coords.append(f"({pt.x:.3f}, {pt.y:.3f})")
+        elif isinstance(pt, dict):
+            coords.append(f"({pt['x']:.3f}, {pt['y']:.3f})")
+    return " | ".join(coords)
+
+
+def run_analysis(pdf_path: str) -> AnalyzeResult:
+    with open(pdf_path, "rb") as f:
+        pdf_bytes = f.read()
+    client = DocumentIntelligenceClient(endpoint=ENDPOINT, credential=AzureKeyCredential(KEY))
+    poller = client.begin_analyze_document(
+        MODEL_ID,
+        AnalyzeDocumentRequest(bytes_source=pdf_bytes),
+        content_type="application/json",
+    )
+    return poller.result()
+
+
+# ── Sheet builders ─────────────────────────────────────────────────────────────
+
+def build_invoice_fields(result: AnalyzeResult) -> pd.DataFrame:
+    """All named invoice fields — one row per field."""
+    rows = []
+    if result.documents:
+        for doc_idx, doc in enumerate(result.documents):
+            if not doc.fields:
+                continue
+            for field_name, field in doc.fields.items():
+                content    = field.get("content")
+                confidence = field.get("confidence")
+                br         = field.get("boundingRegions") or []
+                page       = br[0].get("pageNumber", "") if br else ""
+                raw_poly   = br[0].get("polygon", []) if br else []
+                polygon_str = flatten_polygon(raw_poly)
+                rows.append({
+                    "Document #":   doc_idx + 1,
+                    "Field Name":   field_name,
+                    "Value":        content or "",
+                    "Confidence %": round(confidence * 100, 1) if confidence else "",
+                    "Page":         page,
+                    "Bounding Box": polygon_str,
+                })
+    return pd.DataFrame(rows)
+
+
+def build_line_items(result: AnalyzeResult) -> pd.DataFrame:
+    """Invoice line items (Items array) — one row per item."""
+    rows = []
+    if result.documents:
+        for doc_idx, doc in enumerate(result.documents):
+            if not doc.fields:
+                continue
+            items_field = doc.fields.get("Items")
+            if not items_field:
+                continue
+            items_array = items_field.get("valueArray") or []
+            for i, item in enumerate(items_array):
+                obj = item.get("valueObject") or {}
+                row = {"Document #": doc_idx + 1, "Item #": i + 1}
+                for col in ["Description", "Quantity", "Unit", "UnitPrice",
+                            "ProductCode", "Date", "Tax", "Amount"]:
+                    field = obj.get(col)
+                    row[col]              = field.get("content", "") if field else ""
+                    row[f"{col} Conf %"]  = round(field.get("confidence", 0) * 100, 1) if field else ""
+                rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_kv_pairs(result: AnalyzeResult) -> pd.DataFrame:
+    """All raw key-value pairs detected."""
+    rows = []
+    if hasattr(result, "key_value_pairs") and result.key_value_pairs:
+        for kv in result.key_value_pairs:
+            key_text = kv.key.content   if kv.key   else ""
+            val_text = kv.value.content if kv.value else ""
+            conf     = round(kv.confidence * 100, 1) if kv.confidence else ""
+            page = ""
+            if kv.key and kv.key.bounding_regions:
+                page = kv.key.bounding_regions[0].page_number
+            rows.append({
+                "Key":          key_text,
+                "Value":        val_text,
+                "Confidence %": conf,
+                "Page":         page,
+            })
+    return pd.DataFrame(rows)
+
+
+def build_tables(result: AnalyzeResult) -> list[tuple[str, pd.DataFrame]]:
+    """Each detected table as its own DataFrame."""
+    dfs = []
+    if hasattr(result, "tables") and result.tables:
+        for t_idx, table in enumerate(result.tables):
+            cells = {}
+            for cell in table.cells:
+                cells[(cell.row_index, cell.column_index)] = cell.content
+            # Use row 0 as header
+            headers = [cells.get((0, c), f"Col{c+1}") for c in range(table.column_count)]
+            data = []
+            for r in range(1, table.row_count):
+                data.append([cells.get((r, c), "") for c in range(table.column_count)])
+            page = table.bounding_regions[0].page_number if table.bounding_regions else ""
+            df = pd.DataFrame(data, columns=headers)
+            dfs.append((f"Table_{t_idx+1}_P{page}", df))
+    return dfs
+
+
+def build_content(result: AnalyzeResult) -> pd.DataFrame:
+    """All paragraphs with page number."""
+    rows = []
+    if hasattr(result, "paragraphs") and result.paragraphs:
+        for i, para in enumerate(result.paragraphs):
+            page = para.bounding_regions[0].page_number if para.bounding_regions else ""
+            rows.append({
+                "Para #":  i + 1,
+                "Page":    page,
+                "Content": para.content,
+            })
+    return pd.DataFrame(rows)
+
+
+# ── Excel formatting ───────────────────────────────────────────────────────────
+
+HEADER_FILL  = PatternFill("solid", start_color="1E3A5F")
+HEADER_FONT  = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+HEADER_ALIGN = Alignment(horizontal="center", vertical="center", wrap_text=True)
+CELL_FONT    = Font(name="Arial", size=10)
+CELL_ALIGN   = Alignment(vertical="center", wrap_text=True)
+ALT_FILL     = PatternFill("solid", start_color="EBF2FF")
+
+THIN = Side(style="thin", color="CCCCCC")
+BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+
+
+def style_sheet(ws, df: pd.DataFrame):
+    """Apply consistent formatting to a worksheet."""
+    # Write headers
+    for col_idx, col_name in enumerate(df.columns, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=col_name)
+        cell.fill  = HEADER_FILL
+        cell.font  = HEADER_FONT
+        cell.alignment = HEADER_ALIGN
+        cell.border = BORDER
+
+    # Write data rows
+    for row_idx, row in enumerate(df.itertuples(index=False), start=2):
+        fill = ALT_FILL if row_idx % 2 == 0 else None
+        for col_idx, value in enumerate(row, start=1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell.font      = CELL_FONT
+            cell.alignment = CELL_ALIGN
+            cell.border    = BORDER
+            if fill:
+                cell.fill = fill
+
+    # Auto column widths
+    for col_idx, col_name in enumerate(df.columns, start=1):
+        col_values  = [str(col_name)] + [str(v) for v in df.iloc[:, col_idx - 1]]
+        max_len     = min(max(len(v) for v in col_values), 50)
+        ws.column_dimensions[get_column_letter(col_idx)].width = max_len + 4
+
+    # Freeze header row
+    ws.freeze_panes = "A2"
+    ws.row_dimensions[1].height = 30
+
+
+def write_excel(result: AnalyzeResult, output_path: str):
+    wb = Workbook()
+    wb.remove(wb.active)  # remove default sheet
+
+    # ── Sheet 1: Invoice Fields ──
+    df_fields = build_invoice_fields(result)
+    if not df_fields.empty:
+        ws = wb.create_sheet("Invoice Fields")
+        style_sheet(ws, df_fields)
+        print(f"  ✓ Invoice Fields     — {len(df_fields)} rows")
+
+    # ── Sheet 2: Line Items ──
+    df_items = build_line_items(result)
+    if not df_items.empty:
+        ws = wb.create_sheet("Line Items")
+        style_sheet(ws, df_items)
+        print(f"  ✓ Line Items         — {len(df_items)} rows")
+
+    # ── Sheet 3: Key-Value Pairs ──
+    df_kv = build_kv_pairs(result)
+    if not df_kv.empty:
+        ws = wb.create_sheet("Key-Value Pairs")
+        style_sheet(ws, df_kv)
+        print(f"  ✓ Key-Value Pairs    — {len(df_kv)} rows")
+
+    # ── Sheet 4+: Detected Tables ──
+    for sheet_name, df_table in build_tables(result):
+        ws = wb.create_sheet(sheet_name)
+        style_sheet(ws, df_table)
+        print(f"  ✓ {sheet_name:<20} — {len(df_table)} rows")
+
+    # ── Sheet: Paragraphs ──
+    df_content = build_content(result)
+    if not df_content.empty:
+        ws = wb.create_sheet("Paragraphs")
+        style_sheet(ws, df_content)
+        print(f"  ✓ Paragraphs         — {len(df_content)} rows")
+
+    # ── Sheet: Raw JSON ──
+    ws_json = wb.create_sheet("Raw JSON")
+    json_str = json.dumps(result.as_dict(), indent=2, default=str)
+    for i, line in enumerate(json_str.splitlines(), start=1):
+        cell = ws_json.cell(row=i, column=1, value=line)
+        cell.font = Font(name="Courier New", size=9)
+    ws_json.column_dimensions["A"].width = 120
+    print(f"  ✓ Raw JSON           — {i} lines")
+
+    wb.save(output_path)
+    print(f"\n✅ Saved → {output_path}")
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    print(f"Analyzing: {PDF_PATH}")
+    result = run_analysis(PDF_PATH)
+    print(f"Model: {result.model_id}")
+    print(f"Pages: {len(result.pages) if result.pages else 0}")
+    print("\nBuilding Excel...")
+    write_excel(result, OUTPUT_XL)
