@@ -35,6 +35,21 @@ render_dpi      = st.sidebar.slider("Preview DPI", 72, 300, 150, 10)
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
+def flatten_polygon(raw_poly: list) -> list:
+    """Safely flatten polygon points to [x1,y1,x2,y2,...].
+    Azure SDK returns polygon as list of objects with .x/.y attributes (inches).
+    """
+    result = []
+    for pt in (raw_poly or []):
+        if hasattr(pt, "x"):
+            result += [pt.x, pt.y]        # SDK object (most common)
+        elif isinstance(pt, dict):
+            result += [pt["x"], pt["y"]]  # dict fallback
+        elif isinstance(pt, (int, float)):
+            result.append(pt)             # already flat
+    return result
+
+
 def pdf_page_to_pil(pdf_bytes: bytes, page_num: int = 0, dpi: int = 150) -> Image.Image:
     doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[page_num]
@@ -90,9 +105,8 @@ def extract_fields(result: AnalyzeResult) -> dict:
                     confidence = field.get("confidence")
                     br         = field.get("boundingRegions") or []
                     page       = br[0].get("pageNumber", 1) if br else 1
-                    # polygon points are dicts {"x": float, "y": float} in inches
-                    raw_poly   = br[0].get("polygon", []) if br else []
-                    polygon    = [c for pt in raw_poly for c in (pt["x"], pt["y"])] if raw_poly else []
+                    raw_poly = br[0].get("polygon", []) if br else []
+                    polygon  = flatten_polygon(raw_poly)
                     fields[name] = {
                         "value":      content,
                         "confidence": round(confidence * 100, 1) if confidence else None,
@@ -112,11 +126,11 @@ def extract_kv_pairs(result: AnalyzeResult) -> list:
             key_poly, val_poly, page = [], [], 1
             if kv.key and kv.key.bounding_regions:
                 br = kv.key.bounding_regions[0]
-                key_poly = [c for pt in (br.polygon or []) for c in (pt.x, pt.y)]
+                key_poly = flatten_polygon(br.polygon or [])
                 page     = br.page_number
             if kv.value and kv.value.bounding_regions:
                 br = kv.value.bounding_regions[0]
-                val_poly = [c for pt in (br.polygon or []) for c in (pt.x, pt.y)]
+                val_poly = flatten_polygon(br.polygon or [])
             pairs.append({"key": key_text, "value": val_text, "confidence": conf,
                           "key_polygon": key_poly, "val_polygon": val_poly, "page": page})
     return pairs
