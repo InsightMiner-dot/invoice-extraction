@@ -51,6 +51,19 @@ def is_summary_field(name: str) -> bool:
 def is_summary_label(text: str) -> bool:
     return bool(SUMMARY_LABEL_RE.match(text.strip()))
 
+def is_only_summary(text: str) -> bool:
+    """True only for pure subtotal/total/amountdue — not shipping/tax/hst."""
+    t = text.strip().lower().replace(" ","").replace("-","").replace("/","")
+    # exact matches
+    if t in {"subtotal","soustotal","total","grandtotal","invoicetotal",
+             "amountdue","balance","totalamount","due"}:
+        return True
+    # combined labels like "SOUS-TOTAL SUB-TOTAL" or "TOTAL AMOUNT DUE"
+    return bool(re.match(
+        r"^(sous.?total|sub.?total|subtotal|grand.?total|invoice.?total|amount.?due|balance|^total)[\s\-/]*(sub.?total|sous.?total|total|due|balance)?$",
+        text.strip(), re.IGNORECASE
+    ))
+
 def is_charge_field(name: str) -> bool:
     n = name.lower().replace(" ","").replace("/","").replace("-","").replace("_","")
     return n in CHARGE_FIELD_NAMES
@@ -400,7 +413,7 @@ def extract_rows(filename: str, result: AnalyzeResult) -> tuple:
         for label, amount, page in charge_table_rows:
             clean_label = re.sub(r"^[\d\w]{6,}\s+", "", label).strip() or label
             # Skip if this is a summary label (subtotal/total) — those are columns not rows
-            if is_summary_label(clean_label):
+            if is_only_summary(clean_label):
                 continue
             key = f"{clean_label}|{amount}"
             if key not in seen_charges and amount not in doc_charge_amounts:
@@ -409,10 +422,16 @@ def extract_rows(filename: str, result: AnalyzeResult) -> tuple:
 
         # Find the "Description" and "Amount" column names dynamically
         # They are the item cols most likely to hold label and value
-        desc_col   = next((k for k in all_item_keys if "desc" in k.lower()), None)
+        # Description col — first col containing desc/service/product keywords
+        desc_col = next((k for k in all_item_keys if any(
+            x in k.lower() for x in ["desc","service","product","produit"]
+        )), all_item_keys[0] if all_item_keys else None)
+
+        # Amount col — LAST col matching amount/montant/extended (not unit price)
+        # reversed() ensures we get the rightmost total column, not unit price
         amount_col = next((k for k in reversed(all_item_keys) if any(
-            x in k.lower() for x in ["amount","total","montant","price","prix"]
-        )), None)
+            x in k.lower() for x in ["amount","montant","extended","total","prix net"]
+        )), all_item_keys[-1] if all_item_keys else None)
 
         for label, amount, conf, page in all_charges:
             row               = dict(base)   # SubTotal+Total already in base
