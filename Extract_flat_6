@@ -23,8 +23,7 @@ PDF_FILES = [
 
 
 # ── Charge detection ───────────────────────────────────────────────────────────
-# Doc-level field names that represent charge/summary lines (not address/date fields)
-# These doc-level fields become COLUMNS on the last item row
+# Doc-level field names that represent charge/summary lines
 SUMMARY_FIELD_NAMES = {
     "subtotal", "subtotalamount",
     "invoicetotal", "amountdue", "totalamount", "grandtotal", "balance",
@@ -80,6 +79,15 @@ CHARGE_LABEL_RE = re.compile(
 
 def is_charge_label(text: str) -> bool:
     return bool(CHARGE_LABEL_RE.search(text.strip()))
+
+def get_charge_cat(text: str) -> str:
+    """Categorizes a string so we can safely deduplicate $15 Tax vs $15 Shipping."""
+    t = text.lower().replace(" ","").replace(".","").replace("-","").replace("_","")
+    if any(x in t for x in ["tax","hst","gst","pst","vat","tps","tvq"]): return "tax"
+    if any(x in t for x in ["ship","freight","frt","hndl","handl"]): return "ship"
+    if "surcharge" in t: return "surcharge"
+    if "discount" in t: return "discount"
+    return "other"
 
 # Item table detection
 ITEM_SIGNALS = [
@@ -329,8 +337,6 @@ def extract_rows(filename: str, result: AnalyzeResult) -> tuple:
             base["InvoiceTotal"]        = total_val
             base["InvoiceTotal Conf%"]  = total_conf
 
-        last_item_idx = len(rows) - 1
-
         # ── Step 6: ITEM rows ──────────────────────────────────────────────────
         if items_array:
             for item in items_array:
@@ -391,36 +397,69 @@ def extract_rows(filename: str, result: AnalyzeResult) -> tuple:
         else:
             rows.append(dict(base))
 
-        # ── Step 7: CHARGE rows ────────────────────────────────────────────────
-        all_charges  = []
-        seen_charges = set()
-        charge_counter = 0
+        # ── Step 7: CHARGE rows (Exact Key Matching) ───────────────────────────
+        all_charges      = []
+        seen_charge_sigs = set()  # stores (category, normalized_amount)
 
-        doc_charge_labels = set()
-        for label, amount, conf, page in charge_fields:
-            charge_counter += 1
-            key = f"{charge_counter}|{label}|{amount}"
-            if key not in seen_charges:
-                seen_charges.add(key)
-                doc_charge_labels.add(label.lower().replace(" ","").replace("/","").replace("-",""))
-                all_charges.append((label, amount, conf, page))
+        # -- Harvest explicit TaxDetails --
+        tax_details = []
+        if "TaxDetails" in doc.fields:
+            td_array = doc.fields["TaxDetails"].get("valueArray") or []
+            for td in td_array:
+                tobj = td.get("valueObject") or {}
+                tamt = tobj.get("Amount", {}).get("content", "")
+                ttype = tobj.get("TaxType", {}).get("content", "")
+                if tamt:
+                    tax_details.append((ttype, tamt))
 
+        # 1. Process visual tables FIRST (Prioritizes exact literal text)
         for label, amount, page in charge_table_rows:
             clean_label = re.sub(r"^[\d\w]{6,}\s+", "", label).strip() or label
             if is_only_summary(clean_label):
                 continue
-            norm = clean_label.lower().replace(" ","").replace("/","").replace("-","")
-            if norm in doc_charge_labels:
+            
+            all_charges.append((clean_label, amount, "", page))
+            
+            norm_amt = re.sub(r"[^\d\.]", "", amount)
+            cat = get_charge_cat(clean_label)
+            if norm_amt:
+                seen_charge_sigs.add((cat, norm_amt))
+
+        # 2. Process doc fields (TotalTax, FreightCharge) and fetch literal names
+        for fname, amount, conf, page in charge_fields:
+            norm_amt = re.sub(r"[^\d\.]", "", amount)
+            cat = get_charge_cat(fname)
+            
+            if norm_amt and (cat, norm_amt) in seen_charge_sigs:
                 continue
             
-            charge_counter += 1
-            key = f"{charge_counter}|{clean_label}|{amount}"
-            if key not in seen_charges:
-                seen_charges.add(key)
-                all_charges.append((clean_label, amount, "", page))
+            exact_label = fname 
+            if fname == "TotalTax": exact_label = "Total Tax"
+            elif fname == "FreightCharge": exact_label = "Freight Charge"
 
+            if cat == "tax" and tax_details:
+                for ttype, tamt in tax_details:
+                    if ttype and re.sub(r"[^\d\.]", "", tamt) == norm_amt:
+                        exact_label = ttype
+                        break
+            
+            if exact_label in (fname, "Total Tax", "Freight Charge") and hasattr(result, "key_value_pairs") and result.key_value_pairs:
+                for kv in result.key_value_pairs:
+                    kv_val = kv.value.content if kv.value else ""
+                    if kv_val and norm_amt == re.sub(r"[^\d\.]", "", kv_val):
+                        if kv.key and kv.key.content:
+                            extracted = kv.key.content.strip()
+                            extracted = re.sub(r"[:\-]$", "", extracted).strip()
+                            if extracted and extracted.lower() not in {"amount", "total", "value"}:
+                                exact_label = extracted
+                                break
+
+            all_charges.append((exact_label, amount, conf, page))
+            if norm_amt:
+                seen_charge_sigs.add((cat, norm_amt))
+
+        # 3. Append to output
         target_desc = desc_col or (all_item_keys[0] if all_item_keys else None)
-
         for label, amount, conf, page in all_charges:
             row                  = dict(base)
             row["Row Type"]      = "CHARGE"
