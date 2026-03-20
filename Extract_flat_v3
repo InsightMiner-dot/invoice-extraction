@@ -21,59 +21,63 @@ PDF_FILES = [
     "invoice2.pdf",
 ]
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
 
-def _norm(s):
-    return s.lower().replace(" ","").replace("/","").replace("_","").replace("-","")
+# ── Charge detection ───────────────────────────────────────────────────────────
+# Doc-level field names that represent charge/summary lines (not address/date fields)
+# These doc-level fields become COLUMNS on the last item row
+SUMMARY_FIELD_NAMES = {
+    "subtotal", "subtotalamount",
+    "invoicetotal", "amountdue", "totalamount", "grandtotal", "balance",
+}
 
-# Patterns that identify a row as a charge/summary (not a product line item)
-CHARGE_RE = re.compile(
+# These doc-level fields become CHARGE rows
+CHARGE_FIELD_NAMES = {
+    "totaltax", "tax", "hst", "gst", "pst", "vat", "tps", "tvq",
+    "salestax", "freightcharge", "shippingcharge", "shippinghandling",
+    "frtcharge", "handlingcharge", "surcharge", "discount",
+}
+
+# These labels in charge tables become COLUMNS (not rows) when found
+SUMMARY_LABEL_RE = re.compile(
     r"sous.?total|sub.?total|subtotal|"
-    r"t\.p\.s|t\.v\.p|g\.s\.t|h\.s\.t|p\.s\.t|"
-    r"sales.?tax|total.?tax|tax|vat|hst|gst|pst|"
-    r"shipping|handling|freight|frt|surcharge|fuel|energy|"
+    r"^total$|grand.?total|amount.?due|invoice.?total|balance.?due|totalamount",
+    re.IGNORECASE
+)
+
+def is_summary_field(name: str) -> bool:
+    n = name.lower().replace(" ","").replace("/","").replace("-","").replace("_","")
+    return n in SUMMARY_FIELD_NAMES
+
+def is_summary_label(text: str) -> bool:
+    return bool(SUMMARY_LABEL_RE.match(text.strip()))
+
+def is_charge_field(name: str) -> bool:
+    n = name.lower().replace(" ","").replace("/","").replace("-","").replace("_","")
+    return n in CHARGE_FIELD_NAMES
+
+# Table row labels that indicate a charge/summary line
+CHARGE_LABEL_RE = re.compile(
+    r"sous.?total|sub.?total|subtotal|"
+    r"t\.p\.s|t\.v\.p|t\.v\.q|g\.s\.t|h\.s\.t|p\.s\.t|"
+    r"sales.?tax|total.?tax|^tax$|^hst$|^gst$|^pst$|^vat$|tps|tvq|"
+    r"shipping|handling|freight|frt|surcharge|fuel|delivery|"
     r"discount|adjustment|fee|insurance|duty|misc|"
-    r"invoice.?total|grand.?total|amount.?due|balance.?due|"
-    r"^total$|total.?amount",
+    r"^total$|grand.?total|amount.?due|invoice.?total|balance",
     re.IGNORECASE
 )
 
 def is_charge_label(text: str) -> bool:
-    return bool(CHARGE_RE.search(text.strip()))
+    return bool(CHARGE_LABEL_RE.search(text.strip()))
 
-# Signals that identify a table as the main line-items table
-ITEM_TABLE_SIGNALS = [
-    "qty", "quantity", "ordered", "description", "item", "product",
-    "unit price", "unitprice", "amount", "extended", "price",
-    "montant", "prix", "produit", "rate", "total",
+# Item table detection
+ITEM_SIGNALS = [
+    "qty","quantity","ordered","description","item","product",
+    "unit price","unitprice","amount","extended","price",
+    "montant","prix","produit","rate","total",
 ]
-
-def item_table_score(headers: list[str]) -> int:
+def item_table_score(headers: list) -> int:
     text = " ".join(h.lower() for h in headers)
-    return sum(1 for s in ITEM_TABLE_SIGNALS if s in text)
-
-# Invoice field classification
-SUBTOTAL_NAMES = {"subtotal","subtotalamount"}
-TOTAL_NAMES    = {"invoicetotal","amountdue","totalamount","grandtotal","balance"}
-# Tax/HST keywords — become dedicated columns on last item row
-TAX_FIELD_KW = ["totaltax","tax","hst","gst","pst","vat","salestax","tps","tvq","tvp"]
-TAX_LABEL_RE = re.compile(
-    r"(t\.p\.s|t\.v\.p|t\.v\.q|g\.s\.t|h\.s\.t|p\.s\.t|"
-    r"sales[\s-]?tax|total[\s-]?tax|^tax$|^hst$|^gst$|^pst$|^vat$|^tps$|^tvq$)",
-    re.IGNORECASE
-)
-def is_tax_label(text: str) -> bool:
-    return bool(TAX_LABEL_RE.search(text.strip()))
-
-# Charge keywords — other charges stay as CHARGE rows
-CHARGE_FIELD_KW = [
-    "freight","frt","shippinghandling","shippingfee","deliveryfee",
-    "surcharge","fuelsurcharge","discount","fee","insurance","misc","duty",
-]
-def is_subtotal_field(n): return _norm(n) in SUBTOTAL_NAMES
-def is_total_field(n):    return _norm(n) in TOTAL_NAMES
-def is_tax_field(n):      return any(kw in _norm(n) for kw in TAX_FIELD_KW)
-def is_charge_field(n):   return any(kw in _norm(n) for kw in CHARGE_FIELD_KW)
+    return sum(1 for s in ITEM_SIGNALS if s in text)
 
 
 # ── Azure ──────────────────────────────────────────────────────────────────────
@@ -90,51 +94,72 @@ def run_analysis(pdf_path: str) -> AnalyzeResult:
     return poller.result()
 
 
-# ── Table Grid Builder ─────────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
-def build_grid(table_dict: dict) -> tuple[str, list[str], list[list[str]]]:
+def get_content_conf(field) -> tuple:
+    if not field:
+        return "", ""
+    content = field.get("content") or ""
+    conf    = field.get("confidence")
+    return content, (f"{round(conf * 100, 1)}" if conf else "")
+
+def get_page_from_field(field) -> str:
+    br = field.get("boundingRegions") or field.get("bounding_regions") or []
+    if br:
+        p = br[0]
+        return str(p.get("pageNumber") or p.get("page_number") or "")
+    return ""
+
+def get_currency(field: dict) -> str:
+    """Currency lives at field['value']['code'] in real Azure responses."""
+    val = field.get("value")
+    if isinstance(val, dict):
+        return val.get("code") or val.get("currencyCode") or ""
+    return ""
+
+def discover_item_cols(items_array: list) -> list:
+    """Dynamically discover all valueObject keys across all items."""
+    seen, order = set(), []
+    for item in items_array:
+        for k in (item.get("valueObject") or {}).keys():
+            if k not in seen:
+                seen.add(k)
+                order.append(k)
+    return order
+
+def build_table_grid(table_dict: dict) -> tuple:
     """
     Returns (page, headers, data_rows).
-    Handles multi-row headers by merging them.
-    Trims trailing empty columns from headers.
+    Handles multi-row column headers by merging.
     """
     cells     = table_dict.get("cells", [])
     br        = table_dict.get("bounding_regions", [])
     page      = str(br[0].get("page_number", "")) if br else ""
     col_count = table_dict.get("column_count", 0)
 
-    # Build grid dict
-    grid  = {}
-    kinds = {}
+    grid, kinds = {}, {}
     for c in cells:
         r, ci = c.get("row_index", 0), c.get("column_index", 0)
         grid.setdefault(r, {})[ci] = c.get("content", "").replace("\n", " ").strip()
         kinds[(r, ci)] = c.get("kind", "content")
 
-    # Identify header rows
-    header_idxs = sorted(set(r for (r, _), k in kinds.items() if k == "columnHeader"))
+    header_idxs  = sorted(set(r for (r, _), k in kinds.items() if k == "columnHeader"))
     all_row_idxs = sorted(grid.keys())
 
     if header_idxs:
-        # Merge multi-row headers per column
         headers = []
         for ci in range(col_count):
             parts = [grid.get(hi, {}).get(ci, "") for hi in header_idxs]
-            merged = " / ".join(p for p in parts if p)
-            headers.append(merged or f"Col{ci}")
+            headers.append(" / ".join(p for p in parts if p) or f"Col{ci}")
         data_idxs = [r for r in all_row_idxs if r > max(header_idxs)]
     else:
-        # No column headers — first row as header
-        first = min(all_row_idxs) if all_row_idxs else 0
-        headers = [grid.get(first, {}).get(ci, f"Col{ci}") for ci in range(col_count)]
+        first     = min(all_row_idxs) if all_row_idxs else 0
+        headers   = [grid.get(first, {}).get(ci, f"Col{ci}") for ci in range(col_count)]
         data_idxs = [r for r in all_row_idxs if r != first]
 
-    data_rows = [
-        [grid.get(r, {}).get(ci, "") for ci in range(col_count)]
-        for r in data_idxs
-    ]
+    data_rows = [[grid.get(r, {}).get(ci, "") for ci in range(col_count)] for r in data_idxs]
 
-    # Trim trailing empty header columns
+    # Trim trailing empty header cols
     while headers and not headers[-1].strip():
         headers.pop()
         data_rows = [row[:-1] for row in data_rows]
@@ -142,295 +167,275 @@ def build_grid(table_dict: dict) -> tuple[str, list[str], list[list[str]]]:
     return page, headers, data_rows
 
 
-# ── Invoice field helpers ──────────────────────────────────────────────────────
+# ── Row Extractor ──────────────────────────────────────────────────────────────
 
-def get_content_conf(field: dict) -> tuple[str, str]:
-    content = field.get("content") or ""
-    conf    = field.get("confidence")
-    return content, (f"{round(conf * 100, 1)}" if conf else "")
-
-def get_page_fld(field: dict) -> str:
-    br = field.get("bounding_regions") or field.get("boundingRegions") or []
-    if br:
-        p = br[0]
-        return str(p.get("page_number") or p.get("pageNumber") or "")
-    return ""
-
-def get_currency(field: dict) -> str:
-    # Real structure confirmed from samples: field["value"]["code"]
-    val = field.get("value")
-    if isinstance(val, dict):
-        return val.get("code") or val.get("currencyCode") or ""
-    vc = field.get("valueCurrency")
-    if isinstance(vc, dict):
-        return vc.get("currencyCode") or vc.get("code") or ""
-    return ""
-
-
-# ── Main Extractor ─────────────────────────────────────────────────────────────
-
-def extract_rows(filename: str, result: AnalyzeResult) -> tuple[list[dict], list[str]]:
+def extract_rows(filename: str, result: AnalyzeResult) -> tuple:
     """
     Row layout per invoice:
-      [ITEM rows]   — one per data row in the main items table
-                      SubTotal + InvoiceTotal as columns on LAST item row only
-      [CHARGE rows] — from doc-level charge fields (TotalTax etc.)
-                    + from charge/summary tables (SOUS-TOTAL, SALES TAX etc.)
-    """
-    # ── Step 1: Invoice-level fields from documents ────────────────────────────
-    invoice_cols  = {}
-    tax_fields    = {}   # tax/hst/gst/pst -> columns on last item row
-    charge_fields = {}   # freight/shipping/misc -> CHARGE rows
-    subtotal_fld  = None
-    total_fld     = None
-    currency_code = ""
-    overall_conf  = ""
 
-    if result.documents:
-        doc          = result.documents[0]
+      [ITEM rows]   — one per line item; invoice header fields repeat on every row;
+                      SubTotal + InvoiceTotal repeat on EVERY row as fixed columns
+
+      [CHARGE rows] — Tax/HST/Shipping etc. appended after items as rows,
+                      using the same Description+Amount item columns so they align;
+                      SubTotal + InvoiceTotal also repeat on charge rows
+    """
+    rows          = []
+    all_item_keys = []
+    seen_item     = set()
+
+    if not result.documents:
+        return rows, all_item_keys
+
+    for doc in result.documents:
+        if not doc.fields:
+            continue
+
         overall_conf = f"{round(doc.confidence * 100, 1)}" if doc.confidence else ""
 
-        for fname, fval in (doc.fields or {}).items():
+        # ── Step 1: Bucket doc-level fields ───────────────────────────────────
+        invoice_cols   = {}   # repeating header fields on every row
+        summary_fields = []   # SubTotal/InvoiceTotal/AmountDue → columns on last item row
+        charge_fields  = []   # Tax/HST/Shipping etc. → CHARGE rows
+        currency_code  = ""
+
+        for fname, fval in doc.fields.items():
             if fname == "Items":
                 continue
             content, conf = get_content_conf(fval)
+
+            # Currency from field["value"]["code"]
             if not currency_code:
                 currency_code = get_currency(fval)
 
-            if is_subtotal_field(fname):
-                subtotal_fld = (fname, fval)
-            elif is_total_field(fname):
-                if total_fld is None or _norm(fname) == "invoicetotal":
-                    total_fld = (fname, fval)
-            elif is_tax_field(fname):
-                if content:
-                    tax_fields[fname] = fval    # tax → column on last item row
-            elif is_charge_field(fname):
-                if content:
-                    charge_fields[fname] = fval
-            else:
+            if is_summary_field(fname) and content:
+                # SubTotal / InvoiceTotal / AmountDue → columns on last item row
+                summary_fields.append((fname, content, conf, get_page_from_field(fval)))
+            elif is_charge_field(fname) and content:
+                # Tax / HST / Shipping etc. → CHARGE rows
+                charge_fields.append((fname, content, conf, get_page_from_field(fval)))
+            elif "address" not in fname.lower():
+                # Regular invoice header field — repeats on every row
                 invoice_cols[fname]            = content
                 invoice_cols[f"{fname} Conf%"] = conf
 
-    subtotal_val  = get_content_conf(subtotal_fld[1])[0] if subtotal_fld else ""
-    subtotal_conf = get_content_conf(subtotal_fld[1])[1] if subtotal_fld else ""
-    total_val     = get_content_conf(total_fld[1])[0]    if total_fld    else ""
-    total_conf    = get_content_conf(total_fld[1])[1]    if total_fld    else ""
+        # ── Step 2: Get Items array ────────────────────────────────────────────
+        items_field = doc.fields.get("Items")
+        items_array = (items_field.get("valueArray") or []) if items_field else []
+        item_keys   = discover_item_cols(items_array)
 
-    # ── Step 2: Find main items table + charge tables ──────────────────────────
-    best_table     = None   # (score, page, headers, data_rows)
-    charge_tables  = []     # [(page, headers, data_rows)]
+        for k in item_keys:
+            if k not in seen_item:
+                seen_item.add(k)
+                all_item_keys.append(k)
 
-    for table in (result.tables or []):
-        td = table.as_dict() if hasattr(table, "as_dict") else table
-        page, headers, data_rows = build_grid(td)
-        score = item_table_score(headers)
+        # Try currency from item fields if still empty
+        if not currency_code:
+            for item in items_array:
+                obj = item.get("valueObject") or {}
+                for col in ("UnitPrice", "Amount", "Total", "Rate"):
+                    cc = get_currency(obj.get(col) or {})
+                    if cc:
+                        currency_code = cc
+                        break
+                if currency_code:
+                    break
 
-        # Is this a pure charge/summary table?
-        # Criteria: all headers are charge labels (horizontal) OR
-        #           2 cols and all first-col values are charge labels (vertical)
-        all_hdrs_charge = headers and all(is_charge_label(h) or not h.strip() for h in headers)
-        first_col_vals  = [r[0].strip() for r in data_rows if r and r[0].strip()]
-        all_first_charge = len(headers) <= 2 and first_col_vals and all(
-            is_charge_label(v) for v in first_col_vals
-        )
+        # ── Step 3: Also check tables for items (valueArray often empty) ───────
+        best_table   = None
+        charge_table_rows = []   # [(label, amount, page)]
 
-        if all_hdrs_charge or all_first_charge:
-            charge_tables.append((page, headers, data_rows))
-        elif score >= 2:
-            # Pick highest scoring table as main items table
-            if best_table is None or score > best_table[0]:
-                best_table = (score, page, headers, data_rows)
+        for table in (result.tables or []):
+            td                    = table.as_dict() if hasattr(table, "as_dict") else table
+            tpage, headers, drows = build_table_grid(td)
+            score                 = item_table_score(headers)
 
-    # ── Step 2b: Split tax rows out of charge_tables into tax_cols ───────────
-    # Rows like "T.P.S. G.S.T. 15.92" or header "SALES TAX" go as columns,
-    # not as CHARGE rows.
-    tax_cols_from_table = {}   # {normalized_label: amount}
-    clean_charge_tables = []
-    for (cpage, cheaders, cdata) in charge_tables:
-        clean_rows = []
-        # vertical layout rows
-        all_to_check = []
-        if not cheaders or len(cheaders) <= 2:
-            if cheaders and cheaders[0].strip():
-                all_to_check.append(cheaders)
-            all_to_check.extend(cdata)
-            for row in all_to_check:
-                label  = row[0].strip() if row else ""
-                amount = row[1].strip() if len(row) > 1 else ""
-                if label and amount and is_tax_label(label):
-                    clean = re.sub(r"^[\d\w]{6,}\s+", "", label).strip() or label
-                    col   = re.sub(r"[^A-Z0-9]", "_", clean.upper())[:25].strip("_")
-                    tax_cols_from_table[col] = amount
+            # Pure charge/summary table detection
+            all_hdrs_charge  = headers and all(is_charge_label(h) or not h.strip() for h in headers)
+            first_col_vals   = [r[0].strip() for r in drows if r and r[0].strip()]
+            all_first_charge = (
+                len(headers) <= 2 and first_col_vals
+                and all(is_charge_label(v) for v in first_col_vals)
+            )
+
+            if all_hdrs_charge or all_first_charge:
+                # Parse charge table
+                if len(headers) <= 2:
+                    # Vertical: headers may themselves be first row
+                    to_parse = []
+                    if headers and headers[0].strip():
+                        to_parse.append(headers)
+                    to_parse.extend(drows)
+                    for row in to_parse:
+                        lbl = row[0].strip() if row else ""
+                        amt = row[1].strip() if len(row) > 1 else ""
+                        if lbl and amt and lbl != amt:
+                            charge_table_rows.append((lbl, amt, tpage))
                 else:
-                    clean_rows.append(row)
-            if clean_rows:
-                clean_charge_tables.append((cpage, [], clean_rows))
-        else:
-            # horizontal layout — split tax headers out
-            tax_h_idxs  = [i for i,h in enumerate(cheaders) if is_tax_label(h)]
-            other_idxs  = [i for i,h in enumerate(cheaders) if not is_tax_label(h)]
-            if cdata:
-                vals = cdata[0]
-                for ti in tax_h_idxs:
-                    clean_h = re.sub(r"^[\d\w]{6,}\s+", "", cheaders[ti]).strip() or cheaders[ti]
-                    col = re.sub(r"[^A-Z0-9]", "_", clean_h.upper())[:25].strip("_")
-                    tax_cols_from_table[col] = vals[ti].strip() if ti < len(vals) else ""
-            if other_idxs:
-                new_hdrs = [cheaders[i] for i in other_idxs]
-                new_data = [[r[i] for i in other_idxs if i < len(r)] for r in cdata]
-                clean_charge_tables.append((cpage, new_hdrs, new_data))
-    charge_tables = clean_charge_tables
+                    # Horizontal: headers=labels, first data row=values
+                    if drows:
+                        vals = drows[0]
+                        for ci, h in enumerate(headers):
+                            amt = vals[ci].strip() if ci < len(vals) else ""
+                            if h.strip() and amt:
+                                charge_table_rows.append((h, amt, tpage))
 
-    # ── Step 3: Discover item column keys ─────────────────────────────────────
-    all_item_keys = []
-    seen_item     = set()
-    if best_table:
-        _, _, item_headers, _ = best_table
-        for h in item_headers:
-            if h and h not in seen_item:
-                seen_item.add(h)
-                all_item_keys.append(h)
+            elif score >= 2 and not items_array:
+                # Only use table items if Items.valueArray was empty
+                if best_table is None or score > best_table[0]:
+                    best_table = (score, tpage, headers, drows)
 
-    # ── Step 4: Base row template ──────────────────────────────────────────────
-    base = {
-        "File Name":    filename,
-        "Page":         "",
-        "Row Type":     "ITEM",
-        "Currency":     currency_code,
-        "Overall Conf": overall_conf,
-    }
-    base.update(invoice_cols)
+        # ── Step 4: Discover item keys from table if needed ────────────────────
+        if best_table and not item_keys:
+            for h in best_table[2]:
+                if h and h not in seen_item:
+                    seen_item.add(h)
+                    all_item_keys.append(h)
+            item_keys = best_table[2]
 
-    rows = []
+        # ── Step 5: Base row (repeats on every row for this invoice) ───────────
+        # SubTotal and InvoiceTotal: pick the best available value to repeat
+        subtotal_val  = ""
+        subtotal_conf = ""
+        total_val     = ""
+        total_conf    = ""
+        for label, amount, conf, _ in summary_fields:
+            nl = label.lower().replace(" ","").replace("-","")
+            if "subtotal" in nl and not subtotal_val:
+                subtotal_val  = amount
+                subtotal_conf = conf
+            if nl in ("invoicetotal","amountdue","totalamount","grandtotal","balance") and not total_val:
+                total_val  = amount
+                total_conf = conf
 
-    # ── Step 5: ITEM rows from main table ──────────────────────────────────────
-    item_data_rows = []
-    if best_table:
-        _, tpage, item_headers, data_rows = best_table
-        n_cols = len(item_headers)
-
-        for raw_row in data_rows:
-            # Pad/trim to header count
-            raw_row = (raw_row + [""] * n_cols)[:n_cols]
-            if not any(v.strip() for v in raw_row):
-                continue  # skip blank rows
-
-            # Skip rows where first non-empty cell is a charge label
-            # (some invoices embed subtotal/total inside item table)
-            first_val = next((v.strip() for v in raw_row if v.strip()), "")
-            if is_charge_label(first_val):
-                # Treat as charge row from table
-                last_val = next((v.strip() for v in reversed(raw_row) if v.strip()), "")
-                if last_val and last_val != first_val:
-                    charge_tables.append((tpage, [], [[first_val, last_val]]))
-                continue
-
-            row_dict = {item_headers[i]: raw_row[i] for i in range(n_cols)}
-            row_dict["_page"] = tpage
-            item_data_rows.append(row_dict)
-
-    if item_data_rows:
-        for i, item in enumerate(item_data_rows):
-            row         = dict(base)
-            row["Page"] = str(item.pop("_page", ""))
-            row.update(item)
-
-            # SubTotal | Tax cols | Total — columns on LAST item row only
-            if i == len(item_data_rows) - 1:
-                if subtotal_val:
-                    row["SubTotal"]       = subtotal_val
-                    row["SubTotal Conf%"] = subtotal_conf
-                # Tax from doc fields (TotalTax, HST etc.)
-                for tname, tfval in tax_fields.items():
-                    tc, tconf = get_content_conf(tfval)
-                    row[tname]            = tc
-                    row[f"{tname} Conf%"] = tconf
-                # Tax from charge tables (T.P.S., SALES TAX col etc.)
-                for tcol, tamt in tax_cols_from_table.items():
-                    if tcol not in row or not row[tcol]:
-                        row[tcol] = tamt
-                if total_val:
-                    row["InvoiceTotal"]       = total_val
-                    row["InvoiceTotal Conf%"] = total_conf
-            rows.append(row)
-    else:
-        # No items found — one summary row
-        row = dict(base)
+        base = {
+            "File Name":    filename,
+            "Page":         "",
+            "Row Type":     "ITEM",
+            "Currency":     currency_code,
+            "Overall Conf": overall_conf,
+        }
+        base.update(invoice_cols)
+        # SubTotal + Total repeat on every row (ITEM and CHARGE)
         if subtotal_val:
-            row["SubTotal"]       = subtotal_val
-            row["SubTotal Conf%"] = subtotal_conf
-        for tname, tfval in tax_fields.items():
-            tc, tconf = get_content_conf(tfval)
-            row[tname]            = tc
-            row[f"{tname} Conf%"] = tconf
-        for tcol, tamt in tax_cols_from_table.items():
-            if tcol not in row or not row[tcol]:
-                row[tcol] = tamt
+            base["SubTotal"]        = subtotal_val
+            base["SubTotal Conf%"]  = subtotal_conf
         if total_val:
-            row["InvoiceTotal"]       = total_val
-            row["InvoiceTotal Conf%"] = total_conf
-        rows.append(row)
+            base["InvoiceTotal"]        = total_val
+            base["InvoiceTotal Conf%"]  = total_conf
 
-    # ── Step 6: CHARGE rows ────────────────────────────────────────────────────
-    def add_charge(label, amount, page):
-        if not label or not amount:
-            return
-        # Skip labels that are subtotal/total/tax — already captured as columns
-        if is_subtotal_field(label) or is_total_field(label) or is_tax_label(label):
-            return
-        row                = dict(base)
-        row["Row Type"]    = "CHARGE"
-        row["Page"]        = str(page)
-        row["Description"] = label
-        row["Amount"]      = amount
-        # blank all item-specific cols
-        for k in all_item_keys:
-            if k not in ("Description", "Amount"):
-                row[k] = ""
-        rows.append(row)
+        # ── Step 6: ITEM rows ──────────────────────────────────────────────────
+        if items_array:
+            # From Items.valueArray
+            for item in items_array:
+                obj = item.get("valueObject") or {}
 
-    # From doc-level charge fields (TotalTax, etc.)
-    for fname, fval in charge_fields.items():
-        content, _ = get_content_conf(fval)
-        add_charge(fname, content, get_page_fld(fval))
+                item_page = ""
+                for col in item_keys:
+                    f = obj.get(col)
+                    if f:
+                        pg = get_page_from_field(f)
+                        if pg:
+                            item_page = pg
+                            break
 
-    # From charge tables
-    seen_charge = set()
-    for (cpage, cheaders, cdata) in charge_tables:
-        # Vertical layout: [[label, amount], ...]
-        if not cheaders or len(cheaders) <= 2:
-            # headers themselves may be first row (e.g. ["SOUS-TOTAL SUB-TOTAL", "318.45"])
-            all_rows_to_parse = []
-            if cheaders and cheaders[0].strip():
-                all_rows_to_parse.append(cheaders)
-            all_rows_to_parse.extend(cdata)
+                row          = dict(base)
+                row["Page"]  = item_page
 
-            for row in all_rows_to_parse:
-                label  = row[0].strip() if row else ""
-                amount = row[1].strip() if len(row) > 1 else ""
-                key    = f"{label}|{amount}"
-                if label and amount and label != amount and key not in seen_charge:
-                    seen_charge.add(key)
-                    add_charge(label, amount, cpage)
+                for col in item_keys:
+                    f                   = obj.get(col)
+                    content, conf       = get_content_conf(f) if f else ("", "")
+                    row[col]            = content
+                    row[f"{col} Conf%"] = conf
+
+                rows.append(row)
+
+        elif best_table:
+            # From best-scoring table
+            _, tpage, item_headers, data_rows = best_table
+            n_cols = len(item_headers)
+
+            for raw_row in data_rows:
+                raw_row = (raw_row + [""] * n_cols)[:n_cols]
+                if not any(v.strip() for v in raw_row):
+                    continue
+                first_val = next((v.strip() for v in raw_row if v.strip()), "")
+                # Skip rows that are charge/summary lines embedded in table
+                if is_charge_label(first_val):
+                    last_val = next((v.strip() for v in reversed(raw_row) if v.strip()), "")
+                    if last_val and last_val != first_val:
+                        charge_table_rows.append((first_val, last_val, tpage))
+                    continue
+
+                row         = dict(base)
+                row["Page"] = tpage
+                for i, h in enumerate(item_headers):
+                    row[h] = raw_row[i]
+                rows.append(row)
 
         else:
-            # Horizontal layout: headers=labels, first data row=values
-            if cdata:
-                vals = cdata[0]
-                for ci, h in enumerate(cheaders):
-                    amount = vals[ci].strip() if ci < len(vals) else ""
-                    key    = f"{h}|{amount}"
-                    if h.strip() and amount and key not in seen_charge:
-                        seen_charge.add(key)
-                        add_charge(h, amount, cpage)
+            # No items at all — one summary row
+            rows.append(dict(base))
+
+        # ── Track last item index for charge table summary interception ──────────
+        last_item_idx = len(rows) - 1  # last row added so far
+
+        # ── Step 7: CHARGE rows ────────────────────────────────────────────────
+        # Collect all charges, deduplicate by label+amount, then append as rows
+        all_charges  = []
+        seen_charges = set()
+
+        # Track amounts already seen from doc fields to avoid table duplicates
+        doc_charge_amounts = set()
+
+        # From doc fields (TotalTax, HST etc.)
+        for label, amount, conf, page in charge_fields:
+            key = f"{label}|{amount}"
+            if key not in seen_charges:
+                seen_charges.add(key)
+                doc_charge_amounts.add(amount)
+                all_charges.append((label, amount, conf, page))
+
+        # From charge tables — skip summary labels and skip amounts already from doc fields
+        for label, amount, page in charge_table_rows:
+            clean_label = re.sub(r"^[\d\w]{6,}\s+", "", label).strip() or label
+            # Skip if this is a summary label (subtotal/total) — those are columns not rows
+            if is_summary_label(clean_label):
+                continue
+            key = f"{clean_label}|{amount}"
+            if key not in seen_charges and amount not in doc_charge_amounts:
+                seen_charges.add(key)
+                all_charges.append((clean_label, amount, "", page))
+
+        # Find the "Description" and "Amount" column names dynamically
+        # They are the item cols most likely to hold label and value
+        desc_col   = next((k for k in all_item_keys if "desc" in k.lower()), None)
+        amount_col = next((k for k in reversed(all_item_keys) if any(
+            x in k.lower() for x in ["amount","total","montant","price","prix"]
+        )), None)
+
+        for label, amount, conf, page in all_charges:
+            row               = dict(base)   # SubTotal+Total already in base
+            row["Row Type"]   = "CHARGE"
+            row["Page"]       = str(page)
+            # Clear all item cols first
+            for k in all_item_keys:
+                row[k]            = ""
+                row[f"{k} Conf%"] = ""
+            # Put charge label in Description col (or first item col if no desc col)
+            target_desc = desc_col or (all_item_keys[0] if all_item_keys else "Description")
+            target_amt  = amount_col or (all_item_keys[-1] if all_item_keys else "Amount")
+            row[target_desc]            = label
+            row[target_amt]             = amount
+            row[f"{target_amt} Conf%"]  = conf
+            rows.append(row)
 
     return rows, all_item_keys
 
 
 # ── Collect across all PDFs ────────────────────────────────────────────────────
 
-def collect_all(pdf_files: list[str]) -> tuple[pd.DataFrame, set[str]]:
+def collect_all(pdf_files: list) -> tuple:
     all_rows      = []
     all_item_keys = []
     seen_item     = set()
@@ -447,7 +452,7 @@ def collect_all(pdf_files: list[str]) -> tuple[pd.DataFrame, set[str]]:
                     all_item_keys.append(k)
             ir = sum(1 for r in rows if r.get("Row Type") == "ITEM")
             cr = sum(1 for r in rows if r.get("Row Type") == "CHARGE")
-            print(f"    → {ir} item rows | {cr} charge rows | item cols: {item_keys}")
+            print(f"    -> {ir} item rows | {cr} charge rows | item cols: {item_keys}")
         except Exception as e:
             import traceback; traceback.print_exc()
             all_rows.append({"File Name": os.path.basename(pdf_path), "Error": str(e)})
@@ -455,7 +460,7 @@ def collect_all(pdf_files: list[str]) -> tuple[pd.DataFrame, set[str]]:
     if not all_rows:
         return pd.DataFrame(), set()
 
-    # Column order
+    # ── Column order ───────────────────────────────────────────────────────────
     all_keys = []
     seen_all = set()
     for row in all_rows:
@@ -465,24 +470,16 @@ def collect_all(pdf_files: list[str]) -> tuple[pd.DataFrame, set[str]]:
                 seen_all.add(k)
 
     META = ["File Name", "Page", "Row Type", "Currency", "Overall Conf"]
-    # Tax cols: dynamically discovered keys that look like tax labels
-    tax_col_keys = [k for k in all_keys if is_tax_label(k) or is_tax_field(k)]
-    tax_cols_ordered = []
-    for tc in tax_col_keys:
-        tax_cols_ordered.append(tc)
-        if f"{tc} Conf%" in seen_all:
-            tax_cols_ordered.append(f"{tc} Conf%")
-    SUMMARY_COLS = (
-        [c for c in ["SubTotal","SubTotal Conf%"] if c in seen_all]
-        + tax_cols_ordered
-        + [c for c in ["InvoiceTotal","InvoiceTotal Conf%"] if c in seen_all]
-    )
+
+    # Summary cols repeat on every row — pin them just before item cols
+    SUMMARY_COLS = [c for c in ["SubTotal", "SubTotal Conf%", "InvoiceTotal", "InvoiceTotal Conf%"]
+                    if c in seen_all]
+
     item_and_conf = []
     for k in all_item_keys:
         item_and_conf.append(k)
-        conf_k = f"{k} Conf%"
-        if conf_k in seen_all:
-            item_and_conf.append(conf_k)
+        if f"{k} Conf%" in seen_all:
+            item_and_conf.append(f"{k} Conf%")
 
     end_set  = set(item_and_conf) | set(SUMMARY_COLS) | {"Error"}
     inv_cols = [k for k in all_keys if k not in set(META) and k not in end_set]
@@ -501,14 +498,18 @@ def collect_all(pdf_files: list[str]) -> tuple[pd.DataFrame, set[str]]:
 THIN        = Side(style="thin", color="CCCCCC")
 BORDER      = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 ALT         = PatternFill("solid", start_color="EBF5FB")
-CHARGE_FILL = PatternFill("solid", start_color="FEF9E7")
+CHARGE_FILL = PatternFill("solid", start_color="FEF9E7")   # light yellow
+
 
 def col_color(col_name: str, item_cols: set) -> str:
-    if col_name in ("File Name","Page","Row Type","Currency","Overall Conf"): return "1C2833"
-    if col_name in ("SubTotal","InvoiceTotal"):                               return "1F618D"
-    if col_name.endswith("Conf%"):                                            return "1E8449"
-    if col_name in item_cols:                                                 return "154360"
+    if col_name in ("File Name", "Page", "Row Type", "Currency", "Overall Conf"):
+        return "1C2833"
+    if col_name.endswith("Conf%"):
+        return "1E8449"
+    if col_name in item_cols:
+        return "154360"
     return "1A5276"
+
 
 def write_excel(df: pd.DataFrame, item_cols: set, output_path: str):
     wb = Workbook()
@@ -537,7 +538,7 @@ def write_excel(df: pd.DataFrame, item_cols: set, output_path: str):
     for ci, cn in enumerate(df.columns, 1):
         if cn.endswith("Conf%"):    width = 10
         elif cn == "File Name":     width = 25
-        elif cn in ("Page","Row Type","Currency","Overall Conf"): width = 13
+        elif cn in ("Page", "Row Type", "Currency", "Overall Conf"): width = 13
         else:
             vals  = [str(cn)] + [str(v) for v in df.iloc[:, ci-1] if v != ""]
             width = min(max((len(v) for v in vals), default=10), 45) + 3
@@ -546,7 +547,8 @@ def write_excel(df: pd.DataFrame, item_cols: set, output_path: str):
     ws.freeze_panes    = "E2"
     ws.auto_filter.ref = ws.dimensions
     wb.save(output_path)
-    print(f"\n✅ Saved → {output_path}  |  {len(df)} rows  |  {len(df.columns)} cols")
+    print(f"\n  Saved -> {output_path}  |  {len(df)} rows  |  {len(df.columns)} cols")
+    print(f"  Item cols: {sorted(item_cols)}")
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
