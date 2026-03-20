@@ -50,20 +50,40 @@ LINE_COLS = [
 
 # Keyword hints used by DI-only extraction to find header fields
 DI_HINTS = {
-    "supplier_name":     ["vendor name","supplier name","seller","from","shipper"],
-    "supplier_id":       ["vendor id","supplier id","vendor code","supplier code"],
-    "supplier_address":  ["vendor address","supplier address","seller address"],
-    "invoice_number":    ["invoice no","invoice number","inv no","inv #","invoice #","bill no"],
-    "invoice_date":      ["invoice date","date","dated","bill date"],
-    "customer_name":     ["bill to","sold to","buyer","customer","client","consignee"],
-    "customer_address":  ["customer address","buyer address","consignee address"],
-    "remit_to":          ["remit to","pay to","remittance","payment address"],
-    "shipper_address":   ["ship from","dispatch from","shipper address","from address"],
-    "bill_to":           ["billing address","bill to address"],
-    "origin":            ["origin","ship from","port of loading","pol","from port"],
-    "destination":       ["destination","ship to","port of discharge","pod","to port"],
-    "subtotal":          ["subtotal","sub total","net amount","net total","taxable amount"],
-    "total_amount":      ["total","grand total","invoice total","amount due","total amount","net payable"],
+    "supplier_name":     ["vendor name","supplier name","seller","from","shipper","issued by",
+                          "billed by","service provider","company name"],
+    "supplier_id":       ["vendor id","supplier id","vendor code","supplier code","gst no",
+                          "gstin","tax id","vat no","ein","pan no"],
+    "supplier_address":  ["vendor address","supplier address","seller address","from address",
+                          "company address","registered address"],
+    "invoice_number":    ["invoice no","invoice number","inv no","inv #","invoice #","bill no",
+                          "bill number","reference no","ref no","document no"],
+    "invoice_date":      ["invoice date","date","dated","bill date","issue date","doc date"],
+    "customer_name":     ["bill to","sold to","buyer","customer","client","consignee",
+                          "recipient","ship to name","deliver to","attention","attn",
+                          "sold to name","billed to","party name"],
+    "customer_address":  ["customer address","buyer address","consignee address",
+                          "recipient address","delivery address","billing address",
+                          "sold to address","ship to address"],
+    "remit_to":          ["remit to","pay to","remittance","payment address","remit payment"],
+    "shipper_address":   ["ship from","dispatch from","shipper address","from address",
+                          "pickup address","collection address","origin address",
+                          "generator address","generator name"],
+    "bill_to":           ["billing address","bill to address","sold to","sold to address",
+                          "invoice to","charge to","billed to address"],
+    "origin":            ["origin","ship from","port of loading","pol","from port",
+                          "loading port","place of origin","dispatch from","source",
+                          "generator","generated at","pickup location","from location",
+                          "place of supply","origin port","origin city","origin state"],
+    "destination":       ["destination","ship to","port of discharge","pod","to port",
+                          "delivery port","place of delivery","deliver to","delivery location",
+                          "to location","discharge port","destination port","destination city",
+                          "consignee location","final destination","delivery address"],
+    "subtotal":          ["subtotal","sub total","net amount","net total","taxable amount",
+                          "taxable value","assessable value","basic amount"],
+    "total_amount":      ["total","grand total","invoice total","amount due","total amount",
+                          "net payable","total payable","total due","balance due",
+                          "total invoice amount","net due","amount payable"],
 }
 
 # Column hints used by DI-only to map table headers
@@ -160,109 +180,216 @@ def run_azure_di(file_bytes: bytes) -> dict:
 
     return output
 
-# ── DI-only extraction — same structure as LLM output ────────────────────────
+# ── DI-only extraction — take ALL fields as-is, repeat per row ───────────────
+
+INVOICE_START_HINTS = [
+    "invoice no","invoice number","inv no","inv #","invoice #","bill no","bill number"
+]
 
 def extract_di_only(di_output: dict, charge_keywords: list) -> dict:
     """
-    Extract from DI output using keyword/hint matching.
-    Produces EXACTLY the same dict structure as extract_with_llm().
-    No LLM call made.
+    Takes ALL DI header key-value pairs exactly as-is — no forced label mapping.
+    Whatever DI labels (Recipient, Ship-To, Vendor, From etc.) are kept verbatim.
+    Header fields repeat on every row until a new invoice is detected.
+    All table columns kept as-is — no renaming.
     """
 
-    # ── Find header field value by keyword hints ──
-    def find_val(standard_field):
-        hints = DI_HINTS.get(standard_field, [])
-        for k, v in di_output["header_fields"].items():
-            k_lower = k.lower()
-            if any(h.lower() in k_lower for h in hints):
-                return v["value"]
-        return None
-
-    # ── Find table column name by keyword hints ───
-    def find_col(headers, standard_col):
-        hints = COL_HINTS.get(standard_col, [])
-        for h in headers:
-            h_lower = h.lower()
-            if any(hint.lower() in h_lower for hint in hints):
-                return h
-        return None
-
-    extracted = {
-        "supplier_name":    find_val("supplier_name"),
-        "supplier_id":      find_val("supplier_id"),
-        "supplier_address": find_val("supplier_address"),
-        "invoice_number":   find_val("invoice_number"),
-        "invoice_date":     find_val("invoice_date"),
-        "customer_name":    find_val("customer_name"),
-        "customer_address": find_val("customer_address"),
-        "remit_to":         find_val("remit_to"),
-        "shipper_address":  find_val("shipper_address"),
-        "bill_to":          find_val("bill_to"),
-        "origin":           find_val("origin"),
-        "destination":      find_val("destination"),
-        "subtotal":         find_val("subtotal"),
-        "total_amount":     find_val("total_amount"),
-        "line_items":       [],
-        "charge_lines":     [],
-        "unmapped_header_fields": {}
+    # All header fields exactly as DI found them
+    all_header_fields = {
+        k: v["value"]
+        for k, v in di_output.get("header_fields", {}).items()
+        if v.get("value")
     }
 
-    # Collect unmapped header fields
-    matched_keys = set()
-    for std, hints in DI_HINTS.items():
-        for k in di_output["header_fields"]:
-            if any(h.lower() in k.lower() for h in hints):
-                matched_keys.add(k)
-    for k, v in di_output["header_fields"].items():
-        if k not in matched_keys:
-            extracted["unmapped_header_fields"][k] = v["value"]
+    # Best-effort: detect invoice number and date by loose keyword match
+    inv_number = None
+    inv_date   = None
+    subtotal   = None
+    total_amt  = None
+    for k, v in di_output.get("header_fields", {}).items():
+        kl = k.lower()
+        if inv_number is None and any(h in kl for h in ["invoice no","invoice number","inv no","inv #","bill no"]):
+            inv_number = v["value"]
+        if inv_date is None and any(h in kl for h in ["invoice date","date","dated","bill date"]):
+            inv_date = v["value"]
+        if subtotal is None and any(h in kl for h in ["subtotal","sub total","net amount","taxable amount"]):
+            subtotal = v["value"]
+        if total_amt is None and any(h in kl for h in ["grand total","total amount","invoice total","amount due","net payable"]):
+            total_amt = v["value"]
+        # fallback for plain "total" but only if not already found
+        if total_amt is None and kl.strip() == "total":
+            total_amt = v["value"]
 
-    # ── Process tables ────────────────────────────
+    line_items   = []
+    charge_lines = []
+
     for table in di_output.get("tables", []):
         headers  = table.get("headers", [])
         page_num = table.get("page_number", 1)
-
-        # Map standard columns
-        col = {std: find_col(headers, std) for std in COL_HINTS}
-
-        # All columns not mapped to a standard field = extra
-        mapped_headers = set(v for v in col.values() if v)
-        extra_headers  = [h for h in headers if h not in mapped_headers]
+        # active header snapshot — starts as all DI header fields
+        active_snap = dict(all_header_fields)
 
         for row in table.get("rows", []):
-            # Check if this entire row is a charge row
-            row_text = " ".join(str(v) for v in row.values())
-            desc_val = row.get(col["description"]) if col["description"] else row_text[:80]
+            row_vals = [str(v) for v in row.values() if v]
+            row_text = " ".join(row_vals)
+            row_lower = row_text.lower()
 
+            # Detect if this row signals a new invoice starting
+            if any(hint in row_lower for hint in INVOICE_START_HINTS) and len(row_vals) <= 3:
+                # Likely a header repeat row — update snapshot and skip
+                for col_name, val in row.items():
+                    if val:
+                        active_snap[col_name] = val
+                continue
+
+            # Detect charge row
             if is_charge(row_text, charge_keywords):
-                # Find amount — last numeric value in row
-                amt_val = row.get(col["amount"]) if col["amount"] else None
-                if not amt_val:
-                    for v in reversed(list(row.values())):
-                        if to_float(v) is not None:
-                            amt_val = v
-                            break
-                extracted["charge_lines"].append({
-                    "description": desc_val,
-                    "charge_type": "charge",
-                    "amount":      amt_val,
-                    "page_number": page_num
+                amt_val = None
+                for v in reversed(list(row.values())):
+                    if v and to_float(v) is not None:
+                        amt_val = v
+                        break
+                desc_val = next((v for v in row.values() if v and to_float(v) is None), row_text[:80])
+                charge_lines.append({
+                    "description":      desc_val,
+                    "charge_type":      "charge",
+                    "amount":           amt_val,
+                    "page_number":      page_num,
+                    "_header_snapshot": dict(active_snap)
                 })
-            else:
-                item = {
-                    "page_number":         page_num,
-                    "item_number":         row.get(col["item_number"])         if col["item_number"]         else None,
-                    "manifest":            row.get(col["manifest"])            if col["manifest"]            else None,
-                    "description":         row.get(col["description"])         if col["description"]         else None,
-                    "quantity":            row.get(col["quantity"])            if col["quantity"]            else None,
-                    "unit_of_measurement": row.get(col["unit_of_measurement"]) if col["unit_of_measurement"] else None,
-                    "rate":                row.get(col["rate"])                if col["rate"]                else None,
-                    "amount":              row.get(col["amount"])              if col["amount"]              else None,
-                    "extra_columns":       {h: row.get(h) for h in extra_headers if row.get(h)}
-                }
-                extracted["line_items"].append(item)
+                continue
 
-    return extracted
+            # Regular line item — keep ALL columns as-is in extra_columns
+            # Also try soft-match for QC fields (qty, rate, amount)
+            item = {
+                "page_number":         page_num,
+                "_header_snapshot":    dict(active_snap),
+                "item_number":         None,
+                "manifest":            None,
+                "description":         None,
+                "quantity":            None,
+                "unit_of_measurement": None,
+                "rate":                None,
+                "amount":              None,
+                "extra_columns":       {k: v for k, v in row.items() if v}
+            }
+            for col_name, val in row.items():
+                if not val:
+                    continue
+                cl = col_name.lower()
+                if any(h in cl for h in COL_HINTS.get("item_number",[])):
+                    item["item_number"] = val
+                elif any(h in cl for h in COL_HINTS.get("manifest",[])):
+                    item["manifest"] = val
+                elif any(h in cl for h in COL_HINTS.get("description",[])):
+                    item["description"] = val
+                elif any(h in cl for h in COL_HINTS.get("quantity",[])):
+                    item["quantity"] = val
+                elif any(h in cl for h in COL_HINTS.get("unit_of_measurement",[])):
+                    item["unit_of_measurement"] = val
+                elif any(h in cl for h in COL_HINTS.get("rate",[])):
+                    item["rate"] = val
+                elif any(h in cl for h in COL_HINTS.get("amount",[])):
+                    item["amount"] = val
+
+            # If description still not found — first non-numeric value
+            if not item["description"]:
+                item["description"] = next(
+                    (v for v in row.values() if v and to_float(v) is None), None
+                )
+
+            line_items.append(item)
+
+    return {
+        "invoice_number":     inv_number,
+        "invoice_date":       inv_date,
+        "subtotal":           subtotal,
+        "total_amount":       total_amt,
+        "all_header_fields":  all_header_fields,
+        "line_items":         line_items,
+        "charge_lines":       charge_lines,
+        "unmapped_header_fields": {}
+    }
+
+
+def build_tabular_rows_di_only(filename: str, extracted: dict, mode: str) -> list:
+    """
+    DI-only flat row builder.
+    Every row gets ALL DI header fields as columns (prefixed hdr_).
+    All original table columns appear on the right as extra columns.
+    Same output structure as build_tabular_rows() so Tab 4 works identically.
+    """
+    rows    = []
+    all_hf  = extracted.get("all_header_fields", {})
+
+    def base_row(snap):
+        r = {
+            "file_name":       filename,
+            "extraction_mode": mode,
+            "invoice_number":  extracted.get("invoice_number"),
+            "invoice_date":    extracted.get("invoice_date"),
+        }
+        # Add all DI header fields as columns — label exactly as DI found them
+        for k, v in snap.items():
+            r[k] = v
+        return r
+
+    for item in (extracted.get("line_items") or []):
+        snap = item.get("_header_snapshot", all_hf)
+        row  = base_row(snap)
+        row.update({
+            "page_number":         item.get("page_number", ""),
+            "item_number":         item.get("item_number"),
+            "manifest":            item.get("manifest"),
+            "description":         item.get("description"),
+            "quantity":            item.get("quantity"),
+            "unit_of_measurement": item.get("unit_of_measurement"),
+            "rate":                item.get("rate"),
+            "amount":              item.get("amount"),
+            "subtotal":            None,
+            "total":               None,
+            "row_type":            "line_item"
+        })
+        for k, v in (item.get("extra_columns") or {}).items():
+            row[k] = v
+        rows.append(row)
+
+    for charge in (extracted.get("charge_lines") or []):
+        snap = charge.get("_header_snapshot", all_hf)
+        row  = base_row(snap)
+        row.update({
+            "page_number":         charge.get("page_number", ""),
+            "item_number":         None,
+            "manifest":            None,
+            "description":         charge.get("description"),
+            "quantity":            None,
+            "unit_of_measurement": None,
+            "rate":                None,
+            "amount":              charge.get("amount"),
+            "subtotal":            None,
+            "total":               None,
+            "row_type":            f"charge:{charge.get('charge_type','other')}"
+        })
+        rows.append(row)
+
+    if extracted.get("subtotal"):
+        row = base_row(all_hf)
+        row.update({"description":"SUBTOTAL","subtotal":extracted["subtotal"],
+                    "total":None,"row_type":"subtotal",
+                    "page_number":"","item_number":None,"manifest":None,
+                    "quantity":None,"unit_of_measurement":None,"rate":None,"amount":None})
+        rows.append(row)
+
+    if extracted.get("total_amount"):
+        row = base_row(all_hf)
+        row.update({"description":"TOTAL","subtotal":None,
+                    "total":extracted["total_amount"],"row_type":"total",
+                    "page_number":"","item_number":None,"manifest":None,
+                    "quantity":None,"unit_of_measurement":None,"rate":None,"amount":None})
+        rows.append(row)
+
+    return rows
+
 
 # ── LLM extraction — unchanged ────────────────────────────────────────────────
 
@@ -276,11 +403,14 @@ You are an invoice data extraction assistant.
 
 === EXTRACTION RULES ===
 - Map fields by meaning regardless of label name
-- supplier = vendor / seller / from / shipper
-- customer = bill to / sold to / buyer / client
-- remit_to = remittance address / pay to
-- shipper_address = ship from address
-- bill_to = billing address
+- supplier = vendor / seller / from / shipper / issued by / service provider
+- customer = bill to / sold to / buyer / client / consignee / recipient / deliver to / attention / party name
+- customer_address = billing address / delivery address / sold to address / recipient address
+- remit_to = remit to / pay to / remittance / remit payment
+- shipper_address = ship from / dispatch from / generator address / generator name / pickup address
+- bill_to = billing address / sold to / sold to address / invoice to / charge to
+- origin = ship from / port of loading / POL / loading port / generator / generated at / place of supply / pickup location / from location
+- destination = ship to / port of discharge / POD / delivery port / deliver to / final destination / consignee location / delivery location
 - charge_keywords: {charge_keywords}
 - Rows matching charge_keywords → add to charge_lines array
 - Include page_number per row (default 1)
@@ -620,7 +750,7 @@ with tab2:
 
                         # Extract using same hint-based logic — no LLM
                         extracted = extract_di_only(di_out, charge_keywords)
-                        rows      = build_tabular_rows(fi["name"], extracted, "DI Only")
+                        rows      = build_tabular_rows_di_only(fi["name"], extracted, "DI Only")
                         qc        = run_qc(rows, extracted)
 
                         st.session_state.all_extracted[fi["name"]] = extracted
