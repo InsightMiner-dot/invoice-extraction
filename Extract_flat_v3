@@ -20,31 +20,33 @@ PDF_FILES = [
     "invoice2.pdf",
 ]
 
-# ── Extra charge field names to look for in invoice-level fields ───────────────
-# Azure prebuilt-invoice surfaces these as top-level fields (not inside Items).
-# We treat each one found as an extra charge row appended after line items.
-CHARGE_FIELD_KEYWORDS = [
+# ── Field classification helpers ───────────────────────────────────────────────
+# SubTotal / Total are columns on the LAST item row — not separate rows
+SUBTOTAL_NAMES = {"subtotal", "sub-total", "subtotalamount"}
+TOTAL_NAMES    = {"invoicetotal", "amountdue", "totalamount", "total", "grandtotal", "balance"}
+
+# Charge fields → dynamic CHARGE rows appended after item rows
+# Only what Azure actually returns will be inserted — nothing assumed/hardcoded
+CHARGE_KEYWORDS = [
     "tax", "hst", "gst", "pst", "vat", "salestax",
     "freight", "frt", "handling", "shipping", "delivery",
     "surcharge", "fuelsurcharge", "discount", "adjustment",
-    "fee", "servicecharge", "insurance", "misc", "other",
+    "fee", "servicecharge", "insurance", "misc",
     "environmentalfee", "recyclingfee", "duty",
 ]
 
-def is_charge_field(name: str) -> bool:
-    """True if this invoice-level field looks like an extra charge."""
-    n = name.lower().replace(" ", "").replace("/", "").replace("_", "").replace("-", "")
-    return any(kw in n for kw in CHARGE_FIELD_KEYWORDS)
+def _norm(name: str) -> str:
+    return name.lower().replace(" ", "").replace("/", "").replace("_", "").replace("-", "")
 
-# Fields that are the subtotal / total — go as their own summary rows
-SUBTOTAL_FIELDS = {"subtotal", "sub-total", "subtotalamount"}
-TOTAL_FIELDS    = {"invoicetotal", "amountdue", "totalamount", "total", "grandtotal", "balance"}
+def is_subtotal(name: str) -> bool:
+    return _norm(name) in SUBTOTAL_NAMES
 
-def is_subtotal_field(name: str) -> bool:
-    return name.lower().replace(" ", "").replace("-", "") in SUBTOTAL_FIELDS
+def is_total(name: str) -> bool:
+    return _norm(name) in TOTAL_NAMES
 
-def is_total_field(name: str) -> bool:
-    return name.lower().replace(" ", "").replace("-", "") in TOTAL_FIELDS
+def is_charge(name: str) -> bool:
+    n = _norm(name)
+    return any(kw in n for kw in CHARGE_KEYWORDS)
 
 
 # ── Azure ──────────────────────────────────────────────────────────────────────
@@ -71,25 +73,23 @@ def get_content_conf(field) -> tuple[str, str]:
     return content, (f"{round(conf * 100, 1)}" if conf else "")
 
 
-def get_page_from_field(field) -> str:
+def get_page(field) -> str:
     br = field.get("boundingRegions") or []
     return str(br[0].get("pageNumber", "")) if br else ""
 
 
 def get_currency(field) -> str:
-    """Extract currency code from a currency-type field."""
+    """Extract currency code from valueCurrency dict or any string value."""
     if not field:
         return ""
-    # valueCurrency is a dict with currencyCode and amount
     vc = field.get("valueCurrency")
     if vc and isinstance(vc, dict):
         return vc.get("currencyCode") or ""
-    # fallback: check valueString
-    return field.get("valueString") or ""
+    return ""
 
 
 def discover_item_cols(items_array: list) -> list[str]:
-    """Dynamically discover all valueObject keys across all items."""
+    """Dynamically discover all valueObject keys across every item."""
     seen, order = set(), []
     for item in items_array:
         for k in (item.get("valueObject") or {}).keys():
@@ -103,20 +103,17 @@ def discover_item_cols(items_array: list) -> list[str]:
 
 def extract_rows(filename: str, result: AnalyzeResult) -> tuple[list[dict], list[str]]:
     """
-    Returns (rows, item_keys).
-
     Row layout per invoice:
-      [ITEM rows]      — one row per line item, invoice fields repeat
-      [CHARGE rows]    — one row per extra charge found (Tax, HST, Freight…)
-      [SUBTOTAL row]   — if SubTotal field present
-      [TOTAL row]      — if InvoiceTotal / AmountDue present
 
-    Every row has:
-      File Name | Page | Row Type | Currency
-      + all invoice-level fields (repeating)
-      + all item-level fields (dynamic, only populated on ITEM rows)
-      + Description (reused for charge label on CHARGE/SUBTOTAL/TOTAL rows)
-      + Amount      (reused for charge amount on CHARGE/SUBTOTAL/TOTAL rows)
+      [ITEM rows]   — one per line item; invoice header fields repeat on every row;
+                      SubTotal and InvoiceTotal values sit as columns on the LAST item row only.
+
+      [CHARGE rows] — one per charge field actually found in this invoice
+                      (Tax, HST, TotalTax, Freight, etc. — only what Azure detected).
+                      Uses Description + Amount columns to stay aligned with item rows.
+                      Nothing inserted if no charges found.
+
+    Currency is a column that repeats on every row.
     """
     rows          = []
     all_item_keys = []
@@ -131,9 +128,9 @@ def extract_rows(filename: str, result: AnalyzeResult) -> tuple[list[dict], list
 
         overall_conf = f"{round(doc.confidence * 100, 1)}" if doc.confidence else ""
 
-        # ── Bucket invoice-level fields into 4 groups ──────────────────────────
-        invoice_cols  = {}   # repeating header fields on every row
-        charge_fields = {}   # extra charge fields  → become CHARGE rows
+        # ── Bucket every invoice-level field ──────────────────────────────────
+        invoice_cols  = {}   # repeat on every row
+        charge_fields = {}   # → dynamic CHARGE rows (only what exists)
         subtotal_fld  = None
         total_fld     = None
         currency_code = ""
@@ -144,20 +141,24 @@ def extract_rows(filename: str, result: AnalyzeResult) -> tuple[list[dict], list
 
             content, conf = get_content_conf(fval)
 
-            if is_subtotal_field(fname):
+            # Try currency from this field
+            if not currency_code:
+                currency_code = get_currency(fval)
+
+            if is_subtotal(fname):
                 subtotal_fld = (fname, fval)
-            elif is_total_field(fname):
-                # prefer InvoiceTotal over AmountDue if both exist
-                if total_fld is None or fname.lower() == "invoicetotal":
+
+            elif is_total(fname):
+                # prefer InvoiceTotal if multiple total-like fields exist
+                if total_fld is None or _norm(fname) == "invoicetotal":
                     total_fld = (fname, fval)
-            elif is_charge_field(fname):
-                charge_fields[fname] = fval
+
+            elif is_charge(fname):
+                # Only add if it has an actual value — no empty charge rows
+                if content:
+                    charge_fields[fname] = fval
+
             else:
-                # Try to extract currency from currency-type fields
-                if not currency_code:
-                    cc = get_currency(fval)
-                    if cc:
-                        currency_code = cc
                 invoice_cols[fname]            = content
                 invoice_cols[f"{fname} Conf%"] = conf
 
@@ -171,31 +172,36 @@ def extract_rows(filename: str, result: AnalyzeResult) -> tuple[list[dict], list
                 seen_item.add(k)
                 all_item_keys.append(k)
 
-        # ── Try to get currency from first item's UnitPrice or Amount ──────────
-        if not currency_code and items_array:
+        # Try currency from item fields if still empty
+        if not currency_code:
             for item in items_array:
                 obj = item.get("valueObject") or {}
                 for col in ("UnitPrice", "Amount", "Total", "Rate"):
-                    f = obj.get(col)
-                    if f:
-                        cc = get_currency(f)
-                        if cc:
-                            currency_code = cc
-                            break
+                    cc = get_currency(obj.get(col) or {})
+                    if cc:
+                        currency_code = cc
+                        break
                 if currency_code:
                     break
 
-        # ── Base dict that repeats on every row for this invoice ───────────────
+        # ── Base that repeats on every row ─────────────────────────────────────
         base = {
             "File Name":    filename,
             "Page":         "",
-            "Row Type":     "",
+            "Row Type":     "ITEM",
             "Currency":     currency_code,
             "Overall Conf": overall_conf,
         }
         base.update(invoice_cols)
 
+        # SubTotal and Total as columns (go on last item row only)
+        subtotal_val  = get_content_conf(subtotal_fld[1])[0] if subtotal_fld else ""
+        subtotal_conf = get_content_conf(subtotal_fld[1])[1] if subtotal_fld else ""
+        total_val     = get_content_conf(total_fld[1])[0]    if total_fld    else ""
+        total_conf    = get_content_conf(total_fld[1])[1]    if total_fld    else ""
+
         # ── ITEM rows ──────────────────────────────────────────────────────────
+        item_rows = []
         if items_array:
             for item in items_array:
                 obj = item.get("valueObject") or {}
@@ -204,24 +210,13 @@ def extract_rows(filename: str, result: AnalyzeResult) -> tuple[list[dict], list
                 for col in item_keys:
                     f = obj.get(col)
                     if f:
-                        pg = get_page_from_field(f)
+                        pg = get_page(f)
                         if pg:
                             item_page = pg
                             break
 
-                row              = dict(base)
-                row["Page"]      = item_page
-                row["Row Type"]  = "ITEM"
-
-                # Try to get currency from item if not found yet
-                if not row["Currency"]:
-                    for col in ("UnitPrice", "Amount", "Total"):
-                        f = obj.get(col)
-                        if f:
-                            cc = get_currency(f)
-                            if cc:
-                                row["Currency"] = cc
-                                break
+                row           = dict(base)
+                row["Page"]   = item_page
 
                 for col in item_keys:
                     f                   = obj.get(col)
@@ -229,55 +224,41 @@ def extract_rows(filename: str, result: AnalyzeResult) -> tuple[list[dict], list
                     row[col]            = content
                     row[f"{col} Conf%"] = conf
 
-                rows.append(row)
-
+                item_rows.append(row)
         else:
-            # No items — still emit one row so invoice metadata is captured
-            row             = dict(base)
-            row["Row Type"] = "ITEM"
-            rows.append(row)
+            # No items — still one row so invoice header is captured
+            item_rows.append(dict(base))
 
-        # ── CHARGE rows (Tax, HST, Freight, etc.) ─────────────────────────────
-        # We reuse "Description" and "Amount" columns so they align with item rows
+        # Put SubTotal and Total values on the LAST item row as columns
+        if item_rows:
+            last = item_rows[-1]
+            if subtotal_val:
+                last["SubTotal"]        = subtotal_val
+                last["SubTotal Conf%"]  = subtotal_conf
+            if total_val:
+                last["InvoiceTotal"]       = total_val
+                last["InvoiceTotal Conf%"] = total_conf
+
+        rows.extend(item_rows)
+
+        # ── CHARGE rows — only what was actually found ─────────────────────────
+        # Each charge field that Azure detected becomes one row.
+        # Description col = charge name, Amount col = charge value.
         for fname, fval in charge_fields.items():
             content, conf = get_content_conf(fval)
-            if not content:
-                continue  # skip empty charge fields
-            row                  = dict(base)
-            row["Row Type"]      = "CHARGE"
-            row["Page"]          = get_page_from_field(fval)
-            # Reuse Description col for charge label, Amount col for charge value
-            row["Description"]         = fname
-            row["Description Conf%"]   = ""
-            row["Amount"]              = content
-            row["Amount Conf%"]        = conf
+            row                      = dict(base)
+            row["Row Type"]          = "CHARGE"
+            row["Page"]              = get_page(fval)
+            row["Description"]       = fname        # charge label
+            row["Description Conf%"] = ""
+            row["Amount"]            = content      # charge value
+            row["Amount Conf%"]      = conf
+            # Clear all other item cols so they don't carry over
+            for col in item_keys:
+                if col not in ("Description", "Amount"):
+                    row[col]            = ""
+                    row[f"{col} Conf%"] = ""
             rows.append(row)
-
-        # ── SUBTOTAL row ───────────────────────────────────────────────────────
-        if subtotal_fld:
-            fname, fval   = subtotal_fld
-            content, conf = get_content_conf(fval)
-            if content:
-                row                = dict(base)
-                row["Row Type"]    = "SUBTOTAL"
-                row["Page"]        = get_page_from_field(fval)
-                row["Description"] = "Sub-Total"
-                row["Amount"]      = content
-                row["Amount Conf%"] = conf
-                rows.append(row)
-
-        # ── TOTAL row ─────────────────────────────────────────────────────────
-        if total_fld:
-            fname, fval   = total_fld
-            content, conf = get_content_conf(fval)
-            if content:
-                row                = dict(base)
-                row["Row Type"]    = "TOTAL"
-                row["Page"]        = get_page_from_field(fval)
-                row["Description"] = fname   # e.g. "InvoiceTotal" or "AmountDue"
-                row["Amount"]      = content
-                row["Amount Conf%"] = conf
-                rows.append(row)
 
     return rows, all_item_keys
 
@@ -316,16 +297,23 @@ def collect_all(pdf_files: list[str]) -> tuple[pd.DataFrame, set[str]]:
                 all_keys.append(k)
                 seen_all.add(k)
 
-    META          = ["File Name", "Page", "Row Type", "Currency", "Overall Conf"]
+    META = ["File Name", "Page", "Row Type", "Currency", "Overall Conf"]
+
+    # SubTotal and InvoiceTotal pinned just before item cols
+    SUMMARY_COLS = []
+    for sc in ["SubTotal", "SubTotal Conf%", "InvoiceTotal", "InvoiceTotal Conf%"]:
+        if sc in seen_all:
+            SUMMARY_COLS.append(sc)
+
     item_and_conf = []
     for k in all_item_keys:
         item_and_conf += [k, f"{k} Conf%"]
 
-    end_set  = set(item_and_conf) | {"Error"}
+    end_set  = set(item_and_conf) | set(SUMMARY_COLS) | {"Error"}
     meta_set = set(META)
     inv_cols = [k for k in all_keys if k not in meta_set and k not in end_set]
 
-    final_cols = META + inv_cols + item_and_conf
+    final_cols = META + inv_cols + SUMMARY_COLS + item_and_conf
     if "Error" in seen_all:
         final_cols.append("Error")
 
@@ -340,17 +328,15 @@ THIN   = Side(style="thin", color="CCCCCC")
 BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 ALT    = PatternFill("solid", start_color="EBF5FB")
 
-# Row type highlight colors
-ROW_COLORS = {
-    "CHARGE":   "FEF9E7",  # light yellow
-    "SUBTOTAL": "EAF2FF",  # light blue
-    "TOTAL":    "EAFAF1",  # light green
-}
+CHARGE_FILL   = PatternFill("solid", start_color="FEF9E7")   # yellow  — charge rows
+CHARGE_FONT   = Font(name="Arial", size=10, italic=True)
 
 
 def col_color(col_name: str, item_cols: set) -> str:
     if col_name in ("File Name", "Page", "Row Type", "Currency", "Overall Conf"):
         return "1C2833"
+    if col_name in ("SubTotal", "InvoiceTotal"):
+        return "1A5276"
     if col_name.endswith("Conf%"):
         return "1E8449"
     if col_name in item_cols:
@@ -363,7 +349,7 @@ def write_excel(df: pd.DataFrame, item_cols: set, output_path: str):
     ws = wb.active
     ws.title = "Invoices"
 
-    # ── Headers ──
+    # Headers
     for col_idx, col_name in enumerate(df.columns, start=1):
         cell           = ws.cell(row=1, column=col_idx, value=col_name)
         cell.font      = Font(bold=True, color="FFFFFF", name="Arial", size=10)
@@ -372,37 +358,28 @@ def write_excel(df: pd.DataFrame, item_cols: set, output_path: str):
         cell.border    = BORDER
     ws.row_dimensions[1].height = 35
 
-    # ── Data rows ──
-    row_type_col_idx = list(df.columns).index("Row Type") + 1 if "Row Type" in df.columns else None
+    row_type_idx = list(df.columns).index("Row Type") if "Row Type" in df.columns else None
 
+    # Data rows
     for row_idx, row in enumerate(df.itertuples(index=False), start=2):
-        row_type = ""
-        if row_type_col_idx:
-            row_type = str(row[row_type_col_idx - 1])
-
-        # Row background: special color for CHARGE/SUBTOTAL/TOTAL, else alternating
-        row_fill = None
-        if row_type in ROW_COLORS:
-            row_fill = PatternFill("solid", start_color=ROW_COLORS[row_type])
-        elif row_idx % 2 == 0:
-            row_fill = ALT
+        row_type = str(row[row_type_idx]) if row_type_idx is not None else ""
+        is_charge_row = row_type == "CHARGE"
 
         for col_idx, value in enumerate(row, start=1):
-            cell           = ws.cell(row=row_idx, column=col_idx, value=value if value != "" else "")
-            cell.font      = Font(
-                name="Arial", size=10,
-                bold=(row_type in ("SUBTOTAL", "TOTAL"))  # bold summary rows
-            )
+            cell      = ws.cell(row=row_idx, column=col_idx, value=value if value != "" else "")
+            cell.font = CHARGE_FONT if is_charge_row else Font(name="Arial", size=10)
             cell.alignment = Alignment(vertical="center")
             cell.border    = BORDER
-            if row_fill:
-                cell.fill = row_fill
+            if is_charge_row:
+                cell.fill = CHARGE_FILL
+            elif row_idx % 2 == 0:
+                cell.fill = ALT
 
-    # ── Column widths ──
+    # Column widths
     for col_idx, col_name in enumerate(df.columns, start=1):
         if col_name.endswith("Conf%"):
             width = 10
-        elif col_name in ("File Name",):
+        elif col_name == "File Name":
             width = 25
         elif col_name in ("Page", "Row Type", "Currency", "Overall Conf"):
             width = 13
@@ -411,7 +388,7 @@ def write_excel(df: pd.DataFrame, item_cols: set, output_path: str):
             width = min(max((len(v) for v in vals), default=10), 45) + 3
         ws.column_dimensions[get_column_letter(col_idx)].width = width
 
-    ws.freeze_panes    = "E2"           # freeze meta cols
+    ws.freeze_panes    = "E2"
     ws.auto_filter.ref = ws.dimensions
 
     wb.save(output_path)
