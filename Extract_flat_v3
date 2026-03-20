@@ -376,6 +376,9 @@ def extract_rows(filename: str, result: AnalyzeResult) -> tuple[list[dict], list
     def add_charge(label, amount, page):
         if not label or not amount:
             return
+        # Skip labels that are subtotal/total/tax — already captured as columns
+        if is_subtotal_field(label) or is_total_field(label) or is_tax_label(label):
+            return
         row                = dict(base)
         row["Row Type"]    = "CHARGE"
         row["Page"]        = str(page)
