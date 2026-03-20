@@ -1,0 +1,239 @@
+import os
+import re
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+from azure.ai.documentintelligence import DocumentIntelligenceClient
+from azure.ai.documentintelligence.models import AnalyzeResult, AnalyzeDocumentRequest
+from azure.core.credentials import AzureKeyCredential
+
+
+# ── CONFIG ─────────────────────────────────────────
+ENDPOINT  = "<your-endpoint>"
+KEY       = "<your-key>"
+MODEL_ID  = "prebuilt-invoice"
+OUTPUT_XL = "invoices_flat.xlsx"
+
+PDF_FILES = ["invoice1.pdf", "invoice2.pdf"]
+
+
+# ── NORMALIZATION (NEW) ────────────────────────────
+def normalize_label(text: str) -> str:
+    if not text:
+        return ""
+
+    text = text.lower()
+    text = re.sub(r"[^\w\s]", " ", text)
+
+    replacements = {
+        "t v p": "tvp",
+        "p s t": "pst",
+        "h s t": "hst",
+        "g s t": "gst",
+        "frt": "freight",
+        "hndling": "handling",
+    }
+
+    for k, v in replacements.items():
+        text = text.replace(k, v)
+
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def split_charge_labels(label: str) -> list:
+    return [p.strip() for p in re.split(r"[-/&,+]", label) if p.strip()]
+
+
+# ── CHARGE DETECTION ──────────────────────────────
+CHARGE_LABEL_RE = re.compile(
+    r"(tax|gst|hst|pst|vat|tvq|tps|tvp|"
+    r"shipping|handling|freight|delivery|courier|transport|"
+    r"surcharge|fuel|discount|adjustment|fee|insurance|duty|misc)",
+    re.IGNORECASE
+)
+
+def is_charge_label(text: str) -> bool:
+    norm = normalize_label(text)
+    return CHARGE_LABEL_RE.search(norm) is not None
+
+
+SUMMARY_LABEL_RE = re.compile(
+    r"subtotal|total|grandtotal|amountdue|invoicetotal|balance",
+    re.IGNORECASE
+)
+
+def is_summary_label(text: str) -> bool:
+    return SUMMARY_LABEL_RE.search(text) is not None
+
+
+# ── AZURE ─────────────────────────────────────────
+def run_analysis(pdf_path: str) -> AnalyzeResult:
+    with open(pdf_path, "rb") as f:
+        client = DocumentIntelligenceClient(
+            endpoint=ENDPOINT,
+            credential=AzureKeyCredential(KEY)
+        )
+        poller = client.begin_analyze_document(
+            MODEL_ID,
+            AnalyzeDocumentRequest(bytes_source=f.read())
+        )
+    return poller.result()
+
+
+# ── HELPERS ───────────────────────────────────────
+def get_content_conf(field):
+    if not field:
+        return "", ""
+    return field.get("content", ""), str(round(field.get("confidence", 0)*100,1))
+
+
+def discover_item_cols(items):
+    seen, order = set(), []
+    for item in items:
+        for k in (item.get("valueObject") or {}).keys():
+            if k not in seen:
+                seen.add(k)
+                order.append(k)
+    return order
+
+
+# ── EXTRACTION ────────────────────────────────────
+def extract_rows(filename, result):
+    rows = []
+    all_item_keys = []
+    seen = set()
+
+    for doc in result.documents:
+        items = doc.fields.get("Items", {}).get("valueArray", [])
+        item_keys = discover_item_cols(items)
+
+        for k in item_keys:
+            if k not in seen:
+                seen.add(k)
+                all_item_keys.append(k)
+
+        base = {
+            "File Name": filename,
+            "Row Type": "ITEM",
+            "Currency": "",
+        }
+
+        # ── ITEM ROWS ─────────────────────────────
+        for item in items:
+            row = dict(base)
+            obj = item.get("valueObject", {})
+
+            for k in item_keys:
+                val, conf = get_content_conf(obj.get(k))
+                row[k] = val
+                row[f"{k} Conf%"] = conf
+
+            # NEW COLUMN
+            row["Charge Amount"] = ""
+            row["Charge Amount Conf%"] = ""
+
+            rows.append(row)
+
+        # ── CHARGE EXTRACTION ─────────────────────
+        charges = []
+
+        for table in result.tables or []:
+            td = table.as_dict()
+            for cell in td.get("cells", []):
+                text = cell.get("content", "")
+                if is_charge_label(text):
+                    charges.append(text)
+
+        # ── CREATE CHARGE ROWS ────────────────────
+        for label in charges:
+            split_labels = split_charge_labels(label)
+
+            for sub in split_labels:
+                clean = normalize_label(sub)
+
+                if is_summary_label(clean):
+                    continue
+
+                row = dict(base)
+                row["Row Type"] = "CHARGE"
+
+                # clear item fields
+                for k in all_item_keys:
+                    row[k] = ""
+                    row[f"{k} Conf%"] = ""
+
+                # put label
+                desc_col = next((k for k in all_item_keys if "desc" in k.lower()), None)
+                amt_col = next((k for k in all_item_keys if "amount" in k.lower()), None)
+
+                if desc_col:
+                    row[desc_col] = clean
+
+                if amt_col:
+                    row[amt_col] = ""
+
+                row["Charge Amount"] = ""  # value unknown here
+
+                rows.append(row)
+
+    return rows, all_item_keys
+
+
+# ── COLLECT ───────────────────────────────────────
+def collect_all(pdf_files):
+    all_rows = []
+    all_item_keys = []
+
+    for pdf in pdf_files:
+        result = run_analysis(pdf)
+        rows, keys = extract_rows(pdf, result)
+        all_rows.extend(rows)
+
+        for k in keys:
+            if k not in all_item_keys:
+                all_item_keys.append(k)
+
+    df = pd.DataFrame(all_rows).fillna("")
+
+    # ── COLUMN ORDER ─────────────────────────────
+    cols = list(df.columns)
+
+    if "Charge Amount" not in cols:
+        cols.append("Charge Amount")
+        cols.append("Charge Amount Conf%")
+
+    # move after Amount
+    for c in cols:
+        if "amount" in c.lower():
+            idx = cols.index(c)
+            cols.insert(idx+1, "Charge Amount")
+            cols.insert(idx+2, "Charge Amount Conf%")
+            break
+
+    df = df[dict.fromkeys(cols)]  # remove duplicates
+
+    return df, set(all_item_keys)
+
+
+# ── EXCEL ─────────────────────────────────────────
+def write_excel(df, output):
+    wb = Workbook()
+    ws = wb.active
+
+    for i, col in enumerate(df.columns, 1):
+        ws.cell(row=1, column=i, value=col)
+
+    for r, row in enumerate(df.itertuples(index=False), 2):
+        for c, val in enumerate(row, 1):
+            ws.cell(row=r, column=c, value=val)
+
+    wb.save(output)
+
+
+# ── MAIN ──────────────────────────────────────────
+if __name__ == "__main__":
+    df, item_cols = collect_all(PDF_FILES)
+    write_excel(df, OUTPUT_XL)
+
+    print("✅ Done. Output:", OUTPUT_XL)
