@@ -1,7 +1,5 @@
 import streamlit as st
-import json
-import os
-import re
+import json, os, re, io
 import pandas as pd
 from dotenv import load_dotenv
 from datetime import datetime
@@ -12,49 +10,18 @@ from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.core.credentials import AzureKeyCredential
 from openai import AzureOpenAI
 
-# ── Azure Document Intelligence config ────────────────
-DI_ENDPOINT  = os.getenv("AZURE_DI_ENDPOINT")
-DI_KEY       = os.getenv("AZURE_DI_KEY")
-
-# ── Azure OpenAI config ───────────────────────────────
+# ── Env ───────────────────────────────────────────────────────────────────────
+DI_ENDPOINT              = os.getenv("AZURE_DI_ENDPOINT")
+DI_KEY                   = os.getenv("AZURE_DI_KEY")
 AZURE_OPENAI_ENDPOINT    = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_KEY         = os.getenv("AZURE_OPENAI_KEY")
 AZURE_OPENAI_DEPLOYMENT  = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
 AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview")
 
-def get_llm_client() -> AzureOpenAI:
-    """Return configured Azure OpenAI client."""
-    return AzureOpenAI(
-        azure_endpoint = AZURE_OPENAI_ENDPOINT,
-        api_key        = AZURE_OPENAI_KEY,
-        api_version    = AZURE_OPENAI_API_VERSION,
-    )
+REGISTRY_FILE  = "vendor_registry.json"
+KEYWORDS_FILE  = "charge_keywords.json"
 
-REGISTRY_FILE = "vendor_registry.json"
-
-# ── Field definitions ─────────────────────────────────────────────────────────
-
-# TEXT fields — LLM may clean spelling/formatting only
-TEXT_STANDARD_FIELDS = [
-    "invoice_date", "due_date", "payment_terms", "currency",
-    "supplier.name", "supplier.address", "supplier.tax_id",
-    "bill_to.name",  "bill_to.address",
-    "ship_to.name",  "ship_to.address",
-    "origin", "destination", "extra.custom"
-]
-
-# NUMERIC fields — LLM must NEVER touch these
-NUMERIC_STANDARD_FIELDS = [
-    "invoice_number", "po_number",
-    "subtotal", "tax_amount", "total_amount"
-]
-
-ALL_STANDARD_FIELDS  = TEXT_STANDARD_FIELDS + NUMERIC_STANDARD_FIELDS
-LINE_ITEM_TEXT_COLS    = ["description", "hsn_code", "tax_rate"]
-LINE_ITEM_NUMERIC_COLS = ["quantity", "unit_price", "total"]
-LINE_ITEM_ALL_COLS     = LINE_ITEM_TEXT_COLS + LINE_ITEM_NUMERIC_COLS
-
-CHARGE_KEYWORDS = [
+DEFAULT_CHARGE_KEYWORDS = [
     "tax", "gst", "cgst", "sgst", "igst", "vat",
     "freight", "freight cost", "freight charges",
     "handling", "handling cost", "handling charges",
@@ -63,221 +30,82 @@ CHARGE_KEYWORDS = [
     "surcharge", "service charge", "service fee",
     "duty", "customs duty", "import duty",
     "insurance", "packing", "loading", "unloading",
-    "discount", "rebate", "adjustment"
+    "discount", "rebate", "adjustment", "miscellaneous"
 ]
 
-# Characters OCR commonly confuses inside numbers
-OCR_SUSPECT_CHARS = ["O", "o", "l", "I", "S", "Z", "B", "G", "D"]
+HEADER_COLS = [
+    "file_name", "extraction_mode",
+    "supplier_name", "supplier_id", "supplier_address",
+    "invoice_number", "invoice_date",
+    "customer_name", "customer_address",
+    "remit_to", "shipper_address", "bill_to",
+    "origin", "destination"
+]
 
-# ── Utility functions ─────────────────────────────────────────────────────────
+LINE_COLS = [
+    "page_number", "item_number", "manifest",
+    "description", "quantity", "unit_of_measurement",
+    "rate", "amount"
+]
+
+# ── DI field keyword hints (used in DI-only mode) ─────────────────────────────
+DI_FIELD_HINTS = {
+    "supplier_name":     ["vendor", "supplier", "from", "seller", "shipper name"],
+    "supplier_id":       ["vendor id", "supplier id", "vendor code"],
+    "supplier_address":  ["vendor address", "supplier address", "from address"],
+    "invoice_number":    ["invoice no", "invoice number", "inv no", "inv #", "invoice #"],
+    "invoice_date":      ["invoice date", "date", "dated"],
+    "customer_name":     ["bill to", "sold to", "buyer", "customer", "client"],
+    "customer_address":  ["bill to address", "buyer address", "customer address"],
+    "remit_to":          ["remit to", "pay to", "remittance"],
+    "shipper_address":   ["ship from", "dispatch from", "shipper address"],
+    "bill_to":           ["billing address", "bill to"],
+    "origin":            ["origin", "ship from", "port of loading", "pol"],
+    "destination":       ["destination", "ship to", "port of discharge", "pod"],
+    "subtotal":          ["subtotal", "sub total", "net amount"],
+    "total_amount":      ["total", "grand total", "invoice total", "amount due", "total amount"],
+}
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def load_registry():
     if os.path.exists(REGISTRY_FILE):
-        with open(REGISTRY_FILE, "r") as f:
+        with open(REGISTRY_FILE) as f:
             return json.load(f)
     return {}
 
-def save_registry(registry):
+def save_registry(r):
     with open(REGISTRY_FILE, "w") as f:
-        json.dump(registry, f, indent=2)
+        json.dump(r, f, indent=2)
 
-def looks_numeric_field(field_name: str) -> bool:
-    numeric_keywords = [
-        "amount", "total", "subtotal", "price", "rate", "cost",
-        "qty", "quantity", "tax", "gst", "cgst", "sgst", "igst",
-        "vat", "freight", "charge", "fee", "discount", "value",
-        "number", "no", "#", "invoice no", "po no"
-    ]
-    return any(kw in field_name.lower() for kw in numeric_keywords)
+def load_keywords():
+    if os.path.exists(KEYWORDS_FILE):
+        with open(KEYWORDS_FILE) as f:
+            return json.load(f).get("keywords", DEFAULT_CHARGE_KEYWORDS)
+    return list(DEFAULT_CHARGE_KEYWORDS)
 
-def is_value_numeric(value: str) -> bool:
-    if not value:
-        return False
-    cleaned = re.sub(r"[,.\s\-\+\%]", "", str(value))
-    return bool(re.match(r"^\d+$", cleaned))
+def save_keywords(kws):
+    with open(KEYWORDS_FILE, "w") as f:
+        json.dump({"keywords": kws}, f, indent=2)
 
-def has_suspect_ocr_chars(value: str) -> list:
-    if not value:
-        return []
-    return [c for c in OCR_SUSPECT_CHARS if c in str(value)]
+def get_llm_client():
+    return AzureOpenAI(
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        api_key=AZURE_OPENAI_KEY,
+        api_version=AZURE_OPENAI_API_VERSION,
+    )
 
-def flag_suspicious_numbers(di_output: dict) -> list:
-    """
-    Scan all DI extracted fields.
-    Flag numeric-looking fields that contain OCR suspect characters.
-    These MUST go to human review — LLM is not allowed to fix them.
-    """
-    suspicious = []
-
-    for field_name, field_data in di_output.get("header_fields", {}).items():
-        value = str(field_data.get("value") or "")
-        if looks_numeric_field(field_name) or is_value_numeric(value):
-            suspects = has_suspect_ocr_chars(value)
-            if suspects:
-                suspicious.append({
-                    "location":   "header",
-                    "field":      field_name,
-                    "value":      value,
-                    "suspects":   suspects,
-                    "confidence": field_data.get("confidence", 0),
-                    "corrected":  None
-                })
-
-    for t_idx, table in enumerate(di_output.get("tables", [])):
-        for r_idx, row in enumerate(table.get("rows", [])):
-            for col_name, value in row.items():
-                value = str(value or "")
-                if looks_numeric_field(col_name) or is_value_numeric(value):
-                    suspects = has_suspect_ocr_chars(value)
-                    if suspects:
-                        suspicious.append({
-                            "location":   f"table[{t_idx}].row[{r_idx}]",
-                            "field":      col_name,
-                            "value":      value,
-                            "suspects":   suspects,
-                            "confidence": 0,
-                            "corrected":  None
-                        })
-
-        for r_idx, row in enumerate(table.get("charge_rows", [])):
-            for col_name, value in row.items():
-                value = str(value or "")
-                if is_value_numeric(value):
-                    suspects = has_suspect_ocr_chars(value)
-                    if suspects:
-                        suspicious.append({
-                            "location":   f"table[{t_idx}].charge[{r_idx}]",
-                            "field":      col_name,
-                            "value":      value,
-                            "suspects":   suspects,
-                            "confidence": 0,
-                            "corrected":  None
-                        })
-
-    return suspicious
-
-def guard_numbers(di_output: dict, llm_output: dict) -> tuple:
-    """
-    After LLM runs — verify every numeric field was not changed.
-    If LLM modified ANY number → revert to DI value.
-    Returns (guarded_output, list_of_reverted_fields)
-    """
-    reverted = []
-
-    def normalize(v):
-        return re.sub(r"[,\s]", "", str(v or "")).strip().lower()
-
-    NUMERIC_FIELD_KEYWORDS = {
-        "invoice_number": ["invoice no", "invoice number", "inv no", "inv #"],
-        "po_number":      ["po number", "po no", "purchase order", "order no"],
-        "subtotal":       ["subtotal", "sub total", "net amount", "net total"],
-        "tax_amount":     ["tax amount", "tax", "gst amount", "vat amount"],
-        "total_amount":   ["total", "grand total", "invoice total", "amount due"],
-    }
-
-    di_values = {}
-    for std_field, keywords in NUMERIC_FIELD_KEYWORDS.items():
-        for di_key, di_data in di_output.get("header_fields", {}).items():
-            if any(kw in di_key.lower() for kw in keywords):
-                di_values[std_field] = di_data.get("value")
-                break
-
-    for field in NUMERIC_STANDARD_FIELDS:
-        di_val  = di_values.get(field)
-        llm_val = llm_output.get(field)
-        if di_val and llm_val:
-            if normalize(di_val) != normalize(str(llm_val)):
-                reverted.append({
-                    "field":     field,
-                    "di_value":  di_val,
-                    "llm_value": llm_val,
-                    "action":    "reverted to DI value"
-                })
-                llm_output[field] = di_val
-
-    di_rows  = di_output["tables"][0].get("rows", []) if di_output.get("tables") else []
-    llm_rows = llm_output.get("line_items", [])
-
-    for i, llm_row in enumerate(llm_rows):
-        if i >= len(di_rows):
-            break
-        di_row = di_rows[i]
-        di_numeric_vals = {
-            normalize(v): v
-            for k, v in di_row.items()
-            if is_value_numeric(str(v))
-        }
-        for llm_col in LINE_ITEM_NUMERIC_COLS:
-            llm_val = llm_row.get(llm_col)
-            if not llm_val:
-                continue
-            if normalize(str(llm_val)) not in di_numeric_vals:
-                # LLM invented or changed a number — find closest DI value
-                for di_col, di_val in di_row.items():
-                    if looks_numeric_field(di_col) and is_value_numeric(str(di_val)):
-                        reverted.append({
-                            "field":     f"line_item[{i}].{llm_col}",
-                            "di_value":  di_val,
-                            "llm_value": llm_val,
-                            "action":    "reverted to DI value"
-                        })
-                        llm_row[llm_col] = di_val
-                        break
-
-    return llm_output, reverted
-
-def validate_invoice(data: dict) -> list:
-    errors = []
+def to_float(v):
+    if v is None:
+        return None
     try:
-        def to_float(v):
-            if not v:
-                return 0.0
-            return float(re.sub(r"[^\d.\-]", "", str(v)) or 0)
-
-        subtotal  = to_float(data.get("subtotal"))
-        total     = to_float(data.get("total_amount"))
-        charges   = sum(
-            to_float(c.get("charge_value"))
-            for c in (data.get("total_level_charges") or [])
-            if c.get("charge_type") not in ["discount", "rebate"]
-        )
-        discounts = sum(
-            to_float(c.get("charge_value"))
-            for c in (data.get("total_level_charges") or [])
-            if c.get("charge_type") in ["discount", "rebate"]
-        )
-        if subtotal > 0 and total > 0:
-            expected = subtotal + charges - discounts
-            if abs(expected - total) > 1.0:
-                errors.append(
-                    f"Amount mismatch: {subtotal} + {charges:.2f} charges "
-                    f"- {discounts:.2f} discounts = {expected:.2f}, but total = {total}"
-                )
-    except Exception as e:
-        errors.append(f"Validation error: {e}")
-
-    for field in ["invoice_number", "total_amount"]:
-        if not data.get(field):
-            errors.append(f"Missing required field: {field}")
-
-    return errors
-
-def is_scanned_pdf(file_bytes: bytes) -> bool:
-    try:
-        import fitz
-        doc  = fitz.open(stream=file_bytes, filetype="pdf")
-        text = "".join(page.get_text() for page in doc)
-        return len(text.strip()) < 100
+        return float(re.sub(r"[^\d.\-]", "", str(v)))
     except Exception:
-        return False
+        return None
 
-def scan_quality_label(avg_conf: float) -> tuple:
-    if avg_conf >= 0.85:
-        return "🟢 Good", "Auto process"
-    elif avg_conf >= 0.65:
-        return "🟡 Fair", "LLM review recommended"
-    else:
-        return "🔴 Poor", "Human review required"
+def is_charge_row(text: str, keywords: list) -> bool:
+    t = str(text).lower().strip()
+    return any(kw.lower() in t for kw in keywords)
 
 # ── Azure DI ──────────────────────────────────────────────────────────────────
 
@@ -293,874 +121,955 @@ def run_azure_di(file_bytes: bytes) -> dict:
     output = {
         "raw_text":      result.content or "",
         "header_fields": {},
-        "tables":        [],
-        "charge_lines":  []
+        "tables":        []
     }
 
     if result.key_value_pairs:
         for kv in result.key_value_pairs:
             if kv.key and kv.value:
-                key   = kv.key.content.strip()
-                value = kv.value.content.strip()
-                output["header_fields"][key] = {
-                    "value":      value,
+                output["header_fields"][kv.key.content.strip()] = {
+                    "value":      kv.value.content.strip(),
                     "confidence": round(kv.confidence or 0, 3)
                 }
 
     if result.tables:
         for t_idx, table in enumerate(result.tables):
-            headers = {}
+            headers, row_map = {}, {}
+            page_num = 1
             for cell in table.cells:
+                if cell.bounding_regions:
+                    page_num = cell.bounding_regions[0].page_number
                 if cell.row_index == 0:
                     headers[cell.column_index] = cell.content.strip()
-
-            row_map = {}
-            for cell in table.cells:
-                if cell.row_index == 0:
-                    continue
-                r = cell.row_index
-                if r not in row_map:
-                    row_map[r] = {}
-                col_name = headers.get(cell.column_index, f"col_{cell.column_index}")
-                row_map[r][col_name] = cell.content.strip()
+                else:
+                    r = cell.row_index
+                    if r not in row_map:
+                        row_map[r] = {}
+                    col = headers.get(cell.column_index, f"col_{cell.column_index}")
+                    row_map[r][col] = cell.content.strip()
 
             rows = [row_map[k] for k in sorted(row_map.keys())]
-
-            item_rows, charge_rows = [], []
-            for row in rows:
-                row_text    = " ".join(str(v) for v in row.values()).lower()
-                is_charge   = any(kw in row_text for kw in CHARGE_KEYWORDS)
-                qty_present = any(
-                    k.lower() in ["qty", "quantity", "nos", "units", "count"]
-                    for k in row.keys()
-                )
-                if is_charge and not qty_present:
-                    charge_rows.append(row)
-                else:
-                    item_rows.append(row)
-
             output["tables"].append({
                 "table_index": t_idx,
                 "headers":     list(headers.values()),
-                "rows":        item_rows,
-                "charge_rows": charge_rows
+                "rows":        rows,
+                "page_number": page_num
             })
-            output["charge_lines"].extend(charge_rows)
 
     return output
 
-# ── LLM — strict number protection prompt ────────────────────────────────────
+# ── DI-only extraction ────────────────────────────────────────────────────────
 
-def normalize_with_llm(di_output: dict) -> dict:
-    client = get_llm_client()
+def extract_di_only(
+    di_output: dict,
+    charge_keywords: list,
+    col_mapping: dict,
+    di_field_mapping: dict   # user's custom DI field mapping for this vendor
+) -> dict:
+    """
+    Extract structured data from DI output WITHOUT calling LLM.
+    Uses keyword matching on header_fields + table rows.
+    User can provide a custom DI field mapping to override defaults.
+    """
 
+    def find_header_value(standard_field: str):
+        # Check user's custom DI mapping first
+        custom_key = di_field_mapping.get(standard_field)
+        if custom_key:
+            # Look for exact key match
+            for k, v in di_output["header_fields"].items():
+                if k.lower() == custom_key.lower():
+                    return v["value"]
+
+        # Fall back to keyword hints
+        hints = DI_FIELD_HINTS.get(standard_field, [])
+        for k, v in di_output["header_fields"].items():
+            if any(hint.lower() in k.lower() for hint in hints):
+                return v["value"]
+        return None
+
+    extracted = {
+        "supplier_name":    find_header_value("supplier_name"),
+        "supplier_id":      find_header_value("supplier_id"),
+        "supplier_address": find_header_value("supplier_address"),
+        "invoice_number":   find_header_value("invoice_number"),
+        "invoice_date":     find_header_value("invoice_date"),
+        "customer_name":    find_header_value("customer_name"),
+        "customer_address": find_header_value("customer_address"),
+        "remit_to":         find_header_value("remit_to"),
+        "shipper_address":  find_header_value("shipper_address"),
+        "bill_to":          find_header_value("bill_to"),
+        "origin":           find_header_value("origin"),
+        "destination":      find_header_value("destination"),
+        "subtotal":         find_header_value("subtotal"),
+        "total_amount":     find_header_value("total_amount"),
+        "line_items":       [],
+        "charge_lines":     [],
+        "unmapped_header_fields": {}
+    }
+
+    # Collect unmapped header fields
+    mapped_keys = set()
+    for std_field in DI_FIELD_HINTS:
+        hints = DI_FIELD_HINTS.get(std_field, [])
+        custom = di_field_mapping.get(std_field, "")
+        for k in di_output["header_fields"]:
+            if custom and k.lower() == custom.lower():
+                mapped_keys.add(k)
+            elif any(hint.lower() in k.lower() for hint in hints):
+                mapped_keys.add(k)
+
+    for k, v in di_output["header_fields"].items():
+        if k not in mapped_keys:
+            extracted["unmapped_header_fields"][k] = v["value"]
+
+    # Table rows
+    # User can define column mapping for DI mode
+    col_map = di_field_mapping.get("_columns", {})  # {"original col": "standard col"}
+
+    for table in di_output.get("tables", []):
+        page_num = table.get("page_number", 1)
+        headers  = table.get("headers", [])
+
+        # Detect which column maps to what
+        def detect_col(role_hints):
+            # custom override first
+            for h in headers:
+                if h in col_map and col_map[h] in role_hints:
+                    return h
+            # keyword match
+            for h in headers:
+                if any(hint.lower() in h.lower() for hint in role_hints):
+                    return h
+            return None
+
+        col_item   = detect_col(["item", "item no", "item #", "sr no", "sl no", "line"])
+        col_mfst   = detect_col(["manifest", "awb", "bol", "tracking", "bl no"])
+        col_desc   = detect_col(["description", "particulars", "product", "item description",
+                                  "service", "details", "goods"])
+        col_qty    = detect_col(["qty", "quantity", "nos", "units", "count", "pcs"])
+        col_uom    = detect_col(["uom", "unit", "uom", "measure", "ea", "kg", "cbm"])
+        col_rate   = detect_col(["rate", "unit price", "unit cost", "price", "cost"])
+        col_amount = detect_col(["amount", "total", "line total", "net amount", "value",
+                                  "ext", "extended"])
+
+        # All other columns = extra
+        standard_cols = {col_item, col_mfst, col_desc, col_qty, col_uom, col_rate, col_amount}
+        extra_cols    = [h for h in headers if h not in standard_cols and h is not None]
+
+        for row in table.get("rows", []):
+            desc_val = row.get(col_desc, "") if col_desc else ""
+
+            # Detect if this is a charge row
+            row_text = " ".join(str(v) for v in row.values()).lower()
+            if is_charge_row(row_text, charge_keywords):
+                # Find the amount value — last numeric-looking value
+                amt_val = row.get(col_amount) if col_amount else None
+                if amt_val is None:
+                    for v in reversed(list(row.values())):
+                        if to_float(v) is not None:
+                            amt_val = v
+                            break
+                extracted["charge_lines"].append({
+                    "description": desc_val or row_text[:80],
+                    "charge_type": "charge",
+                    "amount":      amt_val,
+                    "page_number": page_num
+                })
+            else:
+                item = {
+                    "page_number":         page_num,
+                    "item_number":         row.get(col_item)   if col_item   else None,
+                    "manifest":            row.get(col_mfst)   if col_mfst   else None,
+                    "description":         row.get(col_desc)   if col_desc   else None,
+                    "quantity":            row.get(col_qty)    if col_qty    else None,
+                    "unit_of_measurement": row.get(col_uom)    if col_uom    else None,
+                    "rate":                row.get(col_rate)   if col_rate   else None,
+                    "amount":              row.get(col_amount) if col_amount else None,
+                    "extra_columns":       {h: row.get(h) for h in extra_cols if row.get(h)}
+                }
+                extracted["line_items"].append(item)
+
+    return extracted
+
+# ── LLM extraction ────────────────────────────────────────────────────────────
+
+def extract_with_llm(di_output: dict, charge_keywords: list) -> dict:
     prompt = f"""
-You are an invoice field mapping assistant.
+You are an invoice data extraction assistant.
 
-Below is raw JSON from Azure Document Intelligence OCR.
+=== NUMBER RULES (ABSOLUTE) ===
+- Copy ALL numeric values EXACTLY as they appear — do NOT fix, round, or change any number
+- Do NOT calculate any missing number — return null if missing
 
-=== ABSOLUTE RULES FOR NUMBERS — NO EXCEPTIONS ===
-
-1. Copy ALL numeric values EXACTLY character-by-character as in DI output.
-   This includes: amounts, totals, subtotals, quantities, prices,
-   tax values, rates, invoice numbers, PO numbers, HSN codes.
-
-2. Do NOT fix, correct, round, reformat, or change ANY number in any way.
-   Even if a number looks wrong (e.g. "1,5O0.00") — return it EXACTLY as-is.
-
-3. Do NOT remove or add commas, dots, spaces, or any character in numbers.
-
-4. Do NOT calculate or derive any number:
-   - Never compute subtotal from line items
-   - Never compute tax from a rate
-   - Never compute total from subtotal + charges
-   - If a number is missing → return null. Never compute it.
-
-5. For total_level_charges: extract charge values EXACTLY as they appear.
-   Never calculate or infer a charge value.
-
-=== RULES FOR TEXT FIELDS ONLY ===
-
-6. You MAY clean obvious spelling in: vendor name, address, description,
-   payment terms, field labels.
-
-7. Dates: you may reformat ONLY the date format, never the date value.
-   e.g. "15 Jan 2024" → "2024-01-15" is acceptable.
-   But "15 Jan 2O24" → return "15 Jan 2O24" exactly (number rule applies).
-
-8. Map original field names to standard structure based on meaning.
-
-9. Return ONLY valid JSON. No explanation. No markdown.
+=== EXTRACTION RULES ===
+- Map fields by meaning regardless of label name
+- supplier = vendor / seller / from / shipper
+- customer = bill to / sold to / buyer / client
+- remit_to = remittance address / pay to
+- shipper_address = ship from address
+- bill_to = billing address
+- charge_keywords: {charge_keywords}
+- Rows matching charge_keywords → charge_lines array
+- Include page_number per row (default 1)
+- Extra table columns not in standard structure → extra_columns dict per row
+- Return ONLY valid JSON, no explanation
 
 DI RAW OUTPUT:
 {json.dumps(di_output, indent=2)}
 
-Return EXACTLY this JSON structure (use null for missing fields):
+Return EXACTLY:
 {{
-    "invoice_number":  null,
-    "invoice_date":    null,
-    "due_date":        null,
-    "po_number":       null,
-    "payment_terms":   null,
-    "currency":        null,
-    "supplier": {{
-        "name": null, "address": null, "tax_id": null
-    }},
-    "bill_to": {{
-        "name": null, "address": null
-    }},
-    "ship_to": {{
-        "name": null, "address": null
-    }},
-    "origin":      null,
-    "destination": null,
-    "line_items": [
-        {{
-            "description": null,
-            "hsn_code":    null,
-            "quantity":    null,
-            "unit_price":  null,
-            "tax_rate":    null,
-            "total":       null
-        }}
-    ],
-    "total_level_charges": [
-        {{
-            "charge_name":  null,
-            "charge_value": null,
-            "charge_type":  "tax|freight|handling|shipping|tsp|gst|cgst|sgst|igst|vat|discount|other"
-        }}
-    ],
-    "subtotal":     null,
-    "tax_amount":   null,
-    "total_amount": null,
-    "field_mappings":  {{}},
-    "unmapped_fields": {{}}
+  "supplier_name": null, "supplier_id": null, "supplier_address": null,
+  "invoice_number": null, "invoice_date": null,
+  "customer_name": null, "customer_address": null,
+  "remit_to": null, "shipper_address": null, "bill_to": null,
+  "origin": null, "destination": null,
+  "subtotal": null, "total_amount": null,
+  "line_items": [{{
+    "page_number": 1, "item_number": null, "manifest": null,
+    "description": null, "quantity": null, "unit_of_measurement": null,
+    "rate": null, "amount": null, "extra_columns": {{}}
+  }}],
+  "charge_lines": [{{
+    "description": null, "charge_type": null, "amount": null, "page_number": null
+  }}],
+  "unmapped_header_fields": {{}}
 }}
 """
 
-    response = client.chat.completions.create(
-        model=AZURE_OPENAI_DEPLOYMENT,   # deployment name, not model name
+    response = get_llm_client().chat.completions.create(
+        model=AZURE_OPENAI_DEPLOYMENT,
         messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You map invoice fields. "
-                    "CRITICAL: Never modify any numeric value. "
-                    "Return only valid JSON."
-                )
-            },
-            {"role": "user", "content": prompt}
+            {"role": "system", "content": "Extract invoice data. Never modify numbers. Return only valid JSON."},
+            {"role": "user",   "content": prompt}
         ],
-        max_tokens=2000,
+        max_tokens=3000,
         temperature=0
     )
-
-    raw = response.choices[0].message.content.strip()
-    raw = re.sub(r"```json|```", "", raw).strip()
+    raw = re.sub(r"```json|```", "", response.choices[0].message.content.strip()).strip()
     return json.loads(raw)
 
-def apply_vendor_config(di_output: dict, config: dict) -> dict:
-    result = {"line_items": [], "total_level_charges": [], "unmapped_fields": {}}
+# ── Build flat rows ───────────────────────────────────────────────────────────
 
-    def set_nested(d, path, value):
-        keys = path.split(".")
-        for k in keys[:-1]:
-            d = d.setdefault(k, {})
-        d[keys[-1]] = value
+def build_tabular_rows(filename: str, extracted: dict, mode: str) -> list:
+    rows = []
 
-    for original, field_data in di_output["header_fields"].items():
-        if original in config.get("ignored_fields", []):
+    header = {
+        "file_name":        filename,
+        "extraction_mode":  mode,
+        "supplier_name":    extracted.get("supplier_name"),
+        "supplier_id":      extracted.get("supplier_id"),
+        "supplier_address": extracted.get("supplier_address"),
+        "invoice_number":   extracted.get("invoice_number"),
+        "invoice_date":     extracted.get("invoice_date"),
+        "customer_name":    extracted.get("customer_name"),
+        "customer_address": extracted.get("customer_address"),
+        "remit_to":         extracted.get("remit_to"),
+        "shipper_address":  extracted.get("shipper_address"),
+        "bill_to":          extracted.get("bill_to"),
+        "origin":           extracted.get("origin"),
+        "destination":      extracted.get("destination"),
+    }
+
+    for item in (extracted.get("line_items") or []):
+        row = dict(header)
+        row.update({
+            "page_number":         item.get("page_number", 1),
+            "item_number":         item.get("item_number"),
+            "manifest":            item.get("manifest"),
+            "description":         item.get("description"),
+            "quantity":            item.get("quantity"),
+            "unit_of_measurement": item.get("unit_of_measurement"),
+            "rate":                item.get("rate"),
+            "amount":              item.get("amount"),
+            "subtotal":            None,
+            "total":               None,
+            "row_type":            "line_item"
+        })
+        for k, v in (item.get("extra_columns") or {}).items():
+            row[k] = v
+        rows.append(row)
+
+    for charge in (extracted.get("charge_lines") or []):
+        row = dict(header)
+        row.update({
+            "page_number":         charge.get("page_number", ""),
+            "item_number":         None, "manifest": None,
+            "description":         charge.get("description"),
+            "quantity":            None, "unit_of_measurement": None,
+            "rate":                None,
+            "amount":              charge.get("amount"),
+            "subtotal":            None, "total": None,
+            "row_type":            f"charge:{charge.get('charge_type','other')}"
+        })
+        rows.append(row)
+
+    if extracted.get("subtotal"):
+        row = dict(header)
+        row.update({
+            "page_number": "", "item_number": None, "manifest": None,
+            "description": "SUBTOTAL", "quantity": None,
+            "unit_of_measurement": None, "rate": None, "amount": None,
+            "subtotal": extracted.get("subtotal"), "total": None,
+            "row_type": "subtotal"
+        })
+        rows.append(row)
+
+    if extracted.get("total_amount"):
+        row = dict(header)
+        row.update({
+            "page_number": "", "item_number": None, "manifest": None,
+            "description": "TOTAL", "quantity": None,
+            "unit_of_measurement": None, "rate": None, "amount": None,
+            "subtotal": None, "total": extracted.get("total_amount"),
+            "row_type": "total"
+        })
+        rows.append(row)
+
+    return rows
+
+# ── QC ────────────────────────────────────────────────────────────────────────
+
+def run_qc(rows: list, extracted: dict) -> dict:
+    issues     = {}
+    total_amount = to_float(extracted.get("total_amount"))
+    line_sum   = 0.0
+
+    for i, row in enumerate(rows):
+        if row.get("row_type") in ("subtotal", "total"):
             continue
-        value = config.get("overrides", {}).get(original) or field_data["value"]
-        if original in config.get("header_mappings", {}):
-            set_nested(result, config["header_mappings"][original], value)
-        else:
-            result["unmapped_fields"][original] = value
+        amt = to_float(row.get("amount"))
+        if amt is not None:
+            line_sum += amt
 
-    if di_output.get("tables"):
-        for row in di_output["tables"][0].get("rows", []):
-            mapped_row = {}
-            for col, value in row.items():
-                if col in config.get("ignored_fields", []):
-                    continue
-                if col in config.get("column_mappings", {}):
-                    mapped_row[config["column_mappings"][col]] = value
-                else:
-                    mapped_row[col] = value
-            result["line_items"].append(mapped_row)
+        qty  = to_float(row.get("quantity"))
+        rate = to_float(row.get("rate"))
+        if qty is not None and rate is not None and amt is not None:
+            expected = round(qty * rate, 2)
+            if abs(expected - round(amt, 2)) > 0.02:
+                issues[i] = f"Qty×Rate={qty}×{rate}={expected} ≠ amount={amt}"
 
-        for row in di_output["tables"][0].get("charge_rows", []):
-            vals = list(row.values())
-            result["total_level_charges"].append({
-                "charge_name":  vals[0]  if vals else "",
-                "charge_value": vals[-1] if vals else "",
-                "charge_type":  "other"
-            })
+    total_issue = None
+    if total_amount and abs(line_sum - total_amount) > 0.5:
+        total_issue = f"Sum of amounts ({line_sum:.2f}) ≠ invoice total ({total_amount:.2f})"
 
-    return result
+    return {"row_issues": issues, "total_issue": total_issue, "line_sum": line_sum}
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STREAMLIT UI
+# STREAMLIT APP
 # ══════════════════════════════════════════════════════════════════════════════
 
 st.set_page_config(page_title="Invoice Extractor", layout="wide")
-st.title("📄 Invoice Extraction System")
-st.caption("Azure DI + GPT-4o mini  |  Numbers fully protected  |  Self-learning vendor mapping")
+st.title("📄 Invoice Extractor")
+st.caption("Multi-PDF | DI Only or DI + LLM per file | Azure DI + GPT-4o mini")
 
-for key, default in {
-    "di_output":         None,
-    "llm_output":        None,
-    "final_output":      None,
-    "vendor_name":       "",
-    "suspicious":        [],
-    "reverted":          [],
-    "scan_quality":      None,
-    "is_scanned":        False,
-    "human_corrections": {},
-    "header_config":     {},
-    "column_config":     {},
+for k, v in {
+    "uploaded_files_info": [],   # list of {name, bytes, mode}
+    "all_rows":            [],
+    "all_extracted":       {},
+    "qc_results":          {},
+    "col_mapping":         {},
+    "di_field_mapping":    {},   # {filename: {standard_field: "original label"}}
+    "charge_keywords":     None,
+    "processed_files":     set(),
 }.items():
-    if key not in st.session_state:
-        st.session_state[key] = default
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+if st.session_state.charge_keywords is None:
+    st.session_state.charge_keywords = load_keywords()
 
 registry = load_registry()
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Config")
+    st.caption("Azure DI: "     + ("✅" if DI_ENDPOINT and DI_KEY else "❌ .env"))
+    st.caption("Azure OpenAI: " + ("✅" if AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_KEY else "❌ .env"))
     st.caption(f"Deployment: {AZURE_OPENAI_DEPLOYMENT}")
-    st.caption(f"API Version: {AZURE_OPENAI_API_VERSION}")
-    st.caption("Azure DI: " + ("✅" if DI_ENDPOINT and DI_KEY else "❌ check .env"))
-    st.caption("Azure OpenAI: " + ("✅" if AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_KEY else "❌ check .env"))
 
     st.divider()
-    st.subheader("📋 Vendor Registry")
-    if registry:
-        for v in registry:
-            st.success(f"✅ {v}")
-    else:
-        st.info("No vendors saved yet")
-    if st.button("🗑️ Clear Registry"):
-        save_registry({})
+    st.subheader("💰 Charge Keywords")
+    st.caption("Add new keywords — rows matching these become charge rows")
+
+    kw_text = st.text_area(
+        "Keywords (one per line)",
+        value="\n".join(st.session_state.charge_keywords),
+        height=180,
+        key="kw_area"
+    )
+    col_a, col_b = st.columns(2)
+    if col_a.button("💾 Save", key="save_kw", use_container_width=True):
+        updated = [k.strip().lower() for k in kw_text.split("\n") if k.strip()]
+        st.session_state.charge_keywords = updated
+        save_keywords(updated)
+        st.success(f"✅ {len(updated)} keywords saved")
+
+    if col_b.button("↩️ Reset", key="reset_kw", use_container_width=True):
+        st.session_state.charge_keywords = list(DEFAULT_CHARGE_KEYWORDS)
+        save_keywords(list(DEFAULT_CHARGE_KEYWORDS))
         st.rerun()
 
     st.divider()
-    st.subheader("🛡️ Number Rules")
-    st.markdown("""
-- LLM **cannot** modify any number
-- Suspect OCR chars flagged → human review
-- Number guard runs after every LLM call
-- Human corrections override everything
-""")
+    if st.button("🗑️ Clear All Results", use_container_width=True):
+        st.session_state.all_rows       = []
+        st.session_state.all_extracted  = {}
+        st.session_state.qc_results     = {}
+        st.session_state.processed_files = set()
+        st.rerun()
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "1️⃣ Upload & Extract",
-    "2️⃣ DI Raw Output",
-    "3️⃣ 🔢 Number Review",
-    "4️⃣ Configure Mapping",
-    "5️⃣ Final Result"
+    "1️⃣ Upload Files",
+    "2️⃣ DI Only — Map & Extract",
+    "3️⃣ DI + LLM — Extract",
+    "4️⃣ Results & QC",
+    "5️⃣ Column Mapping (Optional)"
 ])
 
 # ════════════════════════════════════════════════════════
-# TAB 1
+# TAB 1 — Upload & assign mode
 # ════════════════════════════════════════════════════════
 with tab1:
-    st.subheader("Upload & Extract")
-    uploaded = st.file_uploader("Upload PDF or Image", type=["pdf", "jpg", "jpeg", "png"])
-
-    c1, c2 = st.columns(2)
-    run_di  = c1.button("🔍 Step 1: Run Azure DI",       use_container_width=True)
-    run_llm = c2.button("🤖 Step 2: Run LLM Normalize",  use_container_width=True)
-
-    if uploaded and run_di:
-        with st.spinner("Running Azure Document Intelligence..."):
-            try:
-                file_bytes = uploaded.read()
-
-                scanned = False
-                if uploaded.name.lower().endswith(".pdf"):
-                    try:
-                        scanned = is_scanned_pdf(file_bytes)
-                    except Exception:
-                        pass
-                st.session_state.is_scanned = scanned
-
-                di_out = run_azure_di(file_bytes)
-                st.session_state.di_output = di_out
-
-                if di_out["header_fields"]:
-                    avg_conf = sum(
-                        v["confidence"] for v in di_out["header_fields"].values()
-                    ) / len(di_out["header_fields"])
-                    label, action = scan_quality_label(avg_conf)
-                    st.session_state.scan_quality = {
-                        "avg": avg_conf, "label": label, "action": action
-                    }
-
-                suspicious = flag_suspicious_numbers(di_out)
-                st.session_state.suspicious        = suspicious
-                st.session_state.human_corrections = {}
-                st.session_state.llm_output        = None
-                st.session_state.final_output      = None
-
-                for key, val in di_out["header_fields"].items():
-                    if any(w in key.lower() for w in ["vendor", "supplier", "from", "seller"]):
-                        st.session_state.vendor_name = val["value"]
-                        break
-
-                st.success("✅ Azure DI extraction complete!")
-
-                m1, m2, m3, m4, m5 = st.columns(5)
-                m1.metric("Header Fields",  len(di_out["header_fields"]))
-                m2.metric("Tables",         len(di_out["tables"]))
-                m3.metric("Line Rows",
-                          len(di_out["tables"][0]["rows"]) if di_out["tables"] else 0)
-                m4.metric("Charge Rows",
-                          len(di_out["tables"][0].get("charge_rows", [])) if di_out["tables"] else 0)
-                m5.metric("⚠️ Suspect Numbers", len(suspicious))
-
-                if scanned:
-                    st.warning("📷 Scanned PDF — check Tab 3 carefully")
-                if suspicious:
-                    st.error(f"🔴 {len(suspicious)} numeric fields need human review — go to Tab 3")
-
-            except Exception as e:
-                st.error(f"DI Error: {e}")
-
-    if st.session_state.di_output and run_llm:
-        vendor = st.session_state.vendor_name
-
-        if vendor and vendor in registry:
-            with st.spinner(f"Applying saved config for '{vendor}'..."):
-                result = apply_vendor_config(st.session_state.di_output, registry[vendor])
-                result, reverted = guard_numbers(st.session_state.di_output, result)
-                st.session_state.llm_output   = result
-                st.session_state.reverted     = reverted
-                st.session_state.final_output = result
-                st.success(f"✅ Used saved config for '{vendor}' — no LLM needed!")
-                if reverted:
-                    st.warning(f"🛡️ {len(reverted)} numbers protected")
-        else:
-            with st.spinner("Running GPT-4o mini (text mapping only, numbers protected)..."):
-                try:
-                    llm_out = normalize_with_llm(st.session_state.di_output)
-                    llm_out, reverted = guard_numbers(st.session_state.di_output, llm_out)
-                    st.session_state.llm_output = llm_out
-                    st.session_state.reverted   = reverted
-
-                    if not vendor:
-                        st.session_state.vendor_name = (
-                            (llm_out.get("supplier") or {}).get("name") or ""
-                        )
-
-                    st.success("✅ LLM normalization complete!")
-                    if reverted:
-                        st.warning(f"🛡️ Number guard: {len(reverted)} fields reverted to DI values")
-                    if st.session_state.suspicious:
-                        st.error("🔴 Go to Tab 3 to correct suspicious numbers before finalizing")
-
-                except Exception as e:
-                    st.error(f"LLM Error: {e}")
-
-    if st.session_state.scan_quality:
-        q = st.session_state.scan_quality
-        st.divider()
-        r1, r2, r3 = st.columns(3)
-        r1.metric("Scan Quality",     q["label"])
-        r2.metric("Avg Confidence",   f"{q['avg']*100:.0f}%")
-        r3.metric("Recommendation",   q["action"])
-
-# ════════════════════════════════════════════════════════
-# TAB 2
-# ════════════════════════════════════════════════════════
-with tab2:
-    st.subheader("Azure DI Raw Output — Exactly As Extracted")
-    di = st.session_state.di_output
-
-    if not di:
-        st.info("Run Azure DI first (Tab 1)")
-    else:
-        st.markdown("### Header Fields")
-        rows = []
-        for k, v in di["header_fields"].items():
-            conf = v["confidence"]
-            icon = "🟢" if conf >= 0.85 else "🟡" if conf >= 0.65 else "🔴"
-            suspects = has_suspect_ocr_chars(str(v["value"] or ""))
-            rows.append({
-                "Field":      k,
-                "Value":      v["value"],
-                "Confidence": f"{icon} {conf*100:.0f}%",
-                "⚠️ OCR Suspect": "⚠️ " + " ".join(suspects) if suspects else ""
-            })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
-
-        if di["tables"]:
-            st.markdown("### Line Item Table (original headers)")
-            st.dataframe(pd.DataFrame(di["tables"][0]["rows"]), use_container_width=True)
-
-            charge_rows = di["tables"][0].get("charge_rows", [])
-            if charge_rows:
-                st.markdown("### Detected Charge Rows")
-                st.dataframe(pd.DataFrame(charge_rows), use_container_width=True)
-
-        st.markdown("### Raw OCR Text")
-        st.text_area("", di["raw_text"], height=200)
-
-        with st.expander("Full DI JSON"):
-            st.json(di)
-
-# ════════════════════════════════════════════════════════
-# TAB 3 — Number Review
-# ════════════════════════════════════════════════════════
-with tab3:
-    st.subheader("🔢 Number Review — Human Correction")
+    st.subheader("Upload Invoices & Choose Extraction Mode")
     st.markdown("""
-> **Why this tab exists:**
-> OCR commonly confuses `O` with `0`, `l` with `1`, `I` with `1`, etc.
-> **LLM is strictly prohibited from fixing any number.**
-> You must enter the correct value by reading the original invoice.
+| Mode | When to use | Cost |
+|---|---|---|
+| **DI Only** | Clean digital PDFs, known/standard layouts, same vendor repeatedly | Free (no LLM) |
+| **DI + LLM** | Scanned, complex layouts, new vendors, mixed formats | LLM tokens used |
 """)
 
-    suspicious = st.session_state.suspicious
-    reverted   = st.session_state.reverted
+    uploaded = st.file_uploader(
+        "Upload PDF or image invoices",
+        type=["pdf", "jpg", "jpeg", "png"],
+        accept_multiple_files=True
+    )
 
-    if not st.session_state.di_output:
-        st.info("Run Azure DI first (Tab 1)")
+    if uploaded:
+        st.markdown("### Assign Mode Per File")
+        st.caption("Choose extraction mode for each file. Default is DI + LLM.")
 
-    elif not suspicious:
-        st.success("✅ No suspicious numeric fields detected — numbers look clean!")
-
-    else:
-        st.error(f"🔴 {len(suspicious)} numeric fields need human correction")
-        st.markdown("---")
-
-        corrections = dict(st.session_state.human_corrections)
-
-        for i, item in enumerate(suspicious):
-            key_id = f"{item['location']}.{item['field']}"
-
-            st.markdown(f"**Field {i+1} of {len(suspicious)}**")
-            r1, r2, r3, r4 = st.columns([2, 2, 3, 3])
-
-            r1.markdown(f"📍 Location")
-            r1.code(item["location"])
-
-            r2.markdown(f"🏷️ Field Name")
-            r2.code(item["field"])
-
-            r3.markdown("🔴 DI Extracted (may have OCR error)")
-            r3.error(item["value"])
-            r3.caption(f"Suspect chars: `{'`, `'.join(item['suspects'])}`")
-
-            r4.markdown("✏️ Correct Value (read from invoice)")
-            correct = r4.text_input(
+        file_modes = {}
+        for f in uploaded:
+            c1, c2, c3 = st.columns([3, 2, 2])
+            c1.markdown(f"📄 **{f.name}**")
+            mode = c2.radio(
                 "",
-                value=corrections.get(key_id, ""),
-                key=f"numfix_{i}",
-                placeholder="Type exact value from invoice"
+                ["DI Only", "DI + LLM"],
+                horizontal=True,
+                key=f"mode_{f.name}"
             )
-            if correct:
-                corrections[key_id] = correct
+            already = f.name in st.session_state.processed_files
+            if already:
+                c3.success("✅ Already processed")
+            file_modes[f.name] = mode
 
-            st.markdown("---")
-
-        if st.button("💾 Save All Number Corrections", type="primary", use_container_width=True):
-            st.session_state.human_corrections = corrections
-            saved = len([v for v in corrections.values() if v])
-            st.success(f"✅ {saved} corrections saved — proceed to Tab 4")
-
-    # Number guard report
-    if reverted:
         st.divider()
-        st.markdown("### 🛡️ Number Guard Report")
-        st.caption("LLM attempted to change these — automatically reverted to DI values")
-        st.dataframe(pd.DataFrame(reverted), use_container_width=True)
 
-    # Preview current numeric values
-    if st.session_state.llm_output:
-        st.divider()
-        st.markdown("### Current Numeric Values in Output")
-        llm = st.session_state.llm_output
-        for field in NUMERIC_STANDARD_FIELDS:
-            val = llm.get(field)
-            c1, c2 = st.columns([3, 4])
-            c1.markdown(f"`{field}`")
-            if val:
-                suspects = has_suspect_ocr_chars(str(val))
-                if suspects:
-                    c2.error(f"{val}  ⚠️ Still suspect: {''.join(suspects)} — correct above")
-                else:
-                    c2.success(f"{val} ✅")
-            else:
-                c2.warning("null")
+        # Global override
+        gc1, gc2, gc3 = st.columns(3)
+        if gc1.button("Set All → DI Only",   use_container_width=True):
+            for f in uploaded:
+                st.session_state[f"mode_{f.name}"] = "DI Only"
+            st.rerun()
+        if gc2.button("Set All → DI + LLM",  use_container_width=True):
+            for f in uploaded:
+                st.session_state[f"mode_{f.name}"] = "DI + LLM"
+            st.rerun()
+
+        # Summary
+        di_only_files = [f for f in uploaded if file_modes.get(f.name) == "DI Only"]
+        llm_files     = [f for f in uploaded if file_modes.get(f.name) == "DI + LLM"]
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Total Files",  len(uploaded))
+        m2.metric("DI Only",      len(di_only_files))
+        m3.metric("DI + LLM",     len(llm_files))
+
+        if di_only_files:
+            st.info(
+                f"📌 {len(di_only_files)} DI-only file(s): "
+                "go to Tab 2 to configure column mapping before processing"
+            )
+        if llm_files:
+            st.info(
+                f"🤖 {len(llm_files)} DI+LLM file(s): "
+                "go to Tab 3 to process"
+            )
+
+        # Store file info in session state
+        st.session_state.uploaded_files_info = [
+            {
+                "name":  f.name,
+                "bytes": f.read(),
+                "mode":  file_modes.get(f.name, "DI + LLM")
+            }
+            for f in uploaded
+        ]
 
 # ════════════════════════════════════════════════════════
-# TAB 4 — Configure Mapping
+# TAB 2 — DI Only
+# ════════════════════════════════════════════════════════
+with tab2:
+    st.subheader("DI Only — Configure & Extract")
+    st.caption(
+        "For these files, Azure DI extracts everything. "
+        "You map which DI field label = which standard field. "
+        "Then process — no LLM cost."
+    )
+
+    di_only_info = [f for f in st.session_state.uploaded_files_info if f["mode"] == "DI Only"]
+
+    if not di_only_info:
+        st.info("No files assigned to DI Only mode. Go to Tab 1 to upload and assign.")
+    else:
+        st.markdown(f"**{len(di_only_info)} file(s) in DI Only mode**")
+
+        # ── Step 1: Run DI and show raw fields ────────
+        st.markdown("### Step 1 — Preview DI Output")
+        st.caption("Run DI on each file to see what field labels it extracted, then map below.")
+
+        if st.button("🔍 Run Azure DI Preview (all DI-only files)", use_container_width=True):
+            for fi in di_only_info:
+                with st.spinner(f"Running DI on {fi['name']}..."):
+                    try:
+                        di_out = run_azure_di(fi["bytes"])
+                        st.session_state[f"di_preview_{fi['name']}"] = di_out
+                        st.success(f"✅ {fi['name']} — {len(di_out['header_fields'])} fields, "
+                                   f"{len(di_out['tables'])} tables")
+                    except Exception as e:
+                        st.error(f"❌ {fi['name']}: {e}")
+
+        # Show previews
+        for fi in di_only_info:
+            preview_key = f"di_preview_{fi['name']}"
+            if preview_key in st.session_state:
+                di_out = st.session_state[preview_key]
+                with st.expander(f"📄 DI Output — {fi['name']}", expanded=False):
+                    st.markdown("**Extracted Header Fields:**")
+                    hf_rows = [
+                        {"Label": k, "Value": v["value"], "Conf": f"{v['confidence']*100:.0f}%"}
+                        for k, v in di_out["header_fields"].items()
+                    ]
+                    st.dataframe(pd.DataFrame(hf_rows), use_container_width=True)
+
+                    if di_out["tables"]:
+                        st.markdown("**Table Headers:**")
+                        for t in di_out["tables"]:
+                            st.code(", ".join(t["headers"]))
+
+        # ── Step 2: Column mapping per file ───────────
+        st.divider()
+        st.markdown("### Step 2 — Map DI Labels to Standard Fields (Optional)")
+        st.caption(
+            "If DI found the right fields with keyword matching, you can skip this. "
+            "Only fill in fields where auto-detection might miss."
+        )
+
+        di_field_mappings = {}
+
+        for fi in di_only_info:
+            preview_key = f"di_preview_{fi['name']}"
+            di_labels   = []
+            if preview_key in st.session_state:
+                di_labels = [""] + list(st.session_state[preview_key]["header_fields"].keys())
+                # Add table headers too
+                for t in st.session_state[preview_key].get("tables", []):
+                    for h in t["headers"]:
+                        if h not in di_labels:
+                            di_labels.append(h)
+
+            with st.expander(f"🗂️ Field Mapping — {fi['name']}", expanded=False):
+                st.caption(
+                    "Select the DI label that corresponds to each standard field. "
+                    "Leave blank to use auto-detection."
+                )
+                file_mapping = {}
+                col_mapping_table = {}
+
+                # Header field mappings
+                st.markdown("**Header Fields**")
+                STANDARD_HEADER_FIELDS = [
+                    "supplier_name", "supplier_id", "supplier_address",
+                    "invoice_number", "invoice_date",
+                    "customer_name", "customer_address",
+                    "remit_to", "shipper_address", "bill_to",
+                    "origin", "destination",
+                    "subtotal", "total_amount"
+                ]
+                for std in STANDARD_HEADER_FIELDS:
+                    c1, c2 = st.columns([2, 3])
+                    c1.markdown(f"`{std}`")
+                    selected = c2.selectbox(
+                        "", di_labels,
+                        key=f"di_hmap_{fi['name']}_{std}",
+                        index=0
+                    )
+                    if selected:
+                        file_mapping[std] = selected
+
+                # Table column mappings
+                if preview_key in st.session_state and st.session_state[preview_key].get("tables"):
+                    st.markdown("**Table Columns**")
+                    table_headers = [""] + st.session_state[preview_key]["tables"][0]["headers"]
+                    LINE_STANDARD = [
+                        "item_number", "manifest", "description",
+                        "quantity", "unit_of_measurement", "rate", "amount"
+                    ]
+                    for std in LINE_STANDARD:
+                        c1, c2 = st.columns([2, 3])
+                        c1.markdown(f"`{std}`")
+                        selected = c2.selectbox(
+                            "", table_headers,
+                            key=f"di_cmap_{fi['name']}_{std}",
+                            index=0
+                        )
+                        if selected:
+                            col_mapping_table[selected] = std
+
+                file_mapping["_columns"] = col_mapping_table
+                di_field_mappings[fi["name"]] = file_mapping
+
+        st.session_state["di_field_mappings_tab2"] = di_field_mappings
+
+        # ── Step 3: Process ────────────────────────────
+        st.divider()
+        st.markdown("### Step 3 — Extract")
+
+        if st.button("⚡ Extract All DI-Only Files", type="primary", use_container_width=True):
+            charge_keywords = st.session_state.charge_keywords
+            progress = st.progress(0)
+            errors   = []
+
+            for idx, fi in enumerate(di_only_info):
+                progress.progress((idx) / len(di_only_info), text=f"Processing {fi['name']}...")
+
+                try:
+                    # Run DI if not already done
+                    preview_key = f"di_preview_{fi['name']}"
+                    if preview_key not in st.session_state:
+                        st.session_state[preview_key] = run_azure_di(fi["bytes"])
+
+                    di_out       = st.session_state[preview_key]
+                    file_di_map  = st.session_state.get("di_field_mappings_tab2", {}).get(fi["name"], {})
+
+                    extracted = extract_di_only(di_out, charge_keywords, {}, file_di_map)
+                    rows      = build_tabular_rows(fi["name"], extracted, "DI Only")
+                    qc        = run_qc(rows, extracted)
+
+                    st.session_state.all_extracted[fi["name"]] = extracted
+                    st.session_state.all_rows.extend(rows)
+                    st.session_state.qc_results[fi["name"]]  = qc
+                    st.session_state.processed_files.add(fi["name"])
+
+                    st.success(f"✅ {fi['name']} — {len(rows)} rows")
+
+                except Exception as e:
+                    errors.append(f"{fi['name']}: {e}")
+                    st.error(f"❌ {fi['name']}: {e}")
+
+            progress.progress(1.0, text="Done!")
+            if not errors:
+                st.success("All DI-only files processed → go to Tab 4 for results")
+
+# ════════════════════════════════════════════════════════
+# TAB 3 — DI + LLM
+# ════════════════════════════════════════════════════════
+with tab3:
+    st.subheader("DI + LLM — Extract")
+    st.caption(
+        "Azure DI extracts raw structure, then GPT-4o mini normalizes and maps fields. "
+        "Best for complex, scanned, or unknown vendor layouts."
+    )
+
+    llm_info = [f for f in st.session_state.uploaded_files_info if f["mode"] == "DI + LLM"]
+
+    if not llm_info:
+        st.info("No files assigned to DI + LLM mode. Go to Tab 1 to upload and assign.")
+    else:
+        st.markdown(f"**{len(llm_info)} file(s) in DI + LLM mode**")
+
+        for fi in llm_info:
+            already = fi["name"] in st.session_state.processed_files
+            status  = "✅ Processed" if already else "⏳ Pending"
+            st.markdown(f"- {fi['name']} — {status}")
+
+        st.divider()
+
+        if st.button("🚀 Process All DI + LLM Files", type="primary", use_container_width=True):
+            charge_keywords = st.session_state.charge_keywords
+            progress = st.progress(0)
+            errors   = []
+
+            for idx, fi in enumerate(llm_info):
+                progress.progress(idx / len(llm_info), text=f"Processing {fi['name']}...")
+
+                try:
+                    # Run DI
+                    with st.spinner(f"🔍 DI: {fi['name']}"):
+                        di_out = run_azure_di(fi["bytes"])
+                        st.session_state[f"di_preview_{fi['name']}"] = di_out
+
+                    # Run LLM
+                    with st.spinner(f"🤖 LLM: {fi['name']}"):
+                        extracted = extract_with_llm(di_out, charge_keywords)
+
+                    rows = build_tabular_rows(fi["name"], extracted, "DI + LLM")
+                    qc   = run_qc(rows, extracted)
+
+                    st.session_state.all_extracted[fi["name"]] = extracted
+                    st.session_state.all_rows.extend(rows)
+                    st.session_state.qc_results[fi["name"]]    = qc
+                    st.session_state.processed_files.add(fi["name"])
+
+                    st.success(f"✅ {fi['name']} — {len(rows)} rows extracted")
+
+                except Exception as e:
+                    errors.append(f"{fi['name']}: {e}")
+                    st.error(f"❌ {fi['name']}: {e}")
+
+            progress.progress(1.0, text="Done!")
+            if not errors:
+                st.success("All DI+LLM files processed → go to Tab 4 for results")
+
+        # Show DI raw output for inspection
+        for fi in llm_info:
+            preview_key = f"di_preview_{fi['name']}"
+            if preview_key in st.session_state:
+                di_out = st.session_state[preview_key]
+                with st.expander(f"🔍 DI Raw Output — {fi['name']}", expanded=False):
+                    hf_rows = [
+                        {"Label": k, "Value": v["value"], "Conf": f"{v['confidence']*100:.0f}%"}
+                        for k, v in di_out["header_fields"].items()
+                    ]
+                    st.dataframe(pd.DataFrame(hf_rows), use_container_width=True)
+                    if di_out["tables"]:
+                        st.dataframe(
+                            pd.DataFrame(di_out["tables"][0]["rows"]),
+                            use_container_width=True
+                        )
+
+# ════════════════════════════════════════════════════════
+# TAB 4 — Results & QC
 # ════════════════════════════════════════════════════════
 with tab4:
-    st.subheader("Configure Field Mapping")
+    st.subheader("Results & QC")
 
-    if not st.session_state.llm_output:
-        st.info("Complete Steps 1 & 2 in Tab 1 first")
+    rows = st.session_state.all_rows
+    if not rows:
+        st.info("Process invoices in Tab 2 or Tab 3 first")
     else:
-        llm = st.session_state.llm_output
-        di  = st.session_state.di_output
+        df = pd.DataFrame(rows)
 
-        vendor_name = st.text_input(
-            "Vendor Name (saved as registry key)",
-            value=st.session_state.vendor_name
-        )
-        st.session_state.vendor_name = vendor_name
+        # ── QC Summary ─────────────────────────────────
+        st.markdown("### QC Summary")
+        for fname, qc in st.session_state.qc_results.items():
+            mode = next(
+                (r["extraction_mode"] for r in rows if r["file_name"] == fname),
+                "—"
+            )
+            c1, c2, c3, c4 = st.columns([3, 1, 2, 3])
+            c1.markdown(f"**{fname}**")
+            c2.caption(mode)
 
-        if st.session_state.suspicious and not st.session_state.human_corrections:
-            st.warning("⚠️ You have unresolved suspicious numbers — complete Tab 3 first")
-
-        # ── Header Fields ──────────────────────────────
-        st.markdown("### Header Fields")
-        st.caption("🔒 = numeric field (LLM cannot modify) | 🟢🟡🔴 = DI confidence")
-
-        header_config  = {}
-        field_mappings = llm.get("field_mappings", {})
-        all_header_keys = list(di["header_fields"].keys())
-        for k in (llm.get("unmapped_fields") or {}):
-            if k not in all_header_keys:
-                all_header_keys.append(k)
-
-        if all_header_keys:
-            hc = st.columns([0.5, 2, 2.5, 2, 2])
-            hc[0].markdown("**Keep**")
-            hc[1].markdown("**Field**")
-            hc[2].markdown("**DI Value**")
-            hc[3].markdown("**Map To**")
-            hc[4].markdown("**Override / Fix**")
-
-            for key in all_header_keys:
-                fd         = di["header_fields"].get(key, {})
-                di_val     = fd.get("value", (llm.get("unmapped_fields") or {}).get(key, ""))
-                conf       = fd.get("confidence", 1.0)
-                suggested  = field_mappings.get(key, "")
-                is_num     = looks_numeric_field(key) or is_value_numeric(str(di_val or ""))
-                suspects   = has_suspect_ocr_chars(str(di_val or ""))
-                icon       = "🟢" if conf >= 0.85 else "🟡" if conf >= 0.65 else "🔴"
-                lock       = " 🔒" if is_num else ""
-
-                c = st.columns([0.5, 2, 2.5, 2, 2])
-                keep = c[0].checkbox("", value=bool(suggested), key=f"hk_{key}")
-                c[1].markdown(f"`{key}`{lock}")
-
-                val_disp = f"{icon} `{di_val}`"
-                if suspects:
-                    val_disp += f" ⚠️`{''.join(suspects)}`"
-                c[2].markdown(val_disp)
-
-                mapped_to = c[3].selectbox(
-                    "",
-                    [""] + ALL_STANDARD_FIELDS,
-                    index=ALL_STANDARD_FIELDS.index(suggested) + 1
-                    if suggested in ALL_STANDARD_FIELDS else 0,
-                    key=f"hm_{key}",
-                    disabled=not keep
-                )
-
-                hint = "⚠️ Paste corrected value" if suspects else "Optional override"
-                override = c[4].text_input(
-                    "", placeholder=hint, key=f"ho_{key}", disabled=not keep
-                )
-
-                if keep:
-                    header_config[key] = {"mapped_to": mapped_to, "override": override}
-
-        st.session_state.header_config = header_config
-
-        # ── Table Columns ──────────────────────────────
-        st.markdown("### Table Columns")
-        st.caption("🔒 numeric columns — DI values used directly")
-
-        column_config = {}
-        table_headers = di["tables"][0]["headers"] if di and di["tables"] else []
-        sample_row    = di["tables"][0]["rows"][0]  if di and di["tables"] and di["tables"][0]["rows"] else {}
-
-        if table_headers:
-            tc = st.columns([0.5, 2, 2, 2])
-            tc[0].markdown("**Keep**")
-            tc[1].markdown("**Column**")
-            tc[2].markdown("**Sample**")
-            tc[3].markdown("**Map To**")
-
-            for col_name in table_headers:
-                sv       = str(sample_row.get(col_name, ""))
-                is_num   = looks_numeric_field(col_name) or is_value_numeric(sv)
-                suspects = has_suspect_ocr_chars(sv)
-                lock     = " 🔒" if is_num else ""
-
-                c = st.columns([0.5, 2, 2, 2])
-                keep = c[0].checkbox("", value=True, key=f"ck_{col_name}")
-                c[1].markdown(f"`{col_name}`{lock}")
-
-                sv_disp = f"`{sv}`"
-                if suspects:
-                    sv_disp += f" ⚠️`{''.join(suspects)}`"
-                c[2].markdown(sv_disp)
-
-                mapped_to = c[3].selectbox(
-                    "", [""] + LINE_ITEM_ALL_COLS + ["ignore"],
-                    key=f"cm_{col_name}", disabled=not keep
-                )
-                if keep:
-                    column_config[col_name] = mapped_to
-
-        st.session_state.column_config = column_config
-
-        # ── Total Level Charges ────────────────────────
-        st.markdown("### Total Level Charges")
-        st.caption("🔒 Charge values are from DI — edit only if you see a clear OCR error")
-
-        charges      = llm.get("total_level_charges") or []
-        charges_data = []
-
-        if charges:
-            for i, charge in enumerate(charges):
-                c1, c2, c3, c4 = st.columns([2, 2, 2, 0.7])
-                name  = c1.text_input("Name",     value=charge.get("charge_name", ""),  key=f"cn_{i}")
-                value = c2.text_input("Value 🔒", value=charge.get("charge_value", ""), key=f"cv_{i}",
-                                      help="From DI — only edit if clear OCR error")
-                ctype = c3.selectbox(
-                    "Type",
-                    ["tax","freight","handling","shipping","tsp","gst",
-                     "cgst","sgst","igst","vat","discount","other"],
-                    key=f"ct_{i}"
-                )
-                keep = c4.checkbox("✅", value=True, key=f"ckeep_{i}")
-                if keep:
-                    charges_data.append({
-                        "charge_name":  name,
-                        "charge_value": value,
-                        "charge_type":  ctype
-                    })
-        else:
-            st.info("No charges detected — add manually below if present on invoice")
-
-        st.markdown("**➕ Add charge manually:**")
-        a1, a2, a3, a4 = st.columns([2, 2, 2, 1])
-        nc_name  = a1.text_input("Name",     key="ncn", placeholder="e.g. Freight")
-        nc_value = a2.text_input("Value 🔒", key="ncv", placeholder="e.g. 150.00",
-                                 help="Enter exact value from invoice")
-        nc_type  = a3.selectbox(
-            "Type",
-            ["tax","freight","handling","shipping","tsp","gst",
-             "cgst","sgst","igst","vat","discount","other"],
-            key="nct"
-        )
-        if a4.button("Add ➕"):
-            if nc_name and nc_value:
-                charges_data.append({
-                    "charge_name": nc_name, "charge_value": nc_value, "charge_type": nc_type
-                })
-                st.success(f"Added: {nc_name} = {nc_value}")
-
-        # ── Save ───────────────────────────────────────
-        st.divider()
-        if st.button("💾 Save Config & Build Final Output", type="primary", use_container_width=True):
-            if not vendor_name:
-                st.error("Enter a vendor name")
+            if qc.get("total_issue"):
+                c3.error("❌ Mismatch")
+                c4.warning(qc["total_issue"])
             else:
-                header_mappings, ignored_fields, overrides = {}, [], {}
-                for k, v in st.session_state.header_config.items():
-                    mt = v.get("mapped_to", "")
-                    if mt and mt != "ignore":
-                        header_mappings[k] = mt
-                    else:
-                        ignored_fields.append(k)
-                    if v.get("override"):
-                        overrides[k] = v["override"]
+                c3.success("✅ OK")
+                c4.caption(f"Sum: {qc.get('line_sum', 0):.2f}")
 
-                column_mappings = {}
-                for k, v in st.session_state.column_config.items():
-                    if v and v != "ignore":
-                        column_mappings[k] = v
-                    else:
-                        ignored_fields.append(k)
-
-                config = {
-                    "vendor_name":     vendor_name,
-                    "header_mappings": header_mappings,
-                    "column_mappings": column_mappings,
-                    "ignored_fields":  ignored_fields,
-                    "overrides":       overrides,
-                    "updated_at":      datetime.utcnow().isoformat()
-                }
-                registry = load_registry()
-                registry[vendor_name] = config
-                save_registry(registry)
-
-                # Build final output
-                final = json.loads(json.dumps(llm))  # deep copy
-                final["total_level_charges"] = charges_data
-
-                # Apply user overrides (header fields)
-                for original_key, override_val in overrides.items():
-                    if original_key in header_mappings:
-                        target = header_mappings[original_key]
-                        keys   = target.split(".")
-                        d      = final
-                        for k in keys[:-1]:
-                            d = d.setdefault(k, {})
-                        d[keys[-1]] = override_val
-
-                # Apply human number corrections from Tab 3
-                corrections = st.session_state.human_corrections
-                for loc_field, correct_val in corrections.items():
-                    for num_field in NUMERIC_STANDARD_FIELDS:
-                        if num_field in loc_field:
-                            final[num_field] = correct_val
-                            break
-
-                # Final number guard pass
-                final, reverted = guard_numbers(di, final)
-                st.session_state.reverted = reverted
-
-                errors = validate_invoice(final)
-                final["_validation_errors"]  = errors
-                final["_extraction_method"]  = "DI + LLM (numbers protected)"
-                final["_number_corrections"] = corrections
-                final["_reverted_fields"]    = reverted
-
-                st.session_state.final_output = final
-                st.success(f"✅ Config saved for '{vendor_name}' — check Tab 5 for result")
-
-                if errors:
-                    for e in errors:
-                        st.warning(f"⚠️ {e}")
-                else:
-                    st.success("✅ Math validation passed!")
-
-# ════════════════════════════════════════════════════════
-# TAB 5 — Final Result
-# ════════════════════════════════════════════════════════
-with tab5:
-    st.subheader("Final Extracted Invoice")
-
-    data = st.session_state.final_output or st.session_state.llm_output
-    if not data:
-        st.info("Complete extraction and save config (Tab 4) first")
-    else:
-        if not st.session_state.final_output:
-            st.info("Showing LLM output — save config in Tab 4 to finalize")
-
-        # Validation
-        errors = data.get("_validation_errors", [])
-        if errors:
-            for e in errors:
-                st.warning(f"⚠️ {e}")
-        else:
-            st.success("✅ Validation passed")
-
-        # Number protection summary
-        reverted    = data.get("_reverted_fields", [])
-        corrections = data.get("_number_corrections", {})
-        col_a, col_b = st.columns(2)
-        col_a.metric("🛡️ Numbers Reverted by Guard", len(reverted))
-        col_b.metric("✏️ Human Corrections Applied",
-                     len([v for v in corrections.values() if v]))
-
-        if reverted or corrections:
-            with st.expander("🛡️ Number Protection Details"):
-                if reverted:
-                    st.markdown("**LLM changes blocked & reverted:**")
-                    st.dataframe(pd.DataFrame(reverted), use_container_width=True)
-                if corrections:
-                    st.markdown("**Human corrections applied:**")
-                    for k, v in corrections.items():
-                        if v:
-                            st.text(f"  {k}  →  {v}")
+            if qc.get("row_issues"):
+                with st.expander(f"⚠️ {len(qc['row_issues'])} row issues — {fname}"):
+                    for ri, msg in qc["row_issues"].items():
+                        st.warning(f"Row {ri}: {msg}")
 
         st.divider()
 
-        # Invoice header
-        st.markdown("### 🧾 Invoice Header")
-        h1, h2, h3, h4 = st.columns(4)
-        h1.metric("Invoice #",     data.get("invoice_number", "—"))
-        h2.metric("Date",          data.get("invoice_date",   "—"))
-        h3.metric("Due Date",      data.get("due_date",       "—"))
-        h4.metric("Currency",      data.get("currency",       "—"))
-        h5, h6, h7, h8 = st.columns(4)
-        h5.metric("PO Number",     data.get("po_number",      "—"))
-        h6.metric("Payment Terms", data.get("payment_terms",  "—"))
-        h7.metric("Origin",        data.get("origin",         "—"))
-        h8.metric("Destination",   data.get("destination",    "—"))
+        # ── Table display ──────────────────────────────
+        st.markdown("### Invoice Data Table")
 
-        # Parties
-        st.markdown("### 🏢 Parties")
-        p1, p2, p3 = st.columns(3)
-        supplier = data.get("supplier", {}) or {}
-        bill_to  = data.get("bill_to",  {}) or {}
-        ship_to  = data.get("ship_to",  {}) or {}
-        with p1:
-            st.markdown("**Supplier**")
-            st.text(supplier.get("name",    "—"))
-            st.text(supplier.get("address", "—"))
-            st.text(f"Tax ID: {supplier.get('tax_id', '—')}")
-        with p2:
-            st.markdown("**Bill To**")
-            st.text(bill_to.get("name",    "—"))
-            st.text(bill_to.get("address", "—"))
-        with p3:
-            st.markdown("**Ship To**")
-            st.text(ship_to.get("name",    "—"))
-            st.text(ship_to.get("address", "—"))
+        # Collect QC issue row indices globally
+        all_issue_indices = set()
+        global_idx = 0
+        for fname, qc in st.session_state.qc_results.items():
+            file_rows = [r for r in rows if r["file_name"] == fname]
+            for local_idx in qc.get("row_issues", {}):
+                all_issue_indices.add(global_idx + local_idx)
+            global_idx += len(file_rows)
 
-        # Line items
-        st.markdown("### 📦 Line Items")
-        st.caption("🔒 quantity, unit_price, total — values from DI only")
-        line_items = data.get("line_items", [])
-        if line_items:
-            st.dataframe(pd.DataFrame(line_items), use_container_width=True)
-        else:
-            st.info("No line items found")
+        # Column order
+        fixed = [c for c in HEADER_COLS + LINE_COLS + ["subtotal", "total", "row_type"] if c in df.columns]
+        extra = [c for c in df.columns if c not in fixed]
+        df    = df[fixed + extra]
 
-        # Total level charges
-        st.markdown("### 💰 Total Level Charges")
-        st.caption("Each charge as separate line — Tax, GST, CGST, SGST, IGST, Freight, Handling, Shipping, TSP, etc.")
-        charges = data.get("total_level_charges", [])
-        if charges:
-            st.dataframe(
-                pd.DataFrame([{
-                    "Charge Name":  c.get("charge_name",  ""),
-                    "Value 🔒":     c.get("charge_value", ""),
-                    "Type":         c.get("charge_type",  "")
-                } for c in charges]),
-                use_container_width=True
-            )
-        else:
-            st.info("No charges found")
+        df.insert(0, "⚠️", ["⚠️" if i in all_issue_indices else "" for i in range(len(df))])
 
-        # Totals
-        st.markdown("### 🧮 Totals")
-        st.caption("🔒 All values from DI — LLM did not modify these")
-        t1, t2, t3 = st.columns(3)
-        t1.metric("Subtotal",     data.get("subtotal",     "—"))
-        t2.metric("Tax Amount",   data.get("tax_amount",   "—"))
-        t3.metric("Total Amount", data.get("total_amount", "—"))
+        # Filters
+        fc1, fc2, fc3, fc4 = st.columns(4)
+        f_files = fc1.multiselect("File", df["file_name"].unique().tolist())
+        f_mode  = fc2.multiselect("Mode", df["extraction_mode"].unique().tolist() if "extraction_mode" in df.columns else [])
+        f_type  = fc3.multiselect("Row Type", df["row_type"].unique().tolist() if "row_type" in df.columns else [])
+        f_qc    = fc4.checkbox("QC issues only")
 
-        # Unmapped
-        unmapped = data.get("unmapped_fields", {})
-        if unmapped:
-            st.markdown("### ⚠️ Unmapped Fields")
-            st.dataframe(
-                pd.DataFrame([{"Field": k, "Value": v} for k, v in unmapped.items()]),
-                use_container_width=True
-            )
+        dv = df.copy()
+        if f_files: dv = dv[dv["file_name"].isin(f_files)]
+        if f_mode:  dv = dv[dv["extraction_mode"].isin(f_mode)]
+        if f_type:  dv = dv[dv["row_type"].isin(f_type)]
+        if f_qc:    dv = dv[dv["⚠️"] == "⚠️"]
 
+        st.caption(f"Showing {len(dv)} of {len(df)} rows")
+
+        def highlight(row):
+            if row.get("⚠️") == "⚠️":
+                return ["background-color: #fff3cd"] * len(row)
+            rt = str(row.get("row_type", ""))
+            if rt.startswith("charge"):
+                return ["background-color: #dbeafe"] * len(row)
+            if rt in ("subtotal", "total"):
+                return ["background-color: #dcfce7; font-weight: bold"] * len(row)
+            return [""] * len(row)
+
+        st.dataframe(
+            dv.style.apply(highlight, axis=1),
+            use_container_width=True,
+            height=500
+        )
+
+        st.caption(
+            "🟡 Yellow = QC issue (qty×rate≠amount)  |  "
+            "🔵 Blue = charge row  |  "
+            "🟢 Green = subtotal/total"
+        )
+
+        # ── Downloads ──────────────────────────────────
         st.divider()
-        st.download_button(
-            "⬇️ Download JSON",
-            data=json.dumps(data, indent=2),
-            file_name=f"invoice_{data.get('invoice_number', 'output')}.json",
-            mime="application/json",
+        st.markdown("### Download")
+
+        dl1, dl2 = st.columns(2)
+
+        # Full CSV
+        csv_bytes = df.drop(columns=["⚠️"], errors="ignore").to_csv(
+            index=False
+        ).encode("utf-8-sig")
+        dl1.download_button(
+            "⬇️ Download Full CSV",
+            data=csv_bytes,
+            file_name=f"invoices_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv",
             use_container_width=True
         )
 
-        with st.expander("Full JSON"):
-            st.json(data)
+        # Filtered CSV
+        csv_filtered = dv.drop(columns=["⚠️"], errors="ignore").to_csv(
+            index=False
+        ).encode("utf-8-sig")
+        dl2.download_button(
+            "⬇️ Download Filtered CSV",
+            data=csv_filtered,
+            file_name=f"invoices_filtered_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+
+        # Per-file JSON
+        st.markdown("### Raw Extracted JSON")
+        for fname, extracted in st.session_state.all_extracted.items():
+            with st.expander(f"📄 {fname}"):
+                st.json(extracted)
+                st.download_button(
+                    f"⬇️ JSON — {fname}",
+                    data=json.dumps(extracted, indent=2),
+                    file_name=f"{fname}_extracted.json",
+                    mime="application/json",
+                    key=f"jdl_{fname}"
+                )
+
+# ════════════════════════════════════════════════════════
+# TAB 5 — Column Mapping (Optional)
+# ════════════════════════════════════════════════════════
+with tab5:
+    st.subheader("Column Mapping (Optional)")
+    st.caption(
+        "Optionally override what the standard output columns are named in your CSV. "
+        "This does not affect extraction — only renames columns in the download."
+    )
+
+    FIELD_DESCRIPTIONS = {
+        "supplier_name":       "Vendor / Seller / Shipper name",
+        "supplier_id":         "Vendor ID / Supplier code",
+        "supplier_address":    "Vendor / Seller address",
+        "invoice_number":      "Invoice No / Inv # / Reference",
+        "invoice_date":        "Invoice Date / Dated",
+        "customer_name":       "Bill To / Sold To / Buyer name",
+        "customer_address":    "Bill To / Buyer address",
+        "remit_to":            "Remit To / Pay To address",
+        "shipper_address":     "Ship From / Dispatch address",
+        "bill_to":             "Billing address",
+        "origin":              "Origin / Port of Loading",
+        "destination":         "Destination / Port of Discharge",
+        "item_number":         "Item # / Sr No",
+        "manifest":            "Manifest / AWB / BOL",
+        "description":         "Item description / Particulars",
+        "quantity":            "Qty / Quantity / Nos",
+        "unit_of_measurement": "UOM / Unit",
+        "rate":                "Rate / Unit Price",
+        "amount":              "Amount / Line Total",
+    }
+
+    rename_map = dict(st.session_state.get("col_rename_map", {}))
+
+    for std, desc in FIELD_DESCRIPTIONS.items():
+        c1, c2, c3 = st.columns([2, 3, 3])
+        c1.markdown(f"**`{std}`**")
+        c2.caption(desc)
+        custom = c3.text_input(
+            "Rename to (optional)",
+            value=rename_map.get(std, ""),
+            placeholder=std,
+            key=f"rename_{std}"
+        )
+        if custom.strip():
+            rename_map[std] = custom.strip()
+        elif std in rename_map:
+            del rename_map[std]
+
+    st.divider()
+
+    v_name = st.text_input("Save for vendor (optional)", placeholder="e.g. ABC Supplies")
+    r1, r2 = st.columns(2)
+
+    if r1.button("💾 Save", use_container_width=True):
+        st.session_state.col_rename_map = rename_map
+        if v_name.strip():
+            reg = load_registry()
+            if v_name.strip() not in reg:
+                reg[v_name.strip()] = {}
+            reg[v_name.strip()]["col_rename_map"] = rename_map
+            save_registry(reg)
+            st.success(f"Saved for '{v_name}'")
+        else:
+            st.success("Saved for this session")
+
+    if r2.button("↩️ Reset", use_container_width=True):
+        st.session_state.col_rename_map = {}
+        st.rerun()
+
+    if rename_map:
+        st.markdown("### Active Renames")
+        st.dataframe(
+            pd.DataFrame([{"Standard": k, "Renamed To": v} for k, v in rename_map.items()]),
+            use_container_width=True
+        )
+
+    # Load vendor
+    reg = load_registry()
+    if reg:
+        st.markdown("### Load Vendor Setting")
+        sel = st.selectbox("Vendor", [""] + list(reg.keys()), key="load_vendor_t5")
+        if sel and st.button("📂 Load", key="load_vendor_btn"):
+            saved = reg.get(sel, {}).get("col_rename_map", {})
+            st.session_state.col_rename_map = saved
+            st.success(f"Loaded '{sel}'")
+            st.rerun()
