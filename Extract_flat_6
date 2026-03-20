@@ -397,11 +397,11 @@ def extract_rows(filename: str, result: AnalyzeResult) -> tuple:
         else:
             rows.append(dict(base))
 
-        # ── Step 7: CHARGE rows (Exact Key Matching) ───────────────────────────
+        # ── Step 7: CHARGE rows (Exact Key Matching + Fallback) ────────────────
         all_charges      = []
         seen_charge_sigs = set()  # stores (category, normalized_amount)
 
-        # -- Harvest explicit TaxDetails --
+        # 7.1 Harvest explicit TaxDetails --
         tax_details = []
         if "TaxDetails" in doc.fields:
             td_array = doc.fields["TaxDetails"].get("valueArray") or []
@@ -412,7 +412,7 @@ def extract_rows(filename: str, result: AnalyzeResult) -> tuple:
                 if tamt:
                     tax_details.append((ttype, tamt))
 
-        # 1. Process visual tables FIRST (Prioritizes exact literal text)
+        # 7.2 Process visual tables FIRST (Prioritizes exact literal text)
         for label, amount, page in charge_table_rows:
             clean_label = re.sub(r"^[\d\w]{6,}\s+", "", label).strip() or label
             if is_only_summary(clean_label):
@@ -425,7 +425,7 @@ def extract_rows(filename: str, result: AnalyzeResult) -> tuple:
             if norm_amt:
                 seen_charge_sigs.add((cat, norm_amt))
 
-        # 2. Process doc fields (TotalTax, FreightCharge) and fetch literal names
+        # 7.3 Process doc fields (TotalTax, FreightCharge) and fetch literal names
         for fname, amount, conf, page in charge_fields:
             norm_amt = re.sub(r"[^\d\.]", "", amount)
             cat = get_charge_cat(fname)
@@ -458,7 +458,26 @@ def extract_rows(filename: str, result: AnalyzeResult) -> tuple:
             if norm_amt:
                 seen_charge_sigs.add((cat, norm_amt))
 
-        # 3. Append to output
+        # 7.4 Fallback: Search the raw document text (Content Search)
+        raw_text = getattr(result, "content", "")
+        if raw_text:
+            content_pattern = re.compile(
+                r"(h\.s\.t\.?|frt/hndling|freight|handling)\s*[:\-]?\s*\$?\s*([\d\.\,]+)", 
+                re.IGNORECASE
+            )
+            for match in content_pattern.finditer(raw_text):
+                match_label = match.group(1).strip()
+                match_amt = match.group(2).strip()
+                
+                norm_amt = re.sub(r"[^\d\.]", "", match_amt)
+                cat = get_charge_cat(match_label)
+                
+                if norm_amt and (cat, norm_amt) not in seen_charge_sigs:
+                    display_label = match_label.upper() if "h.s.t" in match_label.lower() else match_label.title()
+                    all_charges.append((display_label, match_amt, "Content Search", ""))
+                    seen_charge_sigs.add((cat, norm_amt))
+
+        # 7.5 Append to output
         target_desc = desc_col or (all_item_keys[0] if all_item_keys else None)
         for label, amount, conf, page in all_charges:
             row                  = dict(base)
