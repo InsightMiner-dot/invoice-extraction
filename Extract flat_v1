@@ -1,0 +1,294 @@
+import os
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+from azure.ai.documentintelligence import DocumentIntelligenceClient
+from azure.ai.documentintelligence.models import AnalyzeResult
+from azure.ai.documentintelligence.models import AnalyzeDocumentRequest
+from azure.core.credentials import AzureKeyCredential
+
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+ENDPOINT  = "<your-endpoint>"
+KEY       = "<your-key>"
+MODEL_ID  = "prebuilt-invoice"
+OUTPUT_XL = "invoices_flat.xlsx"
+
+PDF_FILES = [
+    "invoice1.pdf",
+    "invoice2.pdf",
+]
+
+# ── Invoice-level fields to repeat on every row (order matters for columns) ──
+# These are the header/summary fields from the invoice
+INVOICE_FIELDS = [
+    "InvoiceId",
+    "InvoiceDate",
+    "DueDate",
+    "PurchaseOrder",
+    "VendorName",
+    "VendorAddress",
+    "CustomerName",
+    "CustomerAddress",
+    "BillingAddress",
+    "ShippingAddress",
+    "SubTotal",
+    "TotalTax",
+    "AmountDue",
+    "InvoiceTotal",
+]
+
+# ── Line item fields (columns per item row) ────────────────────────────────────
+ITEM_FIELDS = [
+    "Description",
+    "Quantity",
+    "Unit",
+    "UnitPrice",
+    "Amount",
+    "ProductCode",
+    "Tax",
+]
+
+
+# ── Azure ──────────────────────────────────────────────────────────────────────
+
+def run_analysis(pdf_path: str) -> AnalyzeResult:
+    with open(pdf_path, "rb") as f:
+        pdf_bytes = f.read()
+    client = DocumentIntelligenceClient(endpoint=ENDPOINT, credential=AzureKeyCredential(KEY))
+    poller = client.begin_analyze_document(
+        MODEL_ID,
+        AnalyzeDocumentRequest(bytes_source=pdf_bytes),
+        content_type="application/json",
+    )
+    return poller.result()
+
+
+# ── Row Builder ────────────────────────────────────────────────────────────────
+
+def get_field(doc_fields: dict, name: str) -> tuple[str, str]:
+    """Return (content, confidence%) for a named field. Empty string if missing."""
+    field = doc_fields.get(name)
+    if not field:
+        return "", ""
+    content    = field.get("content") or ""
+    confidence = field.get("confidence")
+    conf_str   = f"{round(confidence * 100, 1)}" if confidence else ""
+    return content, conf_str
+
+
+def get_page(field) -> str:
+    """Get page number from a field's bounding regions."""
+    br = field.get("boundingRegions") or []
+    return str(br[0].get("pageNumber", "")) if br else ""
+
+
+def extract_rows(filename: str, result: AnalyzeResult) -> list[dict]:
+    rows = []
+
+    if not result.documents:
+        return rows
+
+    for doc in result.documents:
+        if not doc.fields:
+            continue
+
+        overall_conf = f"{round(doc.confidence * 100, 1)}" if doc.confidence else ""
+
+        # ── Build invoice-level repeated columns ──
+        # Dynamically collect ALL fields from this doc (not just predefined list)
+        # so nothing is lost even if the invoice has unexpected fields
+        all_invoice_fields = {}
+        for fname, fval in doc.fields.items():
+            if fname == "Items":
+                continue
+            content, conf = get_field(doc.fields, fname)
+            all_invoice_fields[fname]           = content
+            all_invoice_fields[f"{fname} Conf%"] = conf
+
+        # ── Get line items ──
+        items_field = doc.fields.get("Items")
+        items_array = (items_field.get("valueArray") or []) if items_field else []
+
+        if items_array:
+            for item in items_array:
+                obj = item.get("valueObject") or {}
+
+                # Get page from first item field that has a bounding region
+                item_page = ""
+                for col in ITEM_FIELDS:
+                    f = obj.get(col)
+                    if f:
+                        br = f.get("boundingRegions") or []
+                        if br:
+                            item_page = str(br[0].get("pageNumber", ""))
+                            break
+
+                row = {
+                    "File Name":      filename,
+                    "Page":           item_page,
+                    "Overall Conf":   overall_conf,
+                }
+
+                # Repeat all invoice-level fields
+                row.update(all_invoice_fields)
+
+                # Item-level fields
+                for col in ITEM_FIELDS:
+                    f = obj.get(col)
+                    if f:
+                        row[col]           = f.get("content") or ""
+                        conf               = f.get("confidence")
+                        row[f"{col} Conf%"] = f"{round(conf * 100, 1)}" if conf else ""
+                    else:
+                        row[col]           = ""
+                        row[f"{col} Conf%"] = ""
+
+                rows.append(row)
+
+        else:
+            # No line items — still output one row with invoice fields
+            row = {
+                "File Name":    filename,
+                "Page":         "",
+                "Overall Conf": overall_conf,
+            }
+            row.update(all_invoice_fields)
+            # Empty item columns
+            for col in ITEM_FIELDS:
+                row[col]            = ""
+                row[f"{col} Conf%"] = ""
+            rows.append(row)
+
+    return rows
+
+
+# ── Collect all rows ───────────────────────────────────────────────────────────
+
+def collect_all(pdf_files: list[str]) -> pd.DataFrame:
+    all_rows = []
+
+    for pdf_path in pdf_files:
+        print(f"  Analyzing: {pdf_path} ...")
+        try:
+            result = run_analysis(pdf_path)
+            rows   = extract_rows(os.path.basename(pdf_path), result)
+            all_rows.extend(rows)
+            print(f"    → {len(rows)} row(s)")
+        except Exception as e:
+            print(f"    ✗ Error: {e}")
+            all_rows.append({"File Name": os.path.basename(pdf_path), "Error": str(e)})
+
+    if not all_rows:
+        return pd.DataFrame()
+
+    # Union all keys preserving insertion order
+    all_keys = []
+    seen     = set()
+    for row in all_rows:
+        for k in row.keys():
+            if k not in seen:
+                all_keys.append(k)
+                seen.add(k)
+
+    # Column order:
+    # 1. Fixed meta: File Name, Page, Overall Conf
+    # 2. Invoice-level fields (value + conf interleaved, dynamically detected)
+    # 3. Item-level fields (value + conf interleaved)
+    META      = ["File Name", "Page", "Overall Conf"]
+    ITEM_COLS = []
+    for col in ITEM_FIELDS:
+        ITEM_COLS += [col, f"{col} Conf%"]
+    INV_COLS  = [k for k in all_keys if k not in META and k not in ITEM_COLS and k != "Error"]
+
+    final_cols = META + INV_COLS + ITEM_COLS
+    # Add Error col if present
+    if "Error" in seen:
+        final_cols.append("Error")
+
+    df = pd.DataFrame(all_rows, columns=final_cols)
+    df = df.fillna("")
+    return df
+
+
+# ── Excel Styling ──────────────────────────────────────────────────────────────
+
+THIN   = Side(style="thin", color="CCCCCC")
+BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+
+
+def col_color(col_name: str) -> str:
+    """Header background color by column group."""
+    if col_name in ("File Name", "Page", "Overall Conf"):
+        return "1C2833"   # dark grey  — meta
+    if col_name.endswith("Conf%"):
+        return "1E8449"   # green      — confidence
+    # Check if it's an item field
+    base = col_name.replace(" Conf%", "")
+    if base in ITEM_FIELDS:
+        return "154360"   # dark blue  — line item value
+    return "1A5276"       # medium blue — invoice field value
+
+
+def write_excel(df: pd.DataFrame, output_path: str):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Invoices"
+
+    # ── Headers ──
+    for col_idx, col_name in enumerate(df.columns, start=1):
+        cell           = ws.cell(row=1, column=col_idx, value=col_name)
+        cell.font      = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+        cell.fill      = PatternFill("solid", start_color=col_color(col_name))
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border    = BORDER
+    ws.row_dimensions[1].height = 35
+
+    # ── Data rows ──
+    ALT = PatternFill("solid", start_color="EBF5FB")
+    for row_idx, row in enumerate(df.itertuples(index=False), start=2):
+        for col_idx, value in enumerate(row, start=1):
+            cell           = ws.cell(row=row_idx, column=col_idx, value=value if value != "" else "")
+            cell.font      = Font(name="Arial", size=10)
+            cell.alignment = Alignment(vertical="center")
+            cell.border    = BORDER
+            if row_idx % 2 == 0:
+                cell.fill = ALT
+
+    # ── Column widths ──
+    for col_idx, col_name in enumerate(df.columns, start=1):
+        if col_name.endswith("Conf%"):
+            width = 10
+        elif col_name in ("File Name",):
+            width = 25
+        elif col_name in ("Page", "Overall Conf"):
+            width = 12
+        else:
+            vals  = [str(col_name)] + [str(v) for v in df.iloc[:, col_idx - 1] if v != ""]
+            width = min(max((len(v) for v in vals), default=10), 40) + 3
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+    # ── Freeze first row + first 3 cols ──
+    ws.freeze_panes = "D2"
+
+    # ── Auto filter ──
+    ws.auto_filter.ref = ws.dimensions
+
+    wb.save(output_path)
+    print(f"\n✅ Saved → {output_path}")
+    print(f"   Total rows    : {len(df)}")
+    print(f"   Total columns : {len(df.columns)}")
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    print("Starting extraction...\n")
+    df = collect_all(PDF_FILES)
+
+    if df.empty:
+        print("No data extracted.")
+    else:
+        print(f"\nBuilding Excel...")
+        write_excel(df, OUTPUT_XL)
