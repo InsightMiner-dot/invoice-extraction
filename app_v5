@@ -1,0 +1,246 @@
+import json
+import os
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+from azure.ai.documentintelligence import DocumentIntelligenceClient
+from azure.ai.documentintelligence.models import AnalyzeResult
+from azure.ai.documentintelligence.models import AnalyzeDocumentRequest
+from azure.core.credentials import AzureKeyCredential
+
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+ENDPOINT  = "<your-endpoint>"
+KEY       = "<your-key>"
+MODEL_ID  = "prebuilt-invoice"
+OUTPUT_XL = "invoices_structured.xlsx"
+
+# List of PDF files to process (can be multiple invoices)
+PDF_FILES = [
+    "invoice1.pdf",
+    "invoice2.pdf",
+    # add more...
+]
+
+
+# ── Azure Analysis ─────────────────────────────────────────────────────────────
+
+def run_analysis(pdf_path: str) -> AnalyzeResult:
+    with open(pdf_path, "rb") as f:
+        pdf_bytes = f.read()
+    client = DocumentIntelligenceClient(endpoint=ENDPOINT, credential=AzureKeyCredential(KEY))
+    poller = client.begin_analyze_document(
+        MODEL_ID,
+        AnalyzeDocumentRequest(bytes_source=pdf_bytes),
+        content_type="application/json",
+    )
+    return poller.result()
+
+
+# ── Row Builder ────────────────────────────────────────────────────────────────
+
+def extract_row(filename: str, result: AnalyzeResult) -> list[dict]:
+    """
+    Returns a list of rows — one per detected document/invoice in the result.
+    Each row is a flat dict with:
+      - Filename, Page(s), DocType, OverallConfidence
+      - One column per detected field  (e.g. VendorName, InvoiceTotal ...)
+      - One column per field confidence (e.g. VendorName_Conf%)
+      - Line items serialized as JSON string in a single cell (Items_JSON)
+      - Raw content in last column
+    """
+    rows = []
+
+    if not result.documents:
+        # No structured docs — still capture raw content row
+        rows.append({
+            "Filename":           filename,
+            "Page(s)":            len(result.pages) if result.pages else "",
+            "DocType":            "",
+            "Overall Confidence": "",
+            "Raw Content":        (result.content or "").strip(),
+        })
+        return rows
+
+    for doc in result.documents:
+        row = {}
+
+        # ── Fixed meta columns ──
+        row["Filename"]           = filename
+        row["Page(s)"]            = len(result.pages) if result.pages else ""
+        row["DocType"]            = doc.doc_type or ""
+        row["Overall Confidence"] = round(doc.confidence * 100, 1) if doc.confidence else ""
+
+        if not doc.fields:
+            row["Raw Content"] = (result.content or "").strip()
+            rows.append(row)
+            continue
+
+        # ── Dynamic field columns ──
+        items_data = []
+
+        for field_name, field in doc.fields.items():
+
+            # Line Items — serialize as JSON in one cell, handled separately below
+            if field_name == "Items":
+                items_array = field.get("valueArray") or []
+                for item in items_array:
+                    obj = item.get("valueObject") or {}
+                    item_row = {}
+                    for col in ["Description", "Quantity", "Unit", "UnitPrice",
+                                "ProductCode", "Date", "Tax", "Amount"]:
+                        f = obj.get(col)
+                        item_row[col] = f.get("content", "") if f else ""
+                    items_data.append(item_row)
+                row["Items (JSON)"] = json.dumps(items_data, ensure_ascii=False)
+                continue
+
+            content    = field.get("content")
+            confidence = field.get("confidence")
+
+            # Value column
+            row[field_name] = content or ""
+
+            # Confidence column right after value
+            row[f"{field_name}_Conf%"] = round(confidence * 100, 1) if confidence else ""
+
+        # ── Raw content last ──
+        row["Raw Content"] = (result.content or "").strip()
+
+        rows.append(row)
+
+    return rows
+
+
+# ── Collect all rows across all PDFs ──────────────────────────────────────────
+
+def collect_all_rows(pdf_files: list[str]) -> pd.DataFrame:
+    all_rows = []
+
+    for pdf_path in pdf_files:
+        print(f"  Analyzing: {pdf_path} ...")
+        try:
+            result = run_analysis(pdf_path)
+            rows   = extract_row(os.path.basename(pdf_path), result)
+            all_rows.extend(rows)
+            print(f"    → {len(rows)} invoice(s) found")
+        except Exception as e:
+            print(f"    ✗ Error: {e}")
+            all_rows.append({"Filename": os.path.basename(pdf_path), "Error": str(e)})
+
+    if not all_rows:
+        return pd.DataFrame()
+
+    # Union all keys — different invoices may have different fields
+    all_keys = []
+    seen     = set()
+    for row in all_rows:
+        for k in row.keys():
+            if k not in seen:
+                all_keys.append(k)
+                seen.add(k)
+
+    # Reorder: fixed meta cols first, then dynamic fields, then Items+Raw at end
+    META_COLS  = ["Filename", "Page(s)", "DocType", "Overall Confidence"]
+    END_COLS   = ["Items (JSON)", "Raw Content", "Error"]
+    mid_cols   = [k for k in all_keys if k not in META_COLS and k not in END_COLS]
+    final_cols = META_COLS + mid_cols + [c for c in END_COLS if c in seen]
+
+    df = pd.DataFrame(all_rows, columns=final_cols)
+    df = df.fillna("")
+    return df
+
+
+# ── Excel Styling ──────────────────────────────────────────────────────────────
+
+THIN   = Side(style="thin", color="D0D0D0")
+BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+
+META_COLOR  = "1E3A5F"   # dark blue  — fixed meta columns
+FIELD_COLOR = "1A5276"   # medium blue — field value columns
+CONF_COLOR  = "117A65"   # green       — confidence columns
+ITEM_COLOR  = "6E2F7A"   # purple      — items / raw
+ALT_ROW     = "EBF5FB"   # light blue  — alternating rows
+
+
+def header_cell(cell, text: str, hex_color: str):
+    cell.value     = text
+    cell.font      = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+    cell.fill      = PatternFill("solid", start_color=hex_color)
+    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    cell.border    = BORDER
+
+
+def write_excel(df: pd.DataFrame, output_path: str):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Invoices"
+
+    META_COLS = ["Filename", "Page(s)", "DocType", "Overall Confidence"]
+    END_COLS  = ["Items (JSON)", "Raw Content", "Error"]
+
+    # ── Write headers with color coding ──
+    for col_idx, col_name in enumerate(df.columns, start=1):
+        cell = ws.cell(row=1, column=col_idx)
+        if col_name in META_COLS:
+            header_cell(cell, col_name, META_COLOR)
+        elif col_name in END_COLS:
+            header_cell(cell, col_name, ITEM_COLOR)
+        elif col_name.endswith("_Conf%"):
+            header_cell(cell, col_name.replace("_Conf%", " Conf%"), CONF_COLOR)
+        else:
+            header_cell(cell, col_name, FIELD_COLOR)
+
+    ws.row_dimensions[1].height = 35
+
+    # ── Write data rows ──
+    for row_idx, row in enumerate(df.itertuples(index=False), start=2):
+        alt = row_idx % 2 == 0
+        for col_idx, value in enumerate(row, start=1):
+            cell            = ws.cell(row=row_idx, column=col_idx, value=str(value) if value != "" else "")
+            cell.font       = Font(name="Arial", size=10)
+            cell.alignment  = Alignment(vertical="center", wrap_text=False)
+            cell.border     = BORDER
+            if alt:
+                cell.fill = PatternFill("solid", start_color=ALT_ROW)
+
+    # ── Column widths ──
+    for col_idx, col_name in enumerate(df.columns, start=1):
+        if col_name in ("Raw Content", "Items (JSON)"):
+            ws.column_dimensions[get_column_letter(col_idx)].width = 40
+        elif col_name.endswith("_Conf%"):
+            ws.column_dimensions[get_column_letter(col_idx)].width = 12
+        elif col_name == "Filename":
+            ws.column_dimensions[get_column_letter(col_idx)].width = 30
+        else:
+            # Auto width based on content
+            col_vals = [str(col_name)] + [str(v) for v in df.iloc[:, col_idx - 1]]
+            max_len  = min(max(len(v) for v in col_vals), 45)
+            ws.column_dimensions[get_column_letter(col_idx)].width = max_len + 3
+
+    # ── Freeze first row + first column ──
+    ws.freeze_panes = "B2"
+
+    # ── Auto filter ──
+    ws.auto_filter.ref = ws.dimensions
+
+    wb.save(output_path)
+    print(f"\n✅ Saved → {output_path}")
+    print(f"   Rows    : {len(df)}")
+    print(f"   Columns : {len(df.columns)}")
+    print(f"   Fields  : {[c for c in df.columns if c not in ['Filename','Page(s)','DocType','Overall Confidence','Items (JSON)','Raw Content','Error']]}")
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    print("Starting extraction...\n")
+    df = collect_all_rows(PDF_FILES)
+
+    if df.empty:
+        print("No data extracted.")
+    else:
+        print(f"\nTotal invoices extracted : {len(df)}")
+        print(f"Total dynamic columns    : {len(df.columns)}")
+        write_excel(df, OUTPUT_XL)
