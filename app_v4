@@ -1,0 +1,735 @@
+import streamlit as st
+import json
+import io
+import os
+from PIL import Image, ImageDraw, ImageFont
+import fitz  # PyMuPDF
+from azure.ai.documentintelligence import DocumentIntelligenceClient
+from azure.ai.documentintelligence.models import AnalyzeResult
+from azure.ai.documentintelligence.models import AnalyzeDocumentRequest
+from azure.core.credentials import AzureKeyCredential
+
+# ── Page Config ────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Document Intelligence Studio",
+    page_icon="🔍",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ── Global Styles ──────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
+
+html, body, [class*="css"] {
+    font-family: 'IBM Plex Sans', sans-serif;
+}
+
+/* ── Main background ── */
+.stApp {
+    background: #0f1117;
+    color: #e2e8f0;
+}
+
+/* ── Sidebar ── */
+[data-testid="stSidebar"] {
+    background: #161b27 !important;
+    border-right: 1px solid #2d3748;
+}
+[data-testid="stSidebar"] * {
+    color: #cbd5e0 !important;
+}
+[data-testid="stSidebar"] .stTextInput input {
+    background: #1e2535 !important;
+    border: 1px solid #3d4f6b !important;
+    color: #e2e8f0 !important;
+    font-family: 'IBM Plex Mono', monospace !important;
+    font-size: 12px !important;
+}
+
+/* ── Uploader ── */
+[data-testid="stFileUploader"] {
+    background: #161b27;
+    border: 2px dashed #2d4a7a;
+    border-radius: 8px;
+    padding: 12px;
+}
+[data-testid="stFileUploader"]:hover {
+    border-color: #3b82f6;
+}
+
+/* ── Tabs ── */
+.stTabs [data-baseweb="tab-list"] {
+    background: #161b27;
+    border-bottom: 1px solid #2d3748;
+    gap: 0px;
+}
+.stTabs [data-baseweb="tab"] {
+    background: transparent !important;
+    color: #718096 !important;
+    border: none !important;
+    padding: 10px 20px !important;
+    font-size: 13px !important;
+    font-weight: 500 !important;
+    letter-spacing: 0.3px;
+}
+.stTabs [aria-selected="true"] {
+    background: #1a2236 !important;
+    color: #63b3ed !important;
+    border-bottom: 2px solid #3b82f6 !important;
+}
+.stTabs [data-baseweb="tab-panel"] {
+    background: #0f1117;
+    padding: 0;
+}
+
+/* ── Buttons ── */
+.stButton > button {
+    background: linear-gradient(135deg, #1e40af, #3b82f6);
+    color: white;
+    border: none;
+    border-radius: 6px;
+    font-family: 'IBM Plex Sans', sans-serif;
+    font-weight: 600;
+    font-size: 14px;
+    padding: 10px 28px;
+    letter-spacing: 0.3px;
+    transition: all 0.2s ease;
+    box-shadow: 0 2px 8px rgba(59,130,246,0.3);
+}
+.stButton > button:hover {
+    background: linear-gradient(135deg, #1d4ed8, #60a5fa);
+    box-shadow: 0 4px 16px rgba(59,130,246,0.5);
+    transform: translateY(-1px);
+}
+
+/* ── Metric cards ── */
+[data-testid="stMetric"] {
+    background: #161b27;
+    border: 1px solid #2d3748;
+    border-radius: 8px;
+    padding: 16px !important;
+}
+[data-testid="stMetric"] label {
+    color: #718096 !important;
+    font-size: 11px !important;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+[data-testid="stMetric"] [data-testid="stMetricValue"] {
+    color: #63b3ed !important;
+    font-family: 'IBM Plex Mono', monospace !important;
+}
+
+/* ── Expander ── */
+.streamlit-expanderHeader {
+    background: #161b27 !important;
+    border: 1px solid #2d3748 !important;
+    border-radius: 6px !important;
+    color: #a0aec0 !important;
+    font-size: 13px !important;
+}
+.streamlit-expanderContent {
+    background: #1a2236 !important;
+    border: 1px solid #2d3748 !important;
+    border-top: none !important;
+}
+
+/* ── Info / success / warning boxes ── */
+.stAlert {
+    border-radius: 6px !important;
+}
+
+/* ── JSON code block ── */
+.stCodeBlock {
+    background: #0d1117 !important;
+}
+
+/* ── Select / text input ── */
+.stTextInput input, .stSelectbox select, .stTextArea textarea {
+    background: #1a2236 !important;
+    border: 1px solid #2d3748 !important;
+    color: #e2e8f0 !important;
+    border-radius: 6px !important;
+}
+
+/* ── Custom field card ── */
+.field-card {
+    background: #161b27;
+    border: 1px solid #2d3748;
+    border-left: 3px solid #3b82f6;
+    border-radius: 6px;
+    padding: 12px 16px;
+    margin: 6px 0;
+    font-family: 'IBM Plex Sans', sans-serif;
+}
+.field-key {
+    color: #718096;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    margin-bottom: 4px;
+}
+.field-value {
+    color: #e2e8f0;
+    font-size: 14px;
+    font-weight: 500;
+}
+.field-conf {
+    color: #48bb78;
+    font-size: 11px;
+    font-family: 'IBM Plex Mono', monospace;
+    margin-top: 4px;
+}
+
+/* ── Header ── */
+.app-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 20px 0 10px 0;
+    border-bottom: 1px solid #2d3748;
+    margin-bottom: 24px;
+}
+.app-title {
+    font-size: 22px;
+    font-weight: 600;
+    color: #e2e8f0;
+    letter-spacing: -0.3px;
+}
+.app-subtitle {
+    font-size: 13px;
+    color: #4a5568;
+    margin-top: 2px;
+}
+.badge {
+    background: #1e3a5f;
+    color: #63b3ed;
+    font-size: 11px;
+    padding: 2px 10px;
+    border-radius: 20px;
+    border: 1px solid #2d4a7a;
+    font-family: 'IBM Plex Mono', monospace;
+}
+
+/* ── Page selector pills ── */
+.page-pill {
+    display: inline-block;
+    background: #1a2236;
+    border: 1px solid #2d3748;
+    color: #a0aec0;
+    padding: 4px 12px;
+    border-radius: 4px;
+    font-size: 12px;
+    margin: 2px;
+    cursor: pointer;
+    font-family: 'IBM Plex Mono', monospace;
+}
+.page-pill.active {
+    background: #1e3a5f;
+    border-color: #3b82f6;
+    color: #63b3ed;
+}
+
+/* ── Divider ── */
+hr { border-color: #2d3748 !important; }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def pdf_page_to_pil(pdf_bytes: bytes, page_num: int = 0, dpi: int = 150) -> Image.Image:
+    """Render a PDF page to PIL Image."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[page_num]
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    pix = page.get_pixmap(matrix=mat)
+    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    doc.close()
+    return img
+
+
+def draw_bounding_boxes(img: Image.Image, polygons: list, labels: list, color="#3b82f6") -> Image.Image:
+    """Draw polygon bounding boxes on image."""
+    img = img.copy()
+    draw = ImageDraw.Draw(img, "RGBA")
+    w, h = img.size
+
+    for poly, label in zip(polygons, labels):
+        if not poly or len(poly) < 4:
+            continue
+        # poly is [x1,y1, x2,y2, ...] normalized 0-1
+        points = [(poly[i] * w, poly[i + 1] * h) for i in range(0, len(poly), 2)]
+        draw.polygon(points, fill=(59, 130, 246, 35), outline=(59, 130, 246, 220))
+        # label
+        if label:
+            x0, y0 = points[0]
+            draw.rectangle([x0, y0 - 16, x0 + len(label) * 7 + 6, y0], fill=(30, 64, 175, 220))
+            draw.text((x0 + 3, y0 - 14), label[:20], fill="white")
+    return img
+
+
+def get_polygon(region) -> list:
+    """Extract polygon from bounding region."""
+    try:
+        if hasattr(region, "polygon") and region.polygon:
+            return [c for point in region.polygon for c in (point.x, point.y)]
+    except Exception:
+        pass
+    return []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AZURE ANALYSIS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_analysis(endpoint: str, key: str, pdf_bytes: bytes, model_id: str = "prebuilt-invoice"):
+    client = DocumentIntelligenceClient(endpoint=endpoint, credential=AzureKeyCredential(key))
+    poller = client.begin_analyze_document(
+        model_id,
+        AnalyzeDocumentRequest(bytes_source=pdf_bytes),
+        content_type="application/json",
+    )
+    return poller.result()
+
+
+def extract_fields(result: AnalyzeResult) -> dict:
+    """Extract all fields — uses .get() pattern matching official Azure SDK sample."""
+    fields = {}
+    if result.documents:
+        for doc in result.documents:
+            if doc.fields:
+                for name, field in doc.fields.items():
+                    content    = field.get("content")
+                    confidence = field.get("confidence")
+                    br         = field.get("boundingRegions") or []
+                    polygon    = br[0].get("polygon", []) if br else []
+                    page       = br[0].get("pageNumber", 1) if br else 1
+                    # polygon may be [{x,y},...] -> flatten to [x1,y1,x2,y2,...]
+                    if polygon and isinstance(polygon[0], dict):
+                        polygon = [c for pt in polygon for c in (pt["x"], pt["y"])]
+                    fields[name] = {
+                        "value":      content,
+                        "confidence": round(confidence * 100, 1) if confidence else None,
+                        "polygon":    polygon,
+                        "page":       page,
+                    }
+    return fields
+
+
+def extract_kv_pairs(result) -> list:
+    """Extract key-value pairs."""
+    pairs = []
+    if hasattr(result, "key_value_pairs") and result.key_value_pairs:
+        for kv in result.key_value_pairs:
+            key_text = kv.key.content if kv.key else ""
+            val_text = kv.value.content if kv.value else ""
+            conf = round(kv.confidence * 100, 1) if kv.confidence else None
+            key_poly = get_polygon(kv.key.bounding_regions[0]) if kv.key and kv.key.bounding_regions else []
+            val_poly = get_polygon(kv.value.bounding_regions[0]) if kv.value and kv.value.bounding_regions else []
+            page = kv.key.bounding_regions[0].page_number if kv.key and kv.key.bounding_regions else 1
+            pairs.append({
+                "key": key_text, "value": val_text,
+                "confidence": conf,
+                "key_polygon": key_poly, "val_polygon": val_poly,
+                "page": page,
+            })
+    return pairs
+
+
+def extract_tables(result) -> list:
+    """Extract tables."""
+    tables = []
+    if hasattr(result, "tables") and result.tables:
+        for t in result.tables:
+            cells = {}
+            for cell in t.cells:
+                cells[(cell.row_index, cell.column_index)] = cell.content
+            tables.append({
+                "rows": t.row_count,
+                "cols": t.column_count,
+                "cells": cells,
+                "page": t.bounding_regions[0].page_number if t.bounding_regions else 1,
+            })
+    return tables
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIDEBAR
+# ══════════════════════════════════════════════════════════════════════════════
+
+with st.sidebar:
+    st.markdown("""
+    <div style='padding: 16px 0 8px 0'>
+        <div style='font-size:18px; font-weight:700; color:#e2e8f0; letter-spacing:-0.3px'>⬡ Doc Intelligence</div>
+        <div style='font-size:11px; color:#4a5568; margin-top:2px'>Azure AI · Invoice Analyzer</div>
+    </div>
+    <hr style='margin:8px 0 16px 0'/>
+    """, unsafe_allow_html=True)
+
+    st.markdown("**🔑 Credentials**")
+    endpoint = st.text_input("Endpoint URL", placeholder="https://xxx.cognitiveservices.azure.com/", type="default")
+    api_key  = st.text_input("API Key", placeholder="••••••••••••••••", type="password")
+
+    st.markdown("<hr style='margin:16px 0'/>", unsafe_allow_html=True)
+    st.markdown("**🔬 Model**")
+    model_id = st.selectbox("Prebuilt Model", [
+        "prebuilt-invoice",
+        "prebuilt-receipt",
+        "prebuilt-businessCard",
+        "prebuilt-idDocument",
+        "prebuilt-tax.us.w2",
+        "prebuilt-document",
+        "prebuilt-layout",
+    ])
+
+    st.markdown("<hr style='margin:16px 0'/>", unsafe_allow_html=True)
+    st.markdown("**⚙️ Options**")
+    show_confidence = st.checkbox("Show confidence scores", value=True)
+    highlight_boxes = st.checkbox("Highlight bounding boxes", value=True)
+    render_dpi      = st.slider("Preview DPI", 72, 300, 150, 10)
+
+    st.markdown("<hr style='margin:16px 0'/>", unsafe_allow_html=True)
+    st.markdown("""
+    <div style='font-size:11px; color:#4a5568; line-height:1.6'>
+    Powered by<br>
+    <span style='color:#3b82f6'>Azure Document Intelligence</span><br>
+    SDK v1.x · python
+    </div>
+    """, unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HEADER
+# ══════════════════════════════════════════════════════════════════════════════
+
+st.markdown("""
+<div class='app-header'>
+    <div>
+        <div class='app-title'>Document Intelligence Studio</div>
+        <div class='app-subtitle'>Upload · Analyze · Extract · Query</div>
+    </div>
+    <div class='badge'>PREVIEW</div>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UPLOAD SECTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+col_upload, col_run = st.columns([4, 1])
+
+with col_upload:
+    uploaded_file = st.file_uploader(
+        "Upload PDF Invoice",
+        type=["pdf"],
+        help="Upload a PDF invoice to analyze with Azure Document Intelligence",
+        label_visibility="collapsed",
+    )
+
+with col_run:
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+    run_btn = st.button("▶  Run Analysis", use_container_width=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SESSION STATE
+# ══════════════════════════════════════════════════════════════════════════════
+
+if "result"      not in st.session_state: st.session_state.result      = None
+if "pdf_bytes"   not in st.session_state: st.session_state.pdf_bytes   = None
+if "fields"      not in st.session_state: st.session_state.fields      = {}
+if "kv_pairs"    not in st.session_state: st.session_state.kv_pairs    = []
+if "tables"      not in st.session_state: st.session_state.tables      = []
+if "page_count"  not in st.session_state: st.session_state.page_count  = 1
+if "active_page" not in st.session_state: st.session_state.active_page = 1
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RUN ANALYSIS
+# ══════════════════════════════════════════════════════════════════════════════
+
+if run_btn:
+    if not uploaded_file:
+        st.warning("⚠️  Please upload a PDF file first.")
+    elif not endpoint or not api_key:
+        st.warning("⚠️  Please enter your Azure endpoint and API key in the sidebar.")
+    else:
+        pdf_bytes = uploaded_file.read()
+        st.session_state.pdf_bytes = pdf_bytes
+
+        # count pages
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        st.session_state.page_count  = len(doc)
+        st.session_state.active_page = 1
+        doc.close()
+
+        with st.spinner("🔍  Analyzing document with Azure Document Intelligence..."):
+            try:
+                result = run_analysis(endpoint.strip(), api_key.strip(), pdf_bytes, model_id)
+                st.session_state.result   = result
+                st.session_state.fields   = extract_fields(result)
+                st.session_state.kv_pairs = extract_kv_pairs(result)
+                st.session_state.tables   = extract_tables(result)
+                st.success(f"✅  Analysis complete — {len(st.session_state.fields)} fields · {len(st.session_state.kv_pairs)} key-value pairs · {len(st.session_state.tables)} tables")
+            except Exception as e:
+                st.error(f"❌  Azure API error: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN DISPLAY
+# ══════════════════════════════════════════════════════════════════════════════
+
+if st.session_state.pdf_bytes:
+    result     = st.session_state.result
+    pdf_bytes  = st.session_state.pdf_bytes
+    fields     = st.session_state.fields
+    kv_pairs   = st.session_state.kv_pairs
+    tables     = st.session_state.tables
+
+    # ── Layout: left = PDF preview, right = tabs ──
+    left_col, right_col = st.columns([5, 5], gap="medium")
+
+    # ─── LEFT: PDF Preview + bounding boxes ────────────────────────────────
+    with left_col:
+        st.markdown("**📄 Document Preview**")
+
+        # Page selector
+        if st.session_state.page_count > 1:
+            page_num = st.number_input(
+                f"Page (1 – {st.session_state.page_count})",
+                min_value=1, max_value=st.session_state.page_count,
+                value=st.session_state.active_page,
+                step=1,
+            )
+            st.session_state.active_page = page_num
+        else:
+            page_num = 1
+
+        img = pdf_page_to_pil(pdf_bytes, page_num - 1, render_dpi)
+
+        if highlight_boxes and result:
+            # overlay field polygons for current page
+            polys, labels = [], []
+            for name, f in fields.items():
+                if f["page"] == page_num and f["polygon"]:
+                    polys.append(f["polygon"])
+                    labels.append(name)
+            for kv in kv_pairs:
+                if kv["page"] == page_num:
+                    if kv["key_polygon"]:
+                        polys.append(kv["key_polygon"])
+                        labels.append(kv["key"][:15])
+                    if kv["val_polygon"]:
+                        polys.append(kv["val_polygon"])
+                        labels.append("")
+            if polys:
+                img = draw_bounding_boxes(img, polys, labels)
+
+        st.image(img, use_container_width=True, caption=f"Page {page_num} of {st.session_state.page_count}")
+
+    # ─── RIGHT: Tabs ────────────────────────────────────────────────────────
+    with right_col:
+
+        if result is None:
+            st.markdown("""
+            <div style='text-align:center; padding: 60px 20px; color:#4a5568'>
+                <div style='font-size:48px; margin-bottom:16px'>🔍</div>
+                <div style='font-size:16px; font-weight:500; color:#718096'>Run Analysis to see results</div>
+                <div style='font-size:13px; margin-top:8px'>Fields, key-value pairs, tables and raw content will appear here</div>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            # Summary metrics
+            doc_type = result.documents[0].doc_type if result.documents else model_id
+            doc_conf = round(result.documents[0].confidence * 100, 1) if result.documents and result.documents[0].confidence else "—"
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Document Type", doc_type.split(".")[-1] if doc_type else "—")
+            c2.metric("Confidence", f"{doc_conf}%")
+            c3.metric("Fields", len(fields))
+            c4.metric("Pages", st.session_state.page_count)
+
+            st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+
+            tab_fields, tab_kv, tab_tables, tab_content, tab_query, tab_json = st.tabs([
+                "📋 Fields", "🔑 Key-Value", "📊 Tables", "📝 Content", "🔎 Query", "{ } JSON"
+            ])
+
+            # ── TAB 1: FIELDS ──────────────────────────────────────────────
+            with tab_fields:
+                if fields:
+                    search_f = st.text_input("Filter fields", placeholder="Search...", key="field_search", label_visibility="collapsed")
+                    for name, f in fields.items():
+                        if search_f.lower() not in name.lower() and search_f.lower() not in str(f["value"]).lower():
+                            continue
+                        conf_html = ""
+                        if show_confidence and f["confidence"]:
+                            color = "#48bb78" if f["confidence"] >= 80 else "#f6ad55" if f["confidence"] >= 50 else "#fc8181"
+                            conf_html = f"<div class='field-conf' style='color:{color}'>▲ {f['confidence']}% confidence · page {f['page']}</div>"
+                        st.markdown(f"""
+                        <div class='field-card'>
+                            <div class='field-key'>{name}</div>
+                            <div class='field-value'>{f['value'] or '—'}</div>
+                            {conf_html}
+                        </div>
+                        """, unsafe_allow_html=True)
+                else:
+                    st.info("No structured fields found. Try a prebuilt model like prebuilt-invoice.")
+
+            # ── TAB 2: KEY-VALUE PAIRS ─────────────────────────────────────
+            with tab_kv:
+                if kv_pairs:
+                    search_kv = st.text_input("Filter pairs", placeholder="Search...", key="kv_search", label_visibility="collapsed")
+                    for kv in kv_pairs:
+                        if search_kv and search_kv.lower() not in kv["key"].lower() and search_kv.lower() not in kv["value"].lower():
+                            continue
+                        conf_html = ""
+                        if show_confidence and kv["confidence"]:
+                            color = "#48bb78" if kv["confidence"] >= 80 else "#f6ad55" if kv["confidence"] >= 50 else "#fc8181"
+                            conf_html = f"<div class='field-conf' style='color:{color}'>▲ {kv['confidence']}% · page {kv['page']}</div>"
+                        st.markdown(f"""
+                        <div class='field-card' style='border-left-color:#805ad5'>
+                            <div class='field-key'>{kv['key']}</div>
+                            <div class='field-value'>{kv['value'] or '—'}</div>
+                            {conf_html}
+                        </div>
+                        """, unsafe_allow_html=True)
+                else:
+                    st.info("No key-value pairs detected. Try prebuilt-document or prebuilt-layout model.")
+
+            # ── TAB 3: TABLES ──────────────────────────────────────────────
+            with tab_tables:
+                if tables:
+                    for i, t in enumerate(tables):
+                        with st.expander(f"Table {i+1}  —  {t['rows']} rows × {t['cols']} cols  (page {t['page']})"):
+                            data = {}
+                            for col in range(t["cols"]):
+                                col_key = t["cells"].get((0, col), f"Col {col+1}")
+                                data[col_key] = [t["cells"].get((row, col), "") for row in range(1, t["rows"])]
+                            import pandas as pd
+                            df = pd.DataFrame(data)
+                            st.dataframe(df, use_container_width=True)
+                            csv = df.to_csv(index=False)
+                            st.download_button(f"⬇ Download Table {i+1} CSV", csv, f"table_{i+1}.csv", "text/csv", key=f"dl_table_{i}")
+                else:
+                    st.info("No tables detected in this document.")
+
+            # ── TAB 4: CONTENT ─────────────────────────────────────────────
+            with tab_content:
+                content_text = result.content or ""
+                st.markdown(f"**{len(content_text)} characters extracted**")
+                page_filter = st.number_input("Filter by page", min_value=0, max_value=st.session_state.page_count, value=0, key="content_page",
+                                               help="0 = show all pages")
+                if page_filter == 0:
+                    st.text_area("Extracted Content", value=content_text, height=420, label_visibility="collapsed")
+                else:
+                    # Filter paragraphs by page
+                    page_content = []
+                    if hasattr(result, "paragraphs") and result.paragraphs:
+                        for para in result.paragraphs:
+                            if para.bounding_regions and para.bounding_regions[0].page_number == page_filter:
+                                page_content.append(para.content)
+                    st.text_area(f"Content (page {page_filter})",
+                                 value="\n\n".join(page_content) if page_content else "No paragraphs found for this page.",
+                                 height=420, label_visibility="collapsed")
+                st.download_button("⬇ Download as TXT", content_text, "extracted_content.txt", "text/plain")
+
+            # ── TAB 5: QUERY ───────────────────────────────────────────────
+            with tab_query:
+                st.markdown("**Ask a question about the document**")
+                query = st.text_input("Query", placeholder='e.g. "What is the total amount?" or "Who is the vendor?"',
+                                      label_visibility="collapsed")
+                if st.button("🔎 Search", key="query_btn") and query:
+                    content_lower = (result.content or "").lower()
+                    query_lower   = query.lower()
+                    # Simple keyword highlight search
+                    keywords = [w for w in query_lower.split() if len(w) > 3]
+                    hits = []
+                    if hasattr(result, "paragraphs") and result.paragraphs:
+                        for para in result.paragraphs:
+                            score = sum(1 for kw in keywords if kw in para.content.lower())
+                            if score > 0:
+                                hits.append((score, para.content, para.bounding_regions[0].page_number if para.bounding_regions else "?"))
+                    hits.sort(key=lambda x: -x[0])
+
+                    # Also search in fields
+                    field_hits = []
+                    for name, f in fields.items():
+                        if any(kw in name.lower() or kw in str(f["value"]).lower() for kw in keywords):
+                            field_hits.append((name, f["value"], f["confidence"]))
+
+                    if field_hits:
+                        st.markdown("**📋 Matching Fields:**")
+                        for name, val, conf in field_hits[:5]:
+                            st.markdown(f"""
+                            <div class='field-card' style='border-left-color:#48bb78'>
+                                <div class='field-key'>{name}</div>
+                                <div class='field-value'>{val or '—'}</div>
+                            </div>
+                            """, unsafe_allow_html=True)
+
+                    if hits:
+                        st.markdown("**📝 Matching Paragraphs:**")
+                        for score, text, pg in hits[:6]:
+                            st.markdown(f"""
+                            <div class='field-card' style='border-left-color:#ed8936'>
+                                <div class='field-key'>Page {pg} · relevance {score}</div>
+                                <div class='field-value' style='font-size:13px'>{text[:300]}</div>
+                            </div>
+                            """, unsafe_allow_html=True)
+
+                    if not field_hits and not hits:
+                        st.warning("No matching results found. Try different keywords.")
+
+                # Quick field lookup
+                st.markdown("---")
+                st.markdown("**⚡ Quick Field Lookup**")
+                if fields:
+                    selected = st.selectbox("Select a field", list(fields.keys()), label_visibility="collapsed")
+                    f = fields[selected]
+                    st.markdown(f"""
+                    <div class='field-card'>
+                        <div class='field-key'>{selected}</div>
+                        <div class='field-value' style='font-size:18px'>{f['value'] or '—'}</div>
+                        <div class='field-conf'>Confidence: {f['confidence']}% · Page {f['page']}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+            # ── TAB 6: JSON ────────────────────────────────────────────────
+            with tab_json:
+                raw = {
+                    "model_id":    result.model_id,
+                    "api_version": result.api_version if hasattr(result, "api_version") else "",
+                    "content":     result.content[:2000] + "..." if result.content and len(result.content) > 2000 else result.content,
+                    "fields":      fields,
+                    "kv_pairs":    kv_pairs,
+                    "tables": [
+                        {"rows": t["rows"], "cols": t["cols"], "page": t["page"]}
+                        for t in tables
+                    ],
+                }
+                json_str = json.dumps(raw, indent=2, default=str)
+                st.code(json_str, language="json")
+                st.download_button("⬇ Download Full JSON", json_str, "document_analysis.json", "application/json")
+
+else:
+    # ── Empty state ──────────────────────────────────────────────────────────
+    st.markdown("""
+    <div style='text-align:center; padding: 80px 20px; color:#4a5568'>
+        <div style='font-size:64px; margin-bottom:20px; opacity:0.4'>📄</div>
+        <div style='font-size:20px; font-weight:600; color:#718096; margin-bottom:8px'>No document uploaded</div>
+        <div style='font-size:14px; color:#4a5568'>Upload a PDF invoice above and enter your Azure credentials<br>in the sidebar, then click <strong style='color:#3b82f6'>Run Analysis</strong></div>
+        <div style='margin-top:32px; display:flex; justify-content:center; gap:24px; font-size:12px; color:#4a5568'>
+            <span>📋 Invoice Fields</span>
+            <span>🔑 Key-Value Pairs</span>
+            <span>📊 Tables</span>
+            <span>📝 Content</span>
+            <span>🔎 Query</span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
