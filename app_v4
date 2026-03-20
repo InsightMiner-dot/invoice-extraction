@@ -45,14 +45,22 @@ def pdf_page_to_pil(pdf_bytes: bytes, page_num: int = 0, dpi: int = 150) -> Imag
     return img
 
 
-def draw_bounding_boxes(img: Image.Image, polygons: list, labels: list) -> Image.Image:
+def draw_bounding_boxes(img: Image.Image, polygons: list, labels: list,
+                        page_w_in: float = 8.5, page_h_in: float = 11.0) -> Image.Image:
+    """
+    polygons: list of [x1,y1,x2,y2,...] in inches (as returned by Azure SDK)
+    page_w_in / page_h_in: page dimensions in inches from result.pages
+    Converts inch coords -> pixel coords using the rendered image size.
+    """
     img  = img.copy()
     draw = ImageDraw.Draw(img, "RGBA")
-    w, h = img.size
+    px_w, px_h = img.size
+    scale_x = px_w / page_w_in
+    scale_y = px_h / page_h_in
     for poly, label in zip(polygons, labels):
         if not poly or len(poly) < 4:
             continue
-        points = [(poly[i] * w, poly[i + 1] * h) for i in range(0, len(poly), 2)]
+        points = [(poly[i] * scale_x, poly[i + 1] * scale_y) for i in range(0, len(poly), 2)]
         draw.polygon(points, fill=(59, 130, 246, 40), outline=(59, 130, 246, 200))
         if label:
             x0, y0 = points[0]
@@ -81,10 +89,10 @@ def extract_fields(result: AnalyzeResult) -> dict:
                     content    = field.get("content")
                     confidence = field.get("confidence")
                     br         = field.get("boundingRegions") or []
-                    polygon    = br[0].get("polygon", []) if br else []
                     page       = br[0].get("pageNumber", 1) if br else 1
-                    if polygon and isinstance(polygon[0], dict):
-                        polygon = [c for pt in polygon for c in (pt["x"], pt["y"])]
+                    # polygon points are dicts {"x": float, "y": float} in inches
+                    raw_poly   = br[0].get("polygon", []) if br else []
+                    polygon    = [c for pt in raw_poly for c in (pt["x"], pt["y"])] if raw_poly else []
                     fields[name] = {
                         "value":      content,
                         "confidence": round(confidence * 100, 1) if confidence else None,
@@ -186,6 +194,13 @@ if st.session_state.pdf_bytes:
         img = pdf_page_to_pil(pdf_bytes, page_num - 1, render_dpi)
 
         if highlight_boxes and result:
+            # Get page dimensions in inches from the result
+            page_w_in, page_h_in = 8.5, 11.0  # fallback defaults
+            if result.pages and len(result.pages) >= page_num:
+                pg = result.pages[page_num - 1]
+                if pg.width:  page_w_in = pg.width
+                if pg.height: page_h_in = pg.height
+
             polys, labels = [], []
             for name, f in fields.items():
                 if f["page"] == page_num and f["polygon"]:
@@ -200,7 +215,7 @@ if st.session_state.pdf_bytes:
                         polys.append(kv["val_polygon"])
                         labels.append("")
             if polys:
-                img = draw_bounding_boxes(img, polys, labels)
+                img = draw_bounding_boxes(img, polys, labels, page_w_in, page_h_in)
 
         st.image(img, use_container_width=True, caption=f"Page {page_num} of {st.session_state.page_count}")
 
@@ -306,14 +321,8 @@ if st.session_state.pdf_bytes:
 
             # JSON
             with tab_json:
-                st.subheader("Raw JSON")
-                raw = {
-                    "model_id": result.model_id,
-                    "fields":   fields,
-                    "kv_pairs": kv_pairs,
-                    "tables":   [{"rows": t["rows"], "cols": t["cols"], "page": t["page"]} for t in tables],
-                    "content":  (result.content or "")[:3000],
-                }
-                json_str = json.dumps(raw, indent=2, default=str)
+                st.subheader("Raw JSON (original poller result)")
+                # Serialize the raw result as-is from the poller using the SDK's built-in method
+                json_str = json.dumps(result.as_dict(), indent=2, default=str)
                 st.code(json_str, language="json")
                 st.download_button("Download JSON", json_str, "result.json", "application/json")
