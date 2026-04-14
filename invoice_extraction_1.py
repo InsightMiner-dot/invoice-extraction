@@ -8,34 +8,34 @@ from pydantic import BaseModel, Field
 from typing import List, Optional
 
 # ==============================================================
-# 1. Define Data Schema (UPDATED WITH ADDRESSES & TAX)
+# 1. Define Data Schema 
 # ==============================================================
 
 class LineItem(BaseModel):
+    material: Optional[str] = Field(None, description="The material code, part number, SKU, or material type if specified")
     description: str = Field(description="The name or description of the purchased item")
     quantity: Optional[float] = Field(None, description="The number of items purchased")
     unit_price: Optional[float] = Field(None, description="The price of a single unit")
-    total: float = Field(description="The total cost for this line item")
+    line_total: float = Field(description="The total cost for this specific line item. Look for columns labeled 'Line Total', 'Amount', 'Total', or 'Extended Price'.")
 
 class InvoiceData(BaseModel):
-    # Standard Fields
     vendor_name: str = Field(description="The name of the company issuing the invoice")
     invoice_number: Optional[str] = Field(None, description="The unique invoice ID or number")
     date: Optional[str] = Field(None, description="The date the invoice was issued")
     
-    # New Address Fields
     vendor_address: Optional[str] = Field(None, description="The full address of the vendor issuing the invoice")
     bill_to: Optional[str] = Field(None, description="The full 'Bill To' address")
     ship_to: Optional[str] = Field(None, description="The full 'Ship To' address")
+    remit_to: Optional[str] = Field(None, description="The 'Remit To' address where payment should actually be sent")
     origin: Optional[str] = Field(None, description="The origin address where goods/services shipped from")
     destination: Optional[str] = Field(None, description="The destination address where goods/services are going")
     
-    # Totals and Taxes
+    currency: Optional[str] = Field(None, description="The 3-letter currency code (e.g., USD, CAD, EUR) used on the invoice")
+    
     tax_amount: Optional[float] = Field(None, description="The total tax amount charged on the invoice. Leave null if no tax is listed.")
     total_amount: float = Field(description="The final total amount charged on the invoice")
     
-    # Items
-    line_items: List[LineItem] = Field(description="A list of all individual items purchased")
+    line_items: List[LineItem] = Field(description="A list of all individual items purchased across all pages")
 
 # ==============================================================
 # 2. Setup Azure OpenAI Client with Instructor
@@ -55,99 +55,98 @@ client = instructor.from_openai(
 )
 
 # ==============================================================
-# 3. PDF to Image Conversion
+# 3. PDF to Image Conversion (UPDATED FOR MULTIPLE PAGES)
 # ==============================================================
 
-def pdf_page_to_base64(pdf_path: str, page_number: int = 0) -> str:
+def pdf_to_base64_images(pdf_path: str) -> List[str]:
+    """Converts ALL pages of a PDF into a list of base64 encoded JPEGs."""
     doc = fitz.open(pdf_path)
-    page = doc[page_number]
-    pix = page.get_pixmap(dpi=150)
-    img_bytes = pix.tobytes("jpeg")
-    return base64.b64encode(img_bytes).decode('utf-8')
+    base64_images = []
+    
+    # Loop through every page in the document
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        pix = page.get_pixmap(dpi=150)
+        img_bytes = pix.tobytes("jpeg")
+        base64_images.append(base64.b64encode(img_bytes).decode('utf-8'))
+        
+    return base64_images
 
 # ==============================================================
-# 4. LLM Data Extraction
+# 4. LLM Data Extraction (UPDATED FOR MULTIPLE PAGES)
 # ==============================================================
 
 def extract_invoice_data(pdf_path: str) -> InvoiceData:
-    print(f"Processing image for {pdf_path}...")
-    base64_image = pdf_page_to_base64(pdf_path, page_number=0)
+    print(f"Converting all pages of {pdf_path} to images...")
+    base64_images = pdf_to_base64_images(pdf_path)
+    print(f"Found {len(base64_images)} page(s).")
     
+    # Build the dynamic content array starting with our text prompt
+    content_array = [
+        {
+            "type": "text", 
+            "text": "Please extract the data from this multi-page invoice. If a field is missing, leave it null. Ensure you capture line items from all pages."
+        }
+    ]
+    
+    # Dynamically attach every page of the PDF to the prompt
+    for img_base64 in base64_images:
+        content_array.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/jpeg;base64,{img_base64}"
+            }
+        })
+
     print("Calling Azure OpenAI API via Instructor...")
-    
     invoice_extraction = client.chat.completions.create(
         model=azure_deployment, 
         response_model=InvoiceData, 
         messages=[
             {
                 "role": "system",
-                "content": "You are an expert accountant and logistics coordinator. Extract the requested data from the provided invoice image. Strip away currency symbols."
+                "content": "You are an expert accountant and logistics coordinator. Extract the requested data from the provided invoice images. Strip away currency symbols from the number amounts, but note the actual currency in the currency field."
             },
             {
                 "role": "user",
-                "content": [
-                    {
-                        "type": "text", 
-                        "text": "Please extract the data from this invoice. If a field is missing, leave it null."
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{base64_image}"
-                        }
-                    }
-                ]
+                "content": content_array # Pass the fully built array of images here
             }
         ]
-        # Temperature omitted for reasoning models
     )
     return invoice_extraction
 
 # ==============================================================
-# 5. Save Data to CSV (UPDATED TO HANDLE ADDRESSES & TAX ROW)
+# 5. Save Data to CSV
 # ==============================================================
 
 def save_invoice_to_csv(invoice_data: InvoiceData, pdf_path: str, output_filename: str = "invoice_data.csv"):
     file_name = os.path.basename(pdf_path)
     
-    # We added all the new address columns here
     headers = [
-        "File Name", "Vendor Name", "Vendor Address", "Bill To", "Ship To", 
-        "Origin", "Destination", "Invoice Number", "Date", 
-        "Item Description", "Quantity", "Unit Price", 
-        "Item Total", "Invoice Total Amount"
+        "File Name", "Vendor Name", "Vendor Address", "Bill To", "Ship To", "Remit To",
+        "Origin", "Destination", "Invoice Number", "Date", "Currency",
+        "Material", "Item Description", "Quantity", "Unit Price", 
+        "Line Total", "Invoice Total Amount"
     ]
     
     with open(output_filename, mode='w', newline='', encoding='utf-8') as file:
         writer = csv.writer(file)
         writer.writerow(headers)
         
-        # A quick helper function so we don't have to rewrite the address variables over and over
-        def create_row(description, quantity, unit_price, item_total):
+        def create_row(material, description, quantity, unit_price, line_total):
             return [
-                file_name, 
-                invoice_data.vendor_name, 
-                invoice_data.vendor_address,
-                invoice_data.bill_to,
-                invoice_data.ship_to,
-                invoice_data.origin,
-                invoice_data.destination,
-                invoice_data.invoice_number,
-                invoice_data.date, 
-                description, 
-                quantity, 
-                unit_price, 
-                item_total, 
-                invoice_data.total_amount
+                file_name, invoice_data.vendor_name, invoice_data.vendor_address,
+                invoice_data.bill_to, invoice_data.ship_to, invoice_data.remit_to, 
+                invoice_data.origin, invoice_data.destination, invoice_data.invoice_number,
+                invoice_data.date, invoice_data.currency, material, 
+                description, quantity, unit_price, line_total, invoice_data.total_amount
             ]
         
-        # 1. Write the standard line items
         for item in invoice_data.line_items:
-            writer.writerow(create_row(item.description, item.quantity, item.unit_price, item.total))
+            writer.writerow(create_row(item.material, item.description, item.quantity, item.unit_price, item.line_total))
             
-        # 2. Write the Tax as its own line item at the end (if it exists)
         if invoice_data.tax_amount is not None and invoice_data.tax_amount > 0:
-            writer.writerow(create_row("Tax", None, None, invoice_data.tax_amount))
+            writer.writerow(create_row(None, "Tax", None, None, invoice_data.tax_amount))
             
     print(f"✅ Successfully saved structured data to {output_filename}")
 
