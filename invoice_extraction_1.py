@@ -8,8 +8,7 @@ from pydantic import BaseModel, Field
 from typing import List, Optional
 
 # ==============================================================
-# 1. Define Data Schema (Pydantic)
-# Instructor will force the LLM to output exactly this structure
+# 1. Define Data Schema (UPDATED WITH ADDRESSES & TAX)
 # ==============================================================
 
 class LineItem(BaseModel):
@@ -19,23 +18,34 @@ class LineItem(BaseModel):
     total: float = Field(description="The total cost for this line item")
 
 class InvoiceData(BaseModel):
+    # Standard Fields
     vendor_name: str = Field(description="The name of the company issuing the invoice")
     invoice_number: Optional[str] = Field(None, description="The unique invoice ID or number")
     date: Optional[str] = Field(None, description="The date the invoice was issued")
+    
+    # New Address Fields
+    vendor_address: Optional[str] = Field(None, description="The full address of the vendor issuing the invoice")
+    bill_to: Optional[str] = Field(None, description="The full 'Bill To' address")
+    ship_to: Optional[str] = Field(None, description="The full 'Ship To' address")
+    origin: Optional[str] = Field(None, description="The origin address where goods/services shipped from")
+    destination: Optional[str] = Field(None, description="The destination address where goods/services are going")
+    
+    # Totals and Taxes
+    tax_amount: Optional[float] = Field(None, description="The total tax amount charged on the invoice. Leave null if no tax is listed.")
     total_amount: float = Field(description="The final total amount charged on the invoice")
+    
+    # Items
     line_items: List[LineItem] = Field(description="A list of all individual items purchased")
 
 # ==============================================================
 # 2. Setup Azure OpenAI Client with Instructor
 # ==============================================================
 
-# Ensure these environment variables are set in your system
 azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
 azure_api_key = os.getenv("AZURE_OPENAI_KEY")
 azure_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 azure_api_version = os.getenv("AZURE_OPENAI_API_VERSION")
 
-# Patch the Azure client with Instructor
 client = instructor.from_openai(
     AzureOpenAI(
         azure_endpoint=azure_endpoint,
@@ -49,7 +59,6 @@ client = instructor.from_openai(
 # ==============================================================
 
 def pdf_page_to_base64(pdf_path: str, page_number: int = 0) -> str:
-    """Converts a specific page of a PDF to a base64 encoded JPEG."""
     doc = fitz.open(pdf_path)
     page = doc[page_number]
     pix = page.get_pixmap(dpi=150)
@@ -61,20 +70,18 @@ def pdf_page_to_base64(pdf_path: str, page_number: int = 0) -> str:
 # ==============================================================
 
 def extract_invoice_data(pdf_path: str) -> InvoiceData:
-    """Extracts structured data from an invoice PDF."""
     print(f"Processing image for {pdf_path}...")
     base64_image = pdf_page_to_base64(pdf_path, page_number=0)
     
     print("Calling Azure OpenAI API via Instructor...")
     
-    # Instructor handles the function calling and validation automatically
     invoice_extraction = client.chat.completions.create(
         model=azure_deployment, 
-        response_model=InvoiceData, # This is where the magic happens
+        response_model=InvoiceData, 
         messages=[
             {
                 "role": "system",
-                "content": "You are an expert accountant. Extract the requested data from the provided invoice image. Strip away currency symbols and formatting."
+                "content": "You are an expert accountant and logistics coordinator. Extract the requested data from the provided invoice image. Strip away currency symbols."
             },
             {
                 "role": "user",
@@ -91,19 +98,22 @@ def extract_invoice_data(pdf_path: str) -> InvoiceData:
                     }
                 ]
             }
-        ],
-        temperature=0.0 
+        ]
+        # Temperature omitted for reasoning models
     )
     return invoice_extraction
 
 # ==============================================================
-# 5. Save Data to CSV
+# 5. Save Data to CSV (UPDATED TO HANDLE ADDRESSES & TAX ROW)
 # ==============================================================
 
-def save_invoice_to_csv(invoice_data: InvoiceData, output_filename: str = "invoice_data.csv"):
-    """Takes the structured InvoiceData object and flattens it into a CSV."""
+def save_invoice_to_csv(invoice_data: InvoiceData, pdf_path: str, output_filename: str = "invoice_data.csv"):
+    file_name = os.path.basename(pdf_path)
+    
+    # We added all the new address columns here
     headers = [
-        "Vendor Name", "Invoice Number", "Date", 
+        "File Name", "Vendor Name", "Vendor Address", "Bill To", "Ship To", 
+        "Origin", "Destination", "Invoice Number", "Date", 
         "Item Description", "Quantity", "Unit Price", 
         "Item Total", "Invoice Total Amount"
     ]
@@ -112,13 +122,32 @@ def save_invoice_to_csv(invoice_data: InvoiceData, output_filename: str = "invoi
         writer = csv.writer(file)
         writer.writerow(headers)
         
-        for item in invoice_data.line_items:
-            row = [
-                invoice_data.vendor_name, invoice_data.invoice_number,
-                invoice_data.date, item.description, item.quantity,
-                item.unit_price, item.total, invoice_data.total_amount
+        # A quick helper function so we don't have to rewrite the address variables over and over
+        def create_row(description, quantity, unit_price, item_total):
+            return [
+                file_name, 
+                invoice_data.vendor_name, 
+                invoice_data.vendor_address,
+                invoice_data.bill_to,
+                invoice_data.ship_to,
+                invoice_data.origin,
+                invoice_data.destination,
+                invoice_data.invoice_number,
+                invoice_data.date, 
+                description, 
+                quantity, 
+                unit_price, 
+                item_total, 
+                invoice_data.total_amount
             ]
-            writer.writerow(row)
+        
+        # 1. Write the standard line items
+        for item in invoice_data.line_items:
+            writer.writerow(create_row(item.description, item.quantity, item.unit_price, item.total))
+            
+        # 2. Write the Tax as its own line item at the end (if it exists)
+        if invoice_data.tax_amount is not None and invoice_data.tax_amount > 0:
+            writer.writerow(create_row("Tax", None, None, invoice_data.tax_amount))
             
     print(f"✅ Successfully saved structured data to {output_filename}")
 
@@ -132,13 +161,11 @@ if __name__ == "__main__":
     try:
         extracted_data = extract_invoice_data(sample_pdf)
         
-        # Verify the raw JSON output
         print("\n--- Raw JSON Validated by Instructor ---")
         print(extracted_data.model_dump_json(indent=2))
         print("----------------------------------------\n")
         
-        # Export to CSV
-        save_invoice_to_csv(extracted_data, "extracted_invoice.csv")
+        save_invoice_to_csv(extracted_data, sample_pdf, "extracted_invoice.csv")
         
     except FileNotFoundError:
         print(f"Error: Could not find '{sample_pdf}'. Please ensure the path is correct.")
