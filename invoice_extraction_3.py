@@ -7,9 +7,10 @@ from openpyxl.styles import Font, PatternFill, Alignment
 from openai import AzureOpenAI
 from pydantic import BaseModel, Field
 from typing import List, Optional
+import time 
 
 # ==============================================================
-# 1. Define Data Schema (MERGED SHIP TO & STRICT ORIGIN GUARDRAILS)
+# 1. Define Data Schema
 # ==============================================================
 
 class LineItem(BaseModel):
@@ -32,11 +33,9 @@ class InvoiceData(BaseModel):
     bill_to: Optional[str] = Field(None, description="The FULL complete 'Bill To' or 'Sold To' address including street, city, state/province, and postal code.")
     remit_to: Optional[str] = Field(None, description="The FULL complete 'Remit To' address including street, city, state/province, and postal code.")
     
-    # ---> STRICT GUARDRAILS ADDED TO ORIGIN <---
     origin: Optional[str] = Field(None, description="The FULL origin physical address. STRICT GUARDRAIL: ONLY extract this if it is explicitly labeled with tags like 'Ship From', 'Origin', 'From', or 'Pickup'. If these specific tags are missing, or if it is just a random secondary address, you MUST return null. Do NOT extract short alphanumeric codes or tank numbers.")
     origin_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
     
-    # ---> DESTINATION NOW ACTS AS 'SHIP TO' AS WELL <---
     destination: Optional[str] = Field(None, description="The FULL destination physical address ('Ship To', 'To', 'Deliver To', 'Consignee'). STRICT RULE: Do NOT extract short alphanumeric facility codes or building numbers. If a full physical address is not present, leave null.")
     destination_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
     
@@ -78,7 +77,7 @@ def pdf_to_base64_images(pdf_path: str) -> List[str]:
     base64_images = []
     for page_num in range(len(doc)):
         page = doc[page_num]
-        pix = page.get_pixmap(dpi=150)
+        pix = page.get_pixmap(dpi=300) 
         base64_images.append(base64.b64encode(pix.tobytes("jpeg")).decode('utf-8'))
     return base64_images
 
@@ -108,19 +107,21 @@ def setup_excel_workbook():
     ws_details = wb.active
     ws_details.title = "Invoice Details"
     
-    # ---> REMOVED 'Ship To' FROM HEADERS <---
+    # ---> NEW: Added Status & Reason to Main Sheet Headers <---
     details_headers = [
         "File Name", "Page #", "Vendor Name", "Vendor Address", "Bill To", "Remit To",
         "Origin", "Destination", "Invoice Number", "Date", "Currency", 
         "Material", "Description", "Quantity", "UOM", "Unit Price", "Line Total", "Subtotal", "Invoice Total",
-        "Inv# Conf", "Origin Conf", "Dest Conf", "UOM Conf", "Total Conf"
+        "Inv# Conf", "Origin Conf", "Dest Conf", "UOM Conf", "Total Conf",
+        "Status", "Reason for Review" 
     ]
     ws_details.append(details_headers)
     
     ws_qc = wb.create_sheet(title="QC Summary")
+    
     qc_headers = [
-        "File Name", "Invoice Number", "Status", "Reason for Review", "Extracted Total", 
-        "Calculated Sum (Lines+Taxes+Ship)", "Variance", "Currency"
+        "File Name", "Vendor Name", "Bill To", "Invoice Number", "Status", "Reason for Review", 
+        "Extracted Total", "Calculated Sum (Lines+Taxes+Ship)", "Variance", "Currency"
     ]
     ws_qc.append(qc_headers)
     
@@ -164,7 +165,6 @@ if __name__ == "__main__":
                 total_calculated = calculated_line_sum + safe_total_tax + safe_ship
                 variance = round(extracted_data.total_amount - total_calculated, 2)
                 
-                # Reason Generation Logic
                 review_reasons = []
                 
                 if variance != 0.0:
@@ -187,49 +187,62 @@ if __name__ == "__main__":
                 status = "FAIL - NEEDS REVIEW" if needs_review else "PASS"
                 reasons_string = " | ".join(review_reasons) if needs_review else "N/A"
                 
-                # Helper function (Removed ship_to)
+                # ---> NEW: Status and reasons appended to Main Sheet rows <---
                 def create_row(page_num, material, desc, qty, uom, uom_conf, price, line_total):
                     return [
                         filename, page_num, extracted_data.vendor_name, extracted_data.vendor_address,
-                        extracted_data.bill_to, extracted_data.remit_to,  # ship_to removed here
+                        extracted_data.bill_to, extracted_data.remit_to, 
                         extracted_data.origin, extracted_data.destination, extracted_data.invoice_number,
                         extracted_data.date, extracted_data.currency, 
                         material, desc, qty, uom, price, line_total, extracted_data.subtotal, extracted_data.total_amount,
                         extracted_data.invoice_number_confidence, extracted_data.origin_confidence, 
-                        extracted_data.destination_confidence, uom_conf, extracted_data.total_amount_confidence
+                        extracted_data.destination_confidence, uom_conf, extracted_data.total_amount_confidence,
+                        status, reasons_string 
                     ]
 
-                # 1. Write actual line items
                 for item in extracted_data.line_items:
                     ws_details.append(create_row(
                         item.page_number, item.material, item.description, item.quantity, 
                         item.uom, item.uom_confidence, item.unit_price, item.line_total
                     ))
                     
-                # 2. Write Shipping row dynamically
                 if safe_ship > 0:
                     ship_label = extracted_data.shipping_name if extracted_data.shipping_name else "Shipping/Handling"
                     ws_details.append(create_row(None, None, ship_label, None, None, None, None, safe_ship))
                     
-                # 3. Write MULTIPLE Tax rows dynamically
                 for tax in extracted_data.taxes:
                     if tax.tax_amount is not None and tax.tax_amount > 0:
                         ws_details.append(create_row(None, None, tax.tax_name, None, None, None, None, tax.tax_amount))
 
-                # 4. Write QC Summary 
                 ws_qc.append([
-                    filename, extracted_data.invoice_number, status, reasons_string,
-                    extracted_data.total_amount, total_calculated, variance, extracted_data.currency
+                    filename, extracted_data.vendor_name, extracted_data.bill_to, extracted_data.invoice_number, 
+                    status, reasons_string, extracted_data.total_amount, total_calculated, variance, extracted_data.currency
                 ])
                 
                 if needs_review:
-                    ws_qc.cell(row=ws_qc.max_row, column=3).font = red_font
-                    print(f"⚠️ FLAG: '{filename}' failed due to: {reasons_string}")
+                    ws_qc.cell(row=ws_qc.max_row, column=5).font = red_font
+                    print(f"⚠️ FLAG: '{filename}' (Vendor: {extracted_data.vendor_name}) failed due to: {reasons_string}")
                 else:
-                    print(f"✅ PASS: {filename} processed perfectly.")
+                    print(f"✅ PASS: '{filename}' (Vendor: {extracted_data.vendor_name}) processed perfectly.")
                     
+            
+            # ---> NEW: THE CRITICAL SAFETY NET <---
             except Exception as e:
-                print(f"❌ Error processing {filename}: {e}")
+                error_msg = f"System/API Crash: {str(e)}"
+                print(f"❌ CRITICAL ERROR processing {filename}: {error_msg}")
+                
+                # Write to the Main Sheet so you know it failed
+                error_row_details = [filename] + [""] * 23 + ["FAIL - CRITICAL ERROR", error_msg]
+                ws_details.append(error_row_details)
+                
+                # Write to the QC sheet and mark it red
+                error_row_qc = [filename, "N/A", "N/A", "N/A", "FAIL - CRITICAL ERROR", error_msg, "", "", "", ""]
+                ws_qc.append(error_row_qc)
+                ws_qc.cell(row=ws_qc.max_row, column=5).font = red_font
+            
+            # API Rate Limiter
+            print("Waiting 5 seconds to prevent API rate limits...\n")
+            time.sleep(5)
                 
     # Auto-adjust column widths
     for sheet in [ws_details, ws_qc]:
