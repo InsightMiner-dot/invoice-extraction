@@ -9,23 +9,36 @@ from pydantic import BaseModel, Field
 from typing import List, Optional
 import time
 
+from dotenv import load_dotenv
+load_dotenv(override=True)
+
 # ==============================================================
-# 1. Define Data Schema 
+# 1. Define Data Schema (UPDATED FOR BACKORDERS & EXTRA FEES)
 # ==============================================================
 
 class LineItem(BaseModel):
     page_number: Optional[int] = Field(None, description="Page number (starting at 1)")
     material: Optional[str] = Field(None, description="Material code, part number, or SKU")
     description: str = Field(description="Name or description of the item")
-    quantity: Optional[float] = Field(None, description="Number of items purchased")
-    uom: Optional[str] = Field(None, description="Unit of Measure")
+    
+    # ---> FIX 1: STRICT RULES FOR QUANTITY SHIPPED VS BACKORDERED <---
+    quantity: Optional[float] = Field(None, description="Number of items SHIPPED. STRICT RULE: If you see 'QTY B/O' (Backordered) alongside 'QTY SHP', ONLY extract the Shipped amount. Do not extract backordered quantities here.")
+    
+    uom: Optional[str] = Field(None, description="Unit of Measure (e.g., EA, LBS, KG). Look for headers like 'UOM' or 'Bin'.")
     uom_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
     unit_price: Optional[float] = Field(None, description="Price of a single unit")
-    line_total: float = Field(description="Total cost for this specific line item.")
+    
+    # ---> FIX 2: MADE LINE TOTAL OPTIONAL FOR BLANK BACKORDER ROWS <---
+    line_total: Optional[float] = Field(None, description="Total cost for this specific line item. Look for 'Amount', 'Total', 'Extended Price', or 'Extd Price'. STRICT RULE: If the column is blank (e.g., due to a backordered item), leave this null or 0.0. Do not guess.")
 
 class TaxItem(BaseModel):
     tax_name: str = Field(description="The exact printed name of the tax (e.g., 'GST/HST', 'TPS/TVH', 'QST').")
     tax_amount: float = Field(description="The amount for this specific tax.")
+
+# ---> FIX 3: NEW SUB-MODEL FOR SHOP SUPPLIES & OTHER FEES <---
+class FeeItem(BaseModel):
+    fee_name: str = Field(description="The exact printed name of the fee (e.g., 'SHOP Supplies', 'Environmental Fee', 'Pallet Charge').")
+    fee_amount: float = Field(description="The amount for this specific fee.")
 
 class InvoiceData(BaseModel):
     vendor_name: str = Field(description="Name of the company issuing the invoice")
@@ -47,6 +60,9 @@ class InvoiceData(BaseModel):
     subtotal: Optional[float] = Field(None, description="The subtotal amount before taxes and shipping are added.")
     
     taxes: List[TaxItem] = Field(default_factory=list, description="STRICT RULE: Extract ALL individual taxes (e.g., GST, PST, QST) listed in the summary block at the bottom of the invoice, AFTER the subtotal. If no taxes are listed, leave this list empty.")
+    
+    # ---> FIX 4: ATTACHED THE FEE LIST TO THE INVOICE <---
+    additional_fees: List[FeeItem] = Field(default_factory=list, description="STRICT RULE: Extract any miscellaneous extra fees (like 'SHOP Supplies') listed in the summary block at the bottom, AFTER the subtotal. Do not include shipping or taxes here.")
     
     shipping_name: Optional[str] = Field(None, description="The exact printed name of the shipping charge (e.g., 'Freight', 'Handling', 'Delivery Fee').")
     shipping_handling: Optional[float] = Field(0.0, description="STRICT RULE: ONLY extract this if it appears in the final summary block at the bottom of the invoice, AFTER the main line items and subtotal.")
@@ -126,7 +142,7 @@ def setup_excel_workbook():
     ws_qc = wb.create_sheet(title="QC Summary")
     qc_headers = [
         "File Name", "Vendor Name", "Bill To", "Invoice Number", "Status", "Reason for Review", 
-        "Extracted Total", "Calculated Sum (Lines+Taxes+Ship)", "Variance", "Currency"
+        "Extracted Total", "Calculated Sum (Lines+Taxes+Ship+Fees)", "Variance", "Currency"
     ]
     ws_qc.append(qc_headers)
     
@@ -155,14 +171,12 @@ if __name__ == "__main__":
     wb, ws_details, ws_qc = setup_excel_workbook()
     red_font = Font(color="9C0006", bold=True)
 
-    # ---> PRE-SCAN FOLDER TO COUNT PDFS <---
     pdf_files = [f for f in os.listdir(input_folder) if f.lower().endswith(".pdf")]
     total_pdfs = len(pdf_files)
     
     print(f"Scanning folder: {input_folder}")
     print(f"Found {total_pdfs} PDF(s) to process.\n")
     
-    # Initialize Counters
     success_count = 0
     error_count = 0
     
@@ -177,7 +191,10 @@ if __name__ == "__main__":
             safe_ship = extracted_data.shipping_handling if extracted_data.shipping_handling is not None else 0.0
             safe_total_tax = sum(tax.tax_amount for tax in extracted_data.taxes if tax.tax_amount is not None)
             
-            total_calculated = calculated_line_sum + safe_total_tax + safe_ship
+            # ---> FIX 5: ADD THE ADDITIONAL FEES TO THE MATH VALIDATION <---
+            safe_fees = sum(fee.fee_amount for fee in extracted_data.additional_fees if fee.fee_amount is not None)
+            
+            total_calculated = calculated_line_sum + safe_total_tax + safe_ship + safe_fees
             variance = round(extracted_data.total_amount - total_calculated, 2)
             
             review_reasons = []
@@ -235,6 +252,11 @@ if __name__ == "__main__":
             for tax in extracted_data.taxes:
                 if tax.tax_amount is not None and tax.tax_amount > 0:
                     ws_details.append(create_row(None, None, tax.tax_name, None, None, None, None, tax.tax_amount))
+                    
+            # ---> FIX 6: WRITE THE NEW FEES TO EXCEL DYNAMICALLY <---
+            for fee in extracted_data.additional_fees:
+                if fee.fee_amount is not None and fee.fee_amount > 0:
+                    ws_details.append(create_row(None, None, fee.fee_name, None, None, None, None, fee.fee_amount))
 
             ws_qc.append([
                 filename, extracted_data.vendor_name, extracted_data.bill_to, extracted_data.invoice_number, 
@@ -247,7 +269,6 @@ if __name__ == "__main__":
             else:
                 print(f"✅ PASS: '{filename}' (Vendor: {extracted_data.vendor_name}) processed perfectly.")
                 
-            # ---> TICK SUCCESS COUNTER <---
             success_count += 1
                 
         except Exception as e:
@@ -261,14 +282,11 @@ if __name__ == "__main__":
             ws_qc.append(error_row_qc)
             ws_qc.cell(row=ws_qc.max_row, column=5).font = red_font
             
-            # ---> TICK ERROR COUNTER <---
             error_count += 1
         
-        # API Rate Limiter
         print("Waiting 5 seconds to prevent API rate limits...\n")
         time.sleep(5)
                 
-    # Auto-adjust column widths
     for sheet in [ws_details, ws_qc]:
         for col in sheet.columns:
             max_length = 0
@@ -283,13 +301,11 @@ if __name__ == "__main__":
 
     wb.save(output_excel)
     
-    # ---> FINAL SUMMARY CALCULATIONS <---
     end_time = time.time()
     total_seconds = end_time - start_time
     minutes = int(total_seconds // 60)
     seconds = total_seconds % 60
     
-    # Print the beautiful summary box
     print("\n" + "="*50)
     print(" BATCH PROCESSING COMPLETE ")
     print("="*50)
