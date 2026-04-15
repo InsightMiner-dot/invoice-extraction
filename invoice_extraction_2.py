@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 from typing import List, Optional
 
 # ==============================================================
-# 1. Define Data Schema 
+# 1. Define Data Schema (UPDATED TAX LOGIC)
 # ==============================================================
 
 class LineItem(BaseModel):
@@ -36,8 +36,11 @@ class InvoiceData(BaseModel):
     invoice_number_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
     date: Optional[str] = Field(None, description="Date the invoice was issued")
     currency: Optional[str] = Field(None, description="3-letter currency code")
-    tax_amount: Optional[float] = Field(0.0, description="Total tax amount. Default to 0.0 if not found.")
-    shipping_handling: Optional[float] = Field(0.0, description="Shipping/Freight charges. Default to 0.0 if not found.")
+    
+    # ---> STRICT TAX & SHIPPING RULES ADDED HERE <---
+    tax_amount: Optional[float] = Field(0.0, description="STRICT RULE: Only extract if explicitly labeled 'Tax', 'VAT', or 'GST'. If the tax line is blank, missing, or not explicitly stated, you MUST output 0.0. Do not guess.")
+    shipping_handling: Optional[float] = Field(0.0, description="STRICT RULE: Only extract if explicitly labeled as Shipping, Handling, or Freight. If missing, output 0.0.")
+    
     total_amount: float = Field(description="Final total amount charged on the invoice")
     total_amount_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
     line_items: List[LineItem] = Field(description="List of all individual items purchased")
@@ -79,13 +82,13 @@ def extract_invoice_data(pdf_path: str) -> InvoiceData:
         model=azure_deployment, 
         response_model=InvoiceData, 
         messages=[
-            {"role": "system", "content": "You are an expert accountant. Extract data accurately and provide honest confidence scores."},
+            {"role": "system", "content": "You are an expert accountant. Extract data accurately and provide honest confidence scores. Adhere strictly to the rules regarding zero values for missing taxes."},
             {"role": "user", "content": content_array}
         ]
     )
 
 # ==============================================================
-# 4. Excel Setup Utility
+# 4. Excel Setup Utility (UPDATED FOR QC REASONS)
 # ==============================================================
 
 def setup_excel_workbook():
@@ -95,7 +98,6 @@ def setup_excel_workbook():
     ws_details = wb.active
     ws_details.title = "Invoice Details"
     
-    # Notice: Vendor Address and Date are back, and all Confidences are at the end
     details_headers = [
         "File Name", "Page #", "Vendor Name", "Vendor Address", "Bill To", "Ship To", "Remit To",
         "Origin", "Destination", "Invoice Number", "Date", "Currency", 
@@ -106,8 +108,10 @@ def setup_excel_workbook():
     
     # --- Sheet 2: QC Summary ---
     ws_qc = wb.create_sheet(title="QC Summary")
+    
+    # ---> ADDED "Reason for Review" COLUMN <---
     qc_headers = [
-        "File Name", "Invoice Number", "Status", "Extracted Total", 
+        "File Name", "Invoice Number", "Status", "Reason for Review", "Extracted Total", 
         "Calculated Sum (Lines+Tax+Ship)", "Variance", "Currency"
     ]
     ws_qc.append(qc_headers)
@@ -126,11 +130,11 @@ def setup_excel_workbook():
     return wb, ws_details, ws_qc
 
 # ==============================================================
-# 5. Main Execution
+# 5. Main Execution & Error Diagnostics
 # ==============================================================
 
 if __name__ == "__main__":
-    input_folder = r"C:\path\to\your\invoices"  # Folder containing all PDFs
+    input_folder = r"C:\path\to\your\invoices"
     output_excel = os.path.join(input_folder, "Extracted_Invoices_Master.xlsx")
         
     wb, ws_details, ws_qc = setup_excel_workbook()
@@ -148,24 +152,40 @@ if __name__ == "__main__":
                 
                 # Math Validation
                 calculated_line_sum = sum(item.line_total for item in extracted_data.line_items if item.line_total is not None)
-                total_calculated = calculated_line_sum + extracted_data.tax_amount + extracted_data.shipping_handling
+                # Ensure we are adding 0.0 if the AI returned None
+                safe_tax = extracted_data.tax_amount if extracted_data.tax_amount is not None else 0.0
+                safe_ship = extracted_data.shipping_handling if extracted_data.shipping_handling is not None else 0.0
+                
+                total_calculated = calculated_line_sum + safe_tax + safe_ship
                 variance = round(extracted_data.total_amount - total_calculated, 2)
                 
-                # Check Confidence
-                confidence_fields = [
-                    extracted_data.invoice_number_confidence, extracted_data.origin_confidence,
-                    extracted_data.destination_confidence, extracted_data.total_amount_confidence
-                ]
+                # ---> NEW: REASON GENERATION LOGIC <---
+                review_reasons = []
+                
+                if variance != 0.0:
+                    review_reasons.append(f"Math Variance of {variance}")
+                
+                if extracted_data.invoice_number_confidence == "Low":
+                    review_reasons.append("Low Conf: Invoice #")
+                if extracted_data.origin_confidence == "Low":
+                    review_reasons.append("Low Conf: Origin")
+                if extracted_data.destination_confidence == "Low":
+                    review_reasons.append("Low Conf: Destination")
+                if extracted_data.total_amount_confidence == "Low":
+                    review_reasons.append("Low Conf: Total Amount")
+                    
                 for item in extracted_data.line_items:
                     if item.uom_confidence == "Low":
-                        confidence_fields.append("Low")
+                        # Gives specific line item context
+                        short_desc = item.description[:15] + "..." if item.description and len(item.description) > 15 else item.description
+                        review_reasons.append(f"Low Conf: UOM on '{short_desc}'")
                 
-                needs_review = (variance != 0.0) or ("Low" in confidence_fields)
+                # Determine final status
+                needs_review = len(review_reasons) > 0
                 status = "FAIL - NEEDS REVIEW" if needs_review else "PASS"
+                reasons_string = " | ".join(review_reasons) if needs_review else "N/A"
                 
-                # -------------------------------------------------------------
-                # Helper function to ensure Invoice Data repeats on EVERY row
-                # -------------------------------------------------------------
+                # 1. Write actual line items to Details Sheet
                 def create_row(page_num, material, desc, qty, uom, uom_conf, price, line_total):
                     return [
                         filename, page_num, extracted_data.vendor_name, extracted_data.vendor_address,
@@ -177,28 +197,27 @@ if __name__ == "__main__":
                         extracted_data.destination_confidence, uom_conf, extracted_data.total_amount_confidence
                     ]
 
-                # 1. Write actual line items
                 for item in extracted_data.line_items:
                     ws_details.append(create_row(
                         item.page_number, item.material, item.description, item.quantity, 
                         item.uom, item.uom_confidence, item.unit_price, item.line_total
                     ))
                     
-                # 2. Write Shipping/Tax rows (repeating the invoice data)
-                if extracted_data.shipping_handling > 0:
-                    ws_details.append(create_row(None, None, "Shipping/Handling", None, None, None, None, extracted_data.shipping_handling))
-                if extracted_data.tax_amount > 0:
-                    ws_details.append(create_row(None, None, "Tax", None, None, None, None, extracted_data.tax_amount))
+                # 2. Write Shipping/Tax rows
+                if safe_ship > 0:
+                    ws_details.append(create_row(None, None, "Shipping/Handling", None, None, None, None, safe_ship))
+                if safe_tax > 0:
+                    ws_details.append(create_row(None, None, "Tax", None, None, None, None, safe_tax))
 
-                # Write QC Summary
+                # 3. Write QC Summary with the new Reason string
                 ws_qc.append([
-                    filename, extracted_data.invoice_number, status, 
+                    filename, extracted_data.invoice_number, status, reasons_string,
                     extracted_data.total_amount, total_calculated, variance, extracted_data.currency
                 ])
                 
                 if needs_review:
                     ws_qc.cell(row=ws_qc.max_row, column=3).font = red_font
-                    print(f"⚠️ FLAG: Marked '{filename}' as NEEDS REVIEW in QC Summary.")
+                    print(f"⚠️ FLAG: '{filename}' failed due to: {reasons_string}")
                 else:
                     print(f"✅ PASS: {filename} processed perfectly.")
                     
