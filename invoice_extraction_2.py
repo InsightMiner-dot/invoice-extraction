@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 from typing import List, Optional
 
 # ==============================================================
-# 1. Define Data Schema (UPDATED FOR MULTIPLE TAXES & SUBTOTAL)
+# 1. Define Data Schema (UPDATED FOR STRICT FULL ADDRESSES)
 # ==============================================================
 
 class LineItem(BaseModel):
@@ -22,30 +22,33 @@ class LineItem(BaseModel):
     unit_price: Optional[float] = Field(None, description="Price of a single unit")
     line_total: float = Field(description="Total cost for this specific line item.")
 
-# ---> NEW: Sub-model specifically for capturing multiple taxes <---
 class TaxItem(BaseModel):
     tax_name: str = Field(description="The exact printed name of the tax (e.g., 'GST/HST', 'TPS/TVH', 'QST').")
     tax_amount: float = Field(description="The amount for this specific tax.")
 
 class InvoiceData(BaseModel):
     vendor_name: str = Field(description="Name of the company issuing the invoice")
-    vendor_address: Optional[str] = Field(None, description="Full address of the vendor")
-    bill_to: Optional[str] = Field(None, description="'Bill To' or 'Sold To' address")
-    ship_to: Optional[str] = Field(None, description="'Ship To' address.")
-    remit_to: Optional[str] = Field(None, description="'Remit To' address")
-    origin: Optional[str] = Field(None, description="Origin address ('From', 'Ship From', 'Pickup', 'Generator').")
+    
+    # ---> STRICT FULL ADDRESS RULES ADDED HERE <---
+    vendor_address: Optional[str] = Field(None, description="The FULL complete address of the vendor including street, city, state/province, and postal code. Do not extract partial addresses.")
+    bill_to: Optional[str] = Field(None, description="The FULL complete 'Bill To' or 'Sold To' address including street, city, state/province, and postal code.")
+    ship_to: Optional[str] = Field(None, description="The FULL complete 'Ship To' address including street, city, state/province, and postal code.")
+    remit_to: Optional[str] = Field(None, description="The FULL complete 'Remit To' address including street, city, state/province, and postal code.")
+    
+    # ---> NEGATIVE PROMPTING FOR TNK#2 BUG <---
+    origin: Optional[str] = Field(None, description="The FULL origin physical address ('From', 'Ship From', 'Pickup'). STRICT RULE: It must look like a physical address. Do NOT extract short alphanumeric facility codes, building numbers, or tank numbers (e.g., 'TNK# 2'). If a full physical address is not present, leave null.")
     origin_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
-    destination: Optional[str] = Field(None, description="Destination address ('To', 'Deliver To', 'Consignee').")
+    
+    destination: Optional[str] = Field(None, description="The FULL destination physical address ('To', 'Deliver To'). STRICT RULE: Do NOT extract short alphanumeric facility codes or building numbers. If a full physical address is not present, leave null.")
     destination_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
+    
     invoice_number: Optional[str] = Field(None, description="Unique invoice ID or number")
     invoice_number_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
     date: Optional[str] = Field(None, description="Date the invoice was issued")
     currency: Optional[str] = Field(None, description="3-letter currency code")
     
-    # ---> NEW: Subtotal Field <---
     subtotal: Optional[float] = Field(None, description="The subtotal amount before taxes and shipping are added.")
     
-    # ---> UPDATED: Dynamic List for Taxes <---
     taxes: List[TaxItem] = Field(default_factory=list, description="STRICT RULE: Extract ALL individual taxes (e.g., GST, PST, QST) listed in the summary block at the bottom of the invoice, AFTER the subtotal. If no taxes are listed, leave this list empty.")
     
     shipping_name: Optional[str] = Field(None, description="The exact printed name of the shipping charge (e.g., 'Freight', 'Handling', 'Delivery Fee').")
@@ -92,7 +95,7 @@ def extract_invoice_data(pdf_path: str) -> InvoiceData:
         model=azure_deployment, 
         response_model=InvoiceData, 
         messages=[
-            {"role": "system", "content": "You are an expert accountant. Extract data accurately and provide honest confidence scores. Adhere strictly to the rules regarding bottom-page summary blocks for taxes and freight."},
+            {"role": "system", "content": "You are an expert accountant. Extract data accurately, ensure all addresses extracted are full physical addresses, and provide honest confidence scores."},
             {"role": "user", "content": content_array}
         ]
     )
@@ -107,7 +110,6 @@ def setup_excel_workbook():
     ws_details = wb.active
     ws_details.title = "Invoice Details"
     
-    # ---> ADDED "Subtotal" BEFORE "Invoice Total" <---
     details_headers = [
         "File Name", "Page #", "Vendor Name", "Vendor Address", "Bill To", "Ship To", "Remit To",
         "Origin", "Destination", "Invoice Number", "Date", "Currency", 
@@ -156,11 +158,8 @@ if __name__ == "__main__":
             try:
                 extracted_data = extract_invoice_data(pdf_path)
                 
-                # ---> UPDATED MATH VALIDATION FOR MULTIPLE TAXES <---
                 calculated_line_sum = sum(item.line_total for item in extracted_data.line_items if item.line_total is not None)
                 safe_ship = extracted_data.shipping_handling if extracted_data.shipping_handling is not None else 0.0
-                
-                # Sum up all the individual taxes found
                 safe_total_tax = sum(tax.tax_amount for tax in extracted_data.taxes if tax.tax_amount is not None)
                 
                 total_calculated = calculated_line_sum + safe_total_tax + safe_ship
@@ -189,7 +188,7 @@ if __name__ == "__main__":
                 status = "FAIL - NEEDS REVIEW" if needs_review else "PASS"
                 reasons_string = " | ".join(review_reasons) if needs_review else "N/A"
                 
-                # Helper function updated to include extracted_data.subtotal
+                # Helper function
                 def create_row(page_num, material, desc, qty, uom, uom_conf, price, line_total):
                     return [
                         filename, page_num, extracted_data.vendor_name, extracted_data.vendor_address,
@@ -213,7 +212,7 @@ if __name__ == "__main__":
                     ship_label = extracted_data.shipping_name if extracted_data.shipping_name else "Shipping/Handling"
                     ws_details.append(create_row(None, None, ship_label, None, None, None, None, safe_ship))
                     
-                # ---> 3. Write MULTIPLE Tax rows dynamically <---
+                # 3. Write MULTIPLE Tax rows dynamically
                 for tax in extracted_data.taxes:
                     if tax.tax_amount is not None and tax.tax_amount > 0:
                         ws_details.append(create_row(None, None, tax.tax_name, None, None, None, None, tax.tax_amount))
