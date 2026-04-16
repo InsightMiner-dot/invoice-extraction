@@ -13,16 +13,13 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 # ==============================================================
-# 1. Define Data Schema (UPDATED TO ALLOW IN-TABLE TAXES)
+# 1. Define Data Schema (UPDATED WITH CROSS-REFERENCING RULES)
 # ==============================================================
 
 class LineItem(BaseModel):
     page_number: Optional[int] = Field(None, description="Page number (starting at 1)")
     material: Optional[str] = Field(None, description="Material code, part number, or SKU")
-    
-    # ---> FIX 1: Allow taxes to be extracted as Line Items if they are in the table <---
     description: str = Field(description="Name or description of the item. If a tax or fee (e.g., 'Federal Excise Tax', 'Franchise Tax') is printed as a row INSIDE the main table, extract it here as a regular line item.")
-    
     quantity: Optional[float] = Field(None, description="Number of items SHIPPED. STRICT RULE: If you see 'QTY B/O' (Backordered) alongside 'QTY SHP', ONLY extract the Shipped amount. Do not extract backordered quantities here.")
     uom: Optional[str] = Field(None, description="Unit of Measure (e.g., EA, LBS, KG). Look for headers like 'UOM' or 'Bin'.")
     uom_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
@@ -56,11 +53,10 @@ class InvoiceData(BaseModel):
     
     subtotal: Optional[float] = Field(None, description="The subtotal amount before taxes and shipping are added.")
     
-    # ---> FIX 2: Prevent Double-Dipping on Taxes <---
-    taxes: List[TaxItem] = Field(default_factory=list, description="STRICT RULE: Extract individual taxes ONLY if they are listed in the summary block at the bottom of the invoice. STRICT GUARDRAIL: Do NOT extract taxes that are already listed as rows inside the main item table (e.g., do not duplicate 'Federal Excise Tax' here if you already captured it as a line item).")
+    # ---> THE FIX: Strict Cross-Referencing Rules for Taxes and Fees <---
+    taxes: List[TaxItem] = Field(default_factory=list, description="STRICT RULE: Extract individual taxes ONLY from the summary block at the bottom of the invoice. CRITICAL GUARDRAIL: Before adding a tax here, verify you did not already extract it in `line_items`. No duplicates allowed. If a tax is already a line item, skip it here.")
     
-    # ---> FIX 3: Prevent Double-Dipping on Fees <---
-    additional_fees: List[FeeItem] = Field(default_factory=list, description="STRICT RULE: ONLY extract fees from the summary block at the bottom. Do NOT extract fees that are listed as rows inside the main item table.")
+    additional_fees: List[FeeItem] = Field(default_factory=list, description="STRICT RULE: ONLY extract fees from the summary block at the bottom. CRITICAL GUARDRAIL: Before adding a fee here, verify you did not already extract it in `line_items`. No duplicates allowed.")
     
     shipping_name: Optional[str] = Field(None, description="The exact printed name of the shipping charge (e.g., 'Freight', 'Handling', 'Delivery Fee').")
     shipping_handling: Optional[float] = Field(0.0, description="STRICT RULE: ONLY extract this if it appears in the final summary block at the bottom of the invoice, AFTER the main line items and subtotal.")
@@ -109,11 +105,14 @@ def extract_invoice_data(pdf_path: str) -> InvoiceData:
     for img_base64 in base64_images:
         content_array.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"}})
 
+    # ---> THE FIX: System Prompt specifically demanding no double-counting <---
+    system_prompt = "You are an expert accountant. Extract data accurately, ensure all addresses extracted are full physical addresses. CRITICAL RULE AGAINST DUPLICATES: Never extract the same tax, fee, or charge twice. If a tax or fee is listed inside the main item table, extract it ONLY as a LineItem and DO NOT duplicate it in the taxes or additional_fees list. Your extracted total mathematically must equal the calculated sum of unique items."
+
     return client.chat.completions.create(
         model=azure_deployment, 
         response_model=InvoiceData, 
         messages=[
-            {"role": "system", "content": "You are an expert accountant. Extract data accurately, ensure all addresses extracted are full physical addresses and adhere to strict keyword rules, and provide honest confidence scores."},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": content_array}
         ]
     )
