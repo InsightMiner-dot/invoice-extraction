@@ -13,13 +13,16 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 # ==============================================================
-# 1. Define Data Schema 
+# 1. Define Data Schema (UPDATED TO ALLOW IN-TABLE TAXES)
 # ==============================================================
 
 class LineItem(BaseModel):
     page_number: Optional[int] = Field(None, description="Page number (starting at 1)")
     material: Optional[str] = Field(None, description="Material code, part number, or SKU")
-    description: str = Field(description="Name or description of the item")
+    
+    # ---> FIX 1: Allow taxes to be extracted as Line Items if they are in the table <---
+    description: str = Field(description="Name or description of the item. If a tax or fee (e.g., 'Federal Excise Tax', 'Franchise Tax') is printed as a row INSIDE the main table, extract it here as a regular line item.")
+    
     quantity: Optional[float] = Field(None, description="Number of items SHIPPED. STRICT RULE: If you see 'QTY B/O' (Backordered) alongside 'QTY SHP', ONLY extract the Shipped amount. Do not extract backordered quantities here.")
     uom: Optional[str] = Field(None, description="Unit of Measure (e.g., EA, LBS, KG). Look for headers like 'UOM' or 'Bin'.")
     uom_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
@@ -53,9 +56,11 @@ class InvoiceData(BaseModel):
     
     subtotal: Optional[float] = Field(None, description="The subtotal amount before taxes and shipping are added.")
     
-    taxes: List[TaxItem] = Field(default_factory=list, description="STRICT RULE: Extract ALL individual taxes (e.g., GST, PST, QST) listed in the summary block at the bottom of the invoice, AFTER the subtotal. If no taxes are listed, leave this list empty.")
+    # ---> FIX 2: Prevent Double-Dipping on Taxes <---
+    taxes: List[TaxItem] = Field(default_factory=list, description="STRICT RULE: Extract individual taxes ONLY if they are listed in the summary block at the bottom of the invoice. STRICT GUARDRAIL: Do NOT extract taxes that are already listed as rows inside the main item table (e.g., do not duplicate 'Federal Excise Tax' here if you already captured it as a line item).")
     
-    additional_fees: List[FeeItem] = Field(default_factory=list, description="STRICT RULE: Extract any miscellaneous extra fees (like 'SHOP Supplies') listed in the summary block at the bottom, AFTER the subtotal. Do not include shipping or taxes here.")
+    # ---> FIX 3: Prevent Double-Dipping on Fees <---
+    additional_fees: List[FeeItem] = Field(default_factory=list, description="STRICT RULE: ONLY extract fees from the summary block at the bottom. Do NOT extract fees that are listed as rows inside the main item table.")
     
     shipping_name: Optional[str] = Field(None, description="The exact printed name of the shipping charge (e.g., 'Freight', 'Handling', 'Delivery Fee').")
     shipping_handling: Optional[float] = Field(0.0, description="STRICT RULE: ONLY extract this if it appears in the final summary block at the bottom of the invoice, AFTER the main line items and subtotal.")
@@ -132,7 +137,6 @@ def setup_excel_workbook():
     ]
     ws_details.append(details_headers)
     
-    # ---> REMOVED 'Bill To' and 'Currency' from QC Headers <---
     ws_qc = wb.create_sheet(title="QC Summary")
     qc_headers = [
         "File Name", "Vendor Name", "Invoice Number", "Status", "Reason for Review", 
@@ -194,7 +198,6 @@ if __name__ == "__main__":
             if variance != 0.0:
                 review_reasons.append(f"Math Variance of {variance}")
                 
-            # ---> NEW FIX: Check if field is not None BEFORE appending a Low Conf reason <---
             if extracted_data.invoice_number and extracted_data.invoice_number_confidence == "Low":
                 review_reasons.append("Low Conf: Invoice #")
             if extracted_data.origin and extracted_data.origin_confidence == "Low":
@@ -249,14 +252,13 @@ if __name__ == "__main__":
                 if fee.fee_amount is not None and fee.fee_amount > 0:
                     ws_details.append(create_row(None, None, fee.fee_name, None, None, None, None, fee.fee_amount))
 
-            # ---> REMOVED 'Bill To' and 'Currency' from QC row insertion <---
             ws_qc.append([
                 filename, extracted_data.vendor_name, extracted_data.invoice_number, 
                 status, reasons_string, extracted_data.total_amount, total_calculated, variance
             ])
             
             if needs_review:
-                ws_qc.cell(row=ws_qc.max_row, column=4).font = red_font  # Now highlighting column 4 (Status)
+                ws_qc.cell(row=ws_qc.max_row, column=4).font = red_font
                 print(f"⚠️ FLAG: '{filename}' (Vendor: {extracted_data.vendor_name}) failed due to: {reasons_string}")
             else:
                 print(f"✅ PASS: '{filename}' (Vendor: {extracted_data.vendor_name}) processed perfectly.")
