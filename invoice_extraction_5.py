@@ -13,29 +13,23 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 # ==============================================================
-# 1. Define Data Schema (UPDATED FOR BACKORDERS & EXTRA FEES)
+# 1. Define Data Schema 
 # ==============================================================
 
 class LineItem(BaseModel):
     page_number: Optional[int] = Field(None, description="Page number (starting at 1)")
     material: Optional[str] = Field(None, description="Material code, part number, or SKU")
     description: str = Field(description="Name or description of the item")
-    
-    # ---> FIX 1: STRICT RULES FOR QUANTITY SHIPPED VS BACKORDERED <---
     quantity: Optional[float] = Field(None, description="Number of items SHIPPED. STRICT RULE: If you see 'QTY B/O' (Backordered) alongside 'QTY SHP', ONLY extract the Shipped amount. Do not extract backordered quantities here.")
-    
     uom: Optional[str] = Field(None, description="Unit of Measure (e.g., EA, LBS, KG). Look for headers like 'UOM' or 'Bin'.")
     uom_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
     unit_price: Optional[float] = Field(None, description="Price of a single unit")
-    
-    # ---> FIX 2: MADE LINE TOTAL OPTIONAL FOR BLANK BACKORDER ROWS <---
     line_total: Optional[float] = Field(None, description="Total cost for this specific line item. Look for 'Amount', 'Total', 'Extended Price', or 'Extd Price'. STRICT RULE: If the column is blank (e.g., due to a backordered item), leave this null or 0.0. Do not guess.")
 
 class TaxItem(BaseModel):
     tax_name: str = Field(description="The exact printed name of the tax (e.g., 'GST/HST', 'TPS/TVH', 'QST').")
     tax_amount: float = Field(description="The amount for this specific tax.")
 
-# ---> FIX 3: NEW SUB-MODEL FOR SHOP SUPPLIES & OTHER FEES <---
 class FeeItem(BaseModel):
     fee_name: str = Field(description="The exact printed name of the fee (e.g., 'SHOP Supplies', 'Environmental Fee', 'Pallet Charge').")
     fee_amount: float = Field(description="The amount for this specific fee.")
@@ -61,7 +55,6 @@ class InvoiceData(BaseModel):
     
     taxes: List[TaxItem] = Field(default_factory=list, description="STRICT RULE: Extract ALL individual taxes (e.g., GST, PST, QST) listed in the summary block at the bottom of the invoice, AFTER the subtotal. If no taxes are listed, leave this list empty.")
     
-    # ---> FIX 4: ATTACHED THE FEE LIST TO THE INVOICE <---
     additional_fees: List[FeeItem] = Field(default_factory=list, description="STRICT RULE: Extract any miscellaneous extra fees (like 'SHOP Supplies') listed in the summary block at the bottom, AFTER the subtotal. Do not include shipping or taxes here.")
     
     shipping_name: Optional[str] = Field(None, description="The exact printed name of the shipping charge (e.g., 'Freight', 'Handling', 'Delivery Fee').")
@@ -139,10 +132,11 @@ def setup_excel_workbook():
     ]
     ws_details.append(details_headers)
     
+    # ---> REMOVED 'Bill To' and 'Currency' from QC Headers <---
     ws_qc = wb.create_sheet(title="QC Summary")
     qc_headers = [
-        "File Name", "Vendor Name", "Bill To", "Invoice Number", "Status", "Reason for Review", 
-        "Extracted Total", "Calculated Sum (Lines+Taxes+Ship+Fees)", "Variance", "Currency"
+        "File Name", "Vendor Name", "Invoice Number", "Status", "Reason for Review", 
+        "Extracted Total", "Calculated Sum (Lines+Taxes+Ship+Fees)", "Variance"
     ]
     ws_qc.append(qc_headers)
     
@@ -190,8 +184,6 @@ if __name__ == "__main__":
             calculated_line_sum = sum(item.line_total for item in extracted_data.line_items if item.line_total is not None)
             safe_ship = extracted_data.shipping_handling if extracted_data.shipping_handling is not None else 0.0
             safe_total_tax = sum(tax.tax_amount for tax in extracted_data.taxes if tax.tax_amount is not None)
-            
-            # ---> FIX 5: ADD THE ADDITIONAL FEES TO THE MATH VALIDATION <---
             safe_fees = sum(fee.fee_amount for fee in extracted_data.additional_fees if fee.fee_amount is not None)
             
             total_calculated = calculated_line_sum + safe_total_tax + safe_ship + safe_fees
@@ -201,11 +193,13 @@ if __name__ == "__main__":
             
             if variance != 0.0:
                 review_reasons.append(f"Math Variance of {variance}")
-            if extracted_data.invoice_number_confidence == "Low":
+                
+            # ---> NEW FIX: Check if field is not None BEFORE appending a Low Conf reason <---
+            if extracted_data.invoice_number and extracted_data.invoice_number_confidence == "Low":
                 review_reasons.append("Low Conf: Invoice #")
-            if extracted_data.origin_confidence == "Low":
+            if extracted_data.origin and extracted_data.origin_confidence == "Low":
                 review_reasons.append("Low Conf: Origin")
-            if extracted_data.destination_confidence == "Low":
+            if extracted_data.destination and extracted_data.destination_confidence == "Low":
                 review_reasons.append("Low Conf: Destination")
             if extracted_data.total_amount_confidence == "Low":
                 review_reasons.append("Low Conf: Total Amount")
@@ -214,7 +208,7 @@ if __name__ == "__main__":
                 review_reasons.append("Missing: 0 Line Items Found")
                 
             for item in extracted_data.line_items:
-                if item.uom_confidence == "Low":
+                if item.uom and item.uom_confidence == "Low":
                     short_desc = item.description[:15] + "..." if item.description and len(item.description) > 15 else item.description
                     review_reasons.append(f"Low Conf: UOM on '{short_desc}'")
             
@@ -235,9 +229,7 @@ if __name__ == "__main__":
                 ]
 
             if len(extracted_data.line_items) == 0:
-                ws_details.append(create_row(
-                    None, None, None, None, None, None, None, 0.0
-                ))
+                ws_details.append(create_row(None, None, None, None, None, None, None, 0.0))
             else:
                 for item in extracted_data.line_items:
                     ws_details.append(create_row(
@@ -253,18 +245,18 @@ if __name__ == "__main__":
                 if tax.tax_amount is not None and tax.tax_amount > 0:
                     ws_details.append(create_row(None, None, tax.tax_name, None, None, None, None, tax.tax_amount))
                     
-            # ---> FIX 6: WRITE THE NEW FEES TO EXCEL DYNAMICALLY <---
             for fee in extracted_data.additional_fees:
                 if fee.fee_amount is not None and fee.fee_amount > 0:
                     ws_details.append(create_row(None, None, fee.fee_name, None, None, None, None, fee.fee_amount))
 
+            # ---> REMOVED 'Bill To' and 'Currency' from QC row insertion <---
             ws_qc.append([
-                filename, extracted_data.vendor_name, extracted_data.bill_to, extracted_data.invoice_number, 
-                status, reasons_string, extracted_data.total_amount, total_calculated, variance, extracted_data.currency
+                filename, extracted_data.vendor_name, extracted_data.invoice_number, 
+                status, reasons_string, extracted_data.total_amount, total_calculated, variance
             ])
             
             if needs_review:
-                ws_qc.cell(row=ws_qc.max_row, column=5).font = red_font
+                ws_qc.cell(row=ws_qc.max_row, column=4).font = red_font  # Now highlighting column 4 (Status)
                 print(f"⚠️ FLAG: '{filename}' (Vendor: {extracted_data.vendor_name}) failed due to: {reasons_string}")
             else:
                 print(f"✅ PASS: '{filename}' (Vendor: {extracted_data.vendor_name}) processed perfectly.")
@@ -278,9 +270,9 @@ if __name__ == "__main__":
             error_row_details = [filename] + [""] * 23 + ["FAIL - CRITICAL ERROR", error_msg]
             ws_details.append(error_row_details)
             
-            error_row_qc = [filename, "N/A", "N/A", "N/A", "FAIL - CRITICAL ERROR", error_msg, "", "", "", ""]
+            error_row_qc = [filename, "N/A", "N/A", "FAIL - CRITICAL ERROR", error_msg, "", "", ""]
             ws_qc.append(error_row_qc)
-            ws_qc.cell(row=ws_qc.max_row, column=5).font = red_font
+            ws_qc.cell(row=ws_qc.max_row, column=4).font = red_font
             
             error_count += 1
         
