@@ -164,18 +164,15 @@ def pdf_to_base64_images(file_bytes: bytes, max_pages: int, dpi: int) -> Tuple[L
         base64_images.append(base64.b64encode(pix.tobytes("jpeg")).decode('utf-8'))
     return base64_images, total_pages
 
-# ---> UPDATED: Accepts standard_aliases_dict and injects into prompt <---
 def extract_invoice_data(client, deployment: str, file_bytes: bytes, custom_fields_dict: Dict[str, str], standard_aliases_dict: Dict[str, str], max_pages: int, dpi: int) -> Tuple[InvoiceDocument, int]:
     base64_images, total_pages = pdf_to_base64_images(file_bytes, max_pages, dpi)
     
     system_prompt = "You are an expert accountant processing a document that may contain multiple distinct invoices. STRICT PAGING RULES: 1) If the same invoice number continues across multiple pages, combine all line items, taxes, and totals into a SINGLE invoice record. 2) If you see a NEW invoice number, start a NEW invoice record. CRITICAL RULE AGAINST DUPLICATES: Never extract the same tax or fee twice. Your extracted total for EACH invoice must mathematically equal the calculated sum of unique items for that invoice."
     
-    # Inject Standard Aliases
     if standard_aliases_dict:
         alias_str = "\n".join([f"- {k}: Also look for '{v}'" for k, v in standard_aliases_dict.items()])
         system_prompt += f"\n\nSTANDARD FIELD ALIASES:\nThe user has provided common aliases for standard schema fields. Use these to help locate the data:\n{alias_str}"
     
-    # Inject Custom Fields
     if custom_fields_dict:
         rules_str = "\n".join([f"- Field Key: '{k}' | Definition & Aliases: {v}" for k, v in custom_fields_dict.items()])
         system_prompt += f"\n\nSTRICT RULE: The user has requested custom data extraction based on specific definitions and alias mappings. You MUST search the invoice for the following logic and place the results in the 'custom_fields' dictionary using the EXACT 'Field Key' provided:\n{rules_str}\nIf a field or its aliases are not found, leave its value as null."
@@ -223,7 +220,19 @@ def setup_excel_workbook(custom_cols: List[str]):
 # 3. Streamlit UI & Core Logic Orchestrator
 # ==============================================================
 
-def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict, max_pages, dpi, prefix=""):
+# Initialize Session State for Persisting Results
+if 'extraction_details' not in st.session_state:
+    st.session_state.extraction_details = None
+if 'extraction_summary' not in st.session_state:
+    st.session_state.extraction_summary = None
+if 'extraction_excel' not in st.session_state:
+    st.session_state.extraction_excel = None
+if 'start_processing' not in st.session_state:
+    st.session_state.start_processing = False
+if 'files_to_process' not in st.session_state:
+    st.session_state.files_to_process = []
+
+def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict, max_pages, dpi):
     client = instructor.from_openai(AzureOpenAI(azure_endpoint=AZURE_ENDPOINT, api_key=AZURE_API_KEY, api_version=AZURE_API_VERSION))
     
     custom_col_keys = list(custom_fields_dict.keys())
@@ -231,7 +240,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
     red_font = Font(color="9C0006", bold=True)
     
     success_count, error_count = 0, 0
-    progress_bar = st.progress(0, text=f"Initializing {prefix} processing sequence...")
+    progress_bar = st.progress(0, text=f"Initializing processing sequence...")
     status_text = st.empty()
     
     current_run_summary = []
@@ -370,34 +379,37 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
     wb.save(excel_buffer)
     excel_buffer.seek(0)
     
+    # Save results to session state so they persist!
+    st.session_state.extraction_details = current_run_details
+    st.session_state.extraction_summary = current_run_summary
+    st.session_state.extraction_excel = excel_buffer
+    
     progress_bar.empty()
     status_text.empty()
-    st.success(f"🎉 {prefix} Batch Processing Complete! Invoices Extracted: {success_count} | Errors: {error_count}")
-    
-    st.subheader(f"📝 {prefix} Line Item Details")
-    st.dataframe(pd.DataFrame(current_run_details), use_container_width=True, hide_index=True)
+    st.success(f"🎉 Batch Processing Complete! Invoices Extracted: {success_count} | Errors: {error_count}")
 
-    st.divider()
-
-    st.subheader(f"🛡️ {prefix} QC Summary")
-    st.dataframe(pd.DataFrame(current_run_summary), use_container_width=True, hide_index=True)
-
-    st.download_button(
-        label=f"📥 Download {prefix} Excel Report",
-        data=excel_buffer,
-        file_name=f"Extraction_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key=f"dl_btn_{prefix}"
-    )
 
 @st.dialog("⚠️ Duplicate Files Detected")
-def confirm_duplicates_dialog(duplicate_files, custom_fields_dict, standard_aliases_dict, max_pages, dpi):
+def confirm_duplicates_dialog(duplicate_files, unique_files):
     st.warning(f"Found {len(duplicate_files)} file(s) that have already been processed and exist in the master database.")
     for f in duplicate_files:
         st.write(f"- `{f.name}`")
     st.write("Do you want to extract these again? (This will add duplicate entries to your audit logs).")
-    if st.button("Yes, Process Duplicates", type="primary"):
-        run_extraction_process(duplicate_files, custom_fields_dict, standard_aliases_dict, max_pages, dpi, prefix="Duplicate")
+    
+    col1, col2 = st.columns(2)
+    if col1.button("Yes, Process All", type="primary"):
+        st.session_state.files_to_process = unique_files + duplicate_files
+        st.session_state.start_processing = True
+        st.rerun()
+    if col2.button("No, Unique Only"):
+        if unique_files:
+            st.session_state.files_to_process = unique_files
+            st.session_state.start_processing = True
+            st.rerun()
+        else:
+            st.warning("No unique files to process.")
+            time.sleep(2)
+            st.rerun()
 
 # ==============================================================
 # 4. Streamlit App Layout
@@ -408,44 +420,40 @@ st.title("🧾 AI Invoice Intelligence Platform")
 
 # Sidebar
 with st.sidebar:
-    with st.expander("⚙️ Processing Configuration", expanded=True):
+    with st.expander("⚙️ Processing Configuration", expanded=False):
         config_max_pages = st.number_input("Max Pages per PDF", min_value=1, max_value=100, value=15)
         config_dpi = st.slider("Render Resolution (DPI)", min_value=72, max_value=600, value=300, step=72)
 
     st.divider()
     
-    # ---> NEW: Data Editors for Standard Aliases and Custom Columns <---
     st.header("🎯 Extraction Rules")
-    
-    st.subheader("1. Standard Field Aliases")
-    st.write("Add alternative names (comma-separated) for built-in fields to help the AI find them.")
-    
-    default_standard = pd.DataFrame({
-        "Standard Field": ["invoice_number", "vendor_name", "origin", "destination", "date"],
-        "Aliases": ["", "", "", "", ""]
-    })
-    standard_df = st.data_editor(default_standard, disabled=["Standard Field"], use_container_width=True, hide_index=True)
-    
-    standard_aliases_dict = {}
-    for _, row in standard_df.iterrows():
-        if str(row["Aliases"]).strip() and str(row["Aliases"]) != "None":
-            standard_aliases_dict[row["Standard Field"]] = str(row["Aliases"]).strip()
-            
-    st.subheader("2. New Custom Fields")
-    st.write("Add entirely new columns to extract.")
-    
-    default_custom = pd.DataFrame({
-        "Field Name": [""],
-        "Description & Aliases": [""]
-    })
-    custom_df = st.data_editor(default_custom, num_rows="dynamic", use_container_width=True, hide_index=True)
-    
-    custom_fields_dict = {}
-    for _, row in custom_df.iterrows():
-        name = str(row["Field Name"]).strip()
-        desc = str(row["Description & Aliases"]).strip()
-        if name and name != "None":
-            custom_fields_dict[name] = desc
+    with st.expander("1. Standard Field Aliases", expanded=False):
+        st.write("Add alternative names (comma-separated) for built-in fields to help the AI find them.")
+        default_standard = pd.DataFrame({
+            "Standard Field": ["invoice_number", "vendor_name", "origin", "destination", "date"],
+            "Aliases": ["", "", "", "", ""]
+        })
+        standard_df = st.data_editor(default_standard, disabled=["Standard Field"], use_container_width=True, hide_index=True)
+        
+        standard_aliases_dict = {}
+        for _, row in standard_df.iterrows():
+            if str(row["Aliases"]).strip() and str(row["Aliases"]) != "None":
+                standard_aliases_dict[row["Standard Field"]] = str(row["Aliases"]).strip()
+                
+    with st.expander("2. New Custom Fields", expanded=False):
+        st.write("Add entirely new columns to extract.")
+        default_custom = pd.DataFrame({
+            "Field Name": [""],
+            "Description & Aliases": [""]
+        })
+        custom_df = st.data_editor(default_custom, num_rows="dynamic", use_container_width=True, hide_index=True)
+        
+        custom_fields_dict = {}
+        for _, row in custom_df.iterrows():
+            name = str(row["Field Name"]).strip()
+            desc = str(row["Description & Aliases"]).strip()
+            if name and name != "None":
+                custom_fields_dict[name] = desc
     
     st.divider()
     st.header("📄 Upload Files")
@@ -472,11 +480,40 @@ with tab_extract:
             unique_files = [f for f in uploaded_files if f.name not in existing_filenames]
             duplicate_files = [f for f in uploaded_files if f.name in existing_filenames]
             
-            if unique_files:
-                run_extraction_process(unique_files, custom_fields_dict, standard_aliases_dict, config_max_pages, config_dpi, prefix="Unique")
-            
             if duplicate_files:
-                confirm_duplicates_dialog(duplicate_files, custom_fields_dict, standard_aliases_dict, config_max_pages, config_dpi)
+                confirm_duplicates_dialog(duplicate_files, unique_files)
+            else:
+                st.session_state.files_to_process = unique_files
+                st.session_state.start_processing = True
+
+    # Execute Processing Logic if triggered
+    if st.session_state.start_processing:
+        run_extraction_process(
+            st.session_state.files_to_process, 
+            custom_fields_dict, 
+            standard_aliases_dict, 
+            config_max_pages, 
+            config_dpi
+        )
+        st.session_state.start_processing = False
+        st.rerun() # Refresh to clear any states and render the tables
+
+    # Persistently Render the Dataframes and Download button from Session State
+    if st.session_state.extraction_details is not None:
+        st.subheader("📝 Line Item Details (Full Extraction)")
+        st.dataframe(pd.DataFrame(st.session_state.extraction_details), use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        st.subheader("🛡️ QC Summary")
+        st.dataframe(pd.DataFrame(st.session_state.extraction_summary), use_container_width=True, hide_index=True)
+
+        st.download_button(
+            label="📥 Download Excel Report",
+            data=st.session_state.extraction_excel,
+            file_name=f"Extraction_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 
 # ---------------------------------------------------------
 # TAB 2: BUSINESS ANALYTICS
