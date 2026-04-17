@@ -55,6 +55,7 @@ def init_db():
         )
     ''')
     
+    # Safe migration: Add new columns if updating from an older version of the DB
     try:
         cursor.execute("ALTER TABLE qc_audit ADD COLUMN processing_time REAL")
         cursor.execute("ALTER TABLE qc_audit ADD COLUMN page_count INTEGER")
@@ -164,7 +165,6 @@ def pdf_to_base64_images(file_bytes: bytes, max_pages: int, dpi: int) -> Tuple[L
         base64_images.append(base64.b64encode(pix.tobytes("jpeg")).decode('utf-8'))
     return base64_images, total_pages
 
-# ---> UPDATED: Uses the new Dictionary mapping for Custom Fields <---
 def extract_invoice_data(client, deployment: str, file_bytes: bytes, custom_fields_dict: Dict[str, str], max_pages: int, dpi: int) -> Tuple[InvoiceDocument, int]:
     base64_images, total_pages = pdf_to_base64_images(file_bytes, max_pages, dpi)
     
@@ -217,11 +217,9 @@ def setup_excel_workbook(custom_cols: List[str]):
 # 3. Streamlit UI & Core Logic Orchestrator
 # ==============================================================
 
-# ---> UPDATED: Uses Custom Fields Dict <---
 def run_extraction_process(files_list, custom_fields_dict, max_pages, dpi, prefix=""):
     client = instructor.from_openai(AzureOpenAI(azure_endpoint=AZURE_ENDPOINT, api_key=AZURE_API_KEY, api_version=AZURE_API_VERSION))
     
-    # Pass just the keys to the Excel setup
     custom_col_keys = list(custom_fields_dict.keys())
     wb, ws_details, ws_qc = setup_excel_workbook(custom_col_keys)
     red_font = Font(color="9C0006", bold=True)
@@ -410,7 +408,6 @@ with st.sidebar:
 
     st.divider()
     
-    # ---> NEW: UI Instructions for Aliases and Descriptions <---
     st.header("➕ Custom Extraction Rules")
     st.write("Define fields with descriptions/aliases to improve AI accuracy.")
     st.caption("**Format:** `Field Name : Description (Aliases: alias1, alias2)`")
@@ -419,7 +416,6 @@ with st.sidebar:
         placeholder="PO Number : The purchase order reference (Aliases: PO#, Order No)\nCost Center : The department billing code"
     )
     
-    # Parse the custom rules into a Dictionary
     custom_fields_dict = {}
     if custom_columns_input.strip():
         for line in custom_columns_input.split('\n'):
