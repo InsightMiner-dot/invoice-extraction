@@ -55,7 +55,6 @@ def init_db():
         )
     ''')
     
-    # Safe migration: Add new columns if updating from an older version of the DB
     try:
         cursor.execute("ALTER TABLE qc_audit ADD COLUMN processing_time REAL")
         cursor.execute("ALTER TABLE qc_audit ADD COLUMN page_count INTEGER")
@@ -165,11 +164,18 @@ def pdf_to_base64_images(file_bytes: bytes, max_pages: int, dpi: int) -> Tuple[L
         base64_images.append(base64.b64encode(pix.tobytes("jpeg")).decode('utf-8'))
     return base64_images, total_pages
 
-def extract_invoice_data(client, deployment: str, file_bytes: bytes, custom_fields_dict: Dict[str, str], max_pages: int, dpi: int) -> Tuple[InvoiceDocument, int]:
+# ---> UPDATED: Accepts standard_aliases_dict and injects into prompt <---
+def extract_invoice_data(client, deployment: str, file_bytes: bytes, custom_fields_dict: Dict[str, str], standard_aliases_dict: Dict[str, str], max_pages: int, dpi: int) -> Tuple[InvoiceDocument, int]:
     base64_images, total_pages = pdf_to_base64_images(file_bytes, max_pages, dpi)
     
     system_prompt = "You are an expert accountant processing a document that may contain multiple distinct invoices. STRICT PAGING RULES: 1) If the same invoice number continues across multiple pages, combine all line items, taxes, and totals into a SINGLE invoice record. 2) If you see a NEW invoice number, start a NEW invoice record. CRITICAL RULE AGAINST DUPLICATES: Never extract the same tax or fee twice. Your extracted total for EACH invoice must mathematically equal the calculated sum of unique items for that invoice."
     
+    # Inject Standard Aliases
+    if standard_aliases_dict:
+        alias_str = "\n".join([f"- {k}: Also look for '{v}'" for k, v in standard_aliases_dict.items()])
+        system_prompt += f"\n\nSTANDARD FIELD ALIASES:\nThe user has provided common aliases for standard schema fields. Use these to help locate the data:\n{alias_str}"
+    
+    # Inject Custom Fields
     if custom_fields_dict:
         rules_str = "\n".join([f"- Field Key: '{k}' | Definition & Aliases: {v}" for k, v in custom_fields_dict.items()])
         system_prompt += f"\n\nSTRICT RULE: The user has requested custom data extraction based on specific definitions and alias mappings. You MUST search the invoice for the following logic and place the results in the 'custom_fields' dictionary using the EXACT 'Field Key' provided:\n{rules_str}\nIf a field or its aliases are not found, leave its value as null."
@@ -217,7 +223,7 @@ def setup_excel_workbook(custom_cols: List[str]):
 # 3. Streamlit UI & Core Logic Orchestrator
 # ==============================================================
 
-def run_extraction_process(files_list, custom_fields_dict, max_pages, dpi, prefix=""):
+def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict, max_pages, dpi, prefix=""):
     client = instructor.from_openai(AzureOpenAI(azure_endpoint=AZURE_ENDPOINT, api_key=AZURE_API_KEY, api_version=AZURE_API_VERSION))
     
     custom_col_keys = list(custom_fields_dict.keys())
@@ -244,7 +250,7 @@ def run_extraction_process(files_list, custom_fields_dict, max_pages, dpi, prefi
         
         try:
             file_bytes = file.read()
-            extracted_document, total_pages = extract_invoice_data(client, AZURE_DEPLOYMENT, file_bytes, custom_fields_dict, max_pages, dpi)
+            extracted_document, total_pages = extract_invoice_data(client, AZURE_DEPLOYMENT, file_bytes, custom_fields_dict, standard_aliases_dict, max_pages, dpi)
             file_proc_time = round(time.time() - file_start_time, 2)
             
             if not extracted_document.invoices:
@@ -385,13 +391,13 @@ def run_extraction_process(files_list, custom_fields_dict, max_pages, dpi, prefi
     )
 
 @st.dialog("⚠️ Duplicate Files Detected")
-def confirm_duplicates_dialog(duplicate_files, custom_fields_dict, max_pages, dpi):
+def confirm_duplicates_dialog(duplicate_files, custom_fields_dict, standard_aliases_dict, max_pages, dpi):
     st.warning(f"Found {len(duplicate_files)} file(s) that have already been processed and exist in the master database.")
     for f in duplicate_files:
         st.write(f"- `{f.name}`")
     st.write("Do you want to extract these again? (This will add duplicate entries to your audit logs).")
     if st.button("Yes, Process Duplicates", type="primary"):
-        run_extraction_process(duplicate_files, custom_fields_dict, max_pages, dpi, prefix="Duplicate")
+        run_extraction_process(duplicate_files, custom_fields_dict, standard_aliases_dict, max_pages, dpi, prefix="Duplicate")
 
 # ==============================================================
 # 4. Streamlit App Layout
@@ -408,22 +414,38 @@ with st.sidebar:
 
     st.divider()
     
-    st.header("➕ Custom Extraction Rules")
-    st.write("Define fields with descriptions/aliases to improve AI accuracy.")
-    st.caption("**Format:** `Field Name : Description (Aliases: alias1, alias2)`")
-    custom_columns_input = st.text_area(
-        "Custom Rules (One per line)", 
-        placeholder="PO Number : The purchase order reference (Aliases: PO#, Order No)\nCost Center : The department billing code"
-    )
+    # ---> NEW: Data Editors for Standard Aliases and Custom Columns <---
+    st.header("🎯 Extraction Rules")
+    
+    st.subheader("1. Standard Field Aliases")
+    st.write("Add alternative names (comma-separated) for built-in fields to help the AI find them.")
+    
+    default_standard = pd.DataFrame({
+        "Standard Field": ["invoice_number", "vendor_name", "origin", "destination", "date"],
+        "Aliases": ["", "", "", "", ""]
+    })
+    standard_df = st.data_editor(default_standard, disabled=["Standard Field"], use_container_width=True, hide_index=True)
+    
+    standard_aliases_dict = {}
+    for _, row in standard_df.iterrows():
+        if str(row["Aliases"]).strip() and str(row["Aliases"]) != "None":
+            standard_aliases_dict[row["Standard Field"]] = str(row["Aliases"]).strip()
+            
+    st.subheader("2. New Custom Fields")
+    st.write("Add entirely new columns to extract.")
+    
+    default_custom = pd.DataFrame({
+        "Field Name": [""],
+        "Description & Aliases": [""]
+    })
+    custom_df = st.data_editor(default_custom, num_rows="dynamic", use_container_width=True, hide_index=True)
     
     custom_fields_dict = {}
-    if custom_columns_input.strip():
-        for line in custom_columns_input.split('\n'):
-            if ':' in line:
-                key, desc = line.split(':', 1)
-                custom_fields_dict[key.strip()] = desc.strip()
-            elif line.strip():
-                custom_fields_dict[line.strip()] = "Extract this field."
+    for _, row in custom_df.iterrows():
+        name = str(row["Field Name"]).strip()
+        desc = str(row["Description & Aliases"]).strip()
+        if name and name != "None":
+            custom_fields_dict[name] = desc
     
     st.divider()
     st.header("📄 Upload Files")
@@ -451,10 +473,10 @@ with tab_extract:
             duplicate_files = [f for f in uploaded_files if f.name in existing_filenames]
             
             if unique_files:
-                run_extraction_process(unique_files, custom_fields_dict, config_max_pages, config_dpi, prefix="Unique")
+                run_extraction_process(unique_files, custom_fields_dict, standard_aliases_dict, config_max_pages, config_dpi, prefix="Unique")
             
             if duplicate_files:
-                confirm_duplicates_dialog(duplicate_files, custom_fields_dict, config_max_pages, config_dpi)
+                confirm_duplicates_dialog(duplicate_files, custom_fields_dict, standard_aliases_dict, config_max_pages, config_dpi)
 
 # ---------------------------------------------------------
 # TAB 2: BUSINESS ANALYTICS
