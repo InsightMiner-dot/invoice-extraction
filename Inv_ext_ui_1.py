@@ -1,4 +1,3 @@
-
 import streamlit as st
 import fitz  # PyMuPDF
 import base64
@@ -18,8 +17,14 @@ from dotenv import load_dotenv
 # Load environment variables from the backend
 load_dotenv(override=True)
 
+# Fetch Azure settings securely from .env
+AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_API_KEY = os.getenv("AZURE_OPENAI_KEY")
+AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
+AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+
 # ==============================================================
-# 0. Database Setup (NEW AUDIT FEATURE)
+# 0. Database Setup (AUDIT FEATURE)
 # ==============================================================
 
 AUDIT_FOLDER = "audit"
@@ -69,68 +74,66 @@ def insert_audit_record(record: tuple):
 # Initialize the database when the app starts
 init_db()
 
-
 # ==============================================================
-# 1. Define Data Schema (UPDATED FOR STRICT PAGING & FEES)
+# 1. Define Data Schema (STRICT PAGING & FEES)
 # ==============================================================
 
 class LineItem(BaseModel):
     page_number: Optional[int] = Field(None, description="Page number (starting at 1)")
     material: Optional[str] = Field(None, description="Material code, part number, or SKU")
-    description: str = Field(description="Name or description of the item. If a tax or fee (e.g., 'Federal Excise Tax', 'Franchise Tax') is printed as a row INSIDE the main table, extract it here as a regular line item.")
-    quantity: Optional[float] = Field(None, description="Number of items SHIPPED. STRICT RULE: If you see 'QTY B/O' (Backordered) alongside 'QTY SHP', ONLY extract the Shipped amount. Do not extract backordered quantities here.")
-    uom: Optional[str] = Field(None, description="Unit of Measure (e.g., EA, LBS, KG). Look for headers like 'UOM' or 'Bin'.")
+    description: str = Field(description="Name or description of the item. If a tax or fee is printed inside the main table, extract it here.")
+    quantity: Optional[float] = Field(None, description="Number of items SHIPPED. STRICT RULE: ONLY extract the Shipped amount.")
+    uom: Optional[str] = Field(None, description="Unit of Measure (e.g., EA, LBS, KG).")
     uom_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
     unit_price: Optional[float] = Field(None, description="Price of a single unit")
-    line_total: Optional[float] = Field(None, description="Total cost for this specific line item. Look for 'Amount', 'Total', 'Extended Price', or 'Extd Price'. STRICT RULE: If the column is blank (e.g., due to a backordered item), leave this null or 0.0. Do not guess.")
+    line_total: Optional[float] = Field(None, description="Total cost for this specific line item. Leave null or 0.0 if blank.")
 
 class TaxItem(BaseModel):
     tax_name: str = Field(description="The exact printed name of the tax (e.g., 'GST/HST', 'TPS/TVH', 'QST').")
     tax_amount: float = Field(description="The amount for this specific tax.")
 
 class FeeItem(BaseModel):
-    fee_name: str = Field(description="The exact printed name of the fee (e.g., 'SHOP Supplies', 'Environmental Fee', 'Pallet Charge').")
+    fee_name: str = Field(description="The exact printed name of the fee (e.g., 'SHOP Supplies', 'Environmental Fee').")
     fee_amount: float = Field(description="The amount for this specific fee.")
 
 class InvoiceData(BaseModel):
     vendor_name: str = Field(description="Name of the company issuing the invoice")
-    vendor_address: Optional[str] = Field(None, description="The FULL complete address of the vendor including street, city, state/province, and postal code. Do not extract partial addresses.")
-    bill_to: Optional[str] = Field(None, description="The FULL complete 'Bill To' or 'Sold To' address including street, city, state/province, and postal code.")
-    remit_to: Optional[str] = Field(None, description="The FULL complete 'Remit To' address including street, city, state/province, and postal code.")
+    vendor_address: Optional[str] = Field(None, description="The FULL complete address of the vendor.")
+    bill_to: Optional[str] = Field(None, description="The FULL complete 'Bill To' or 'Sold To' address.")
+    remit_to: Optional[str] = Field(None, description="The FULL complete 'Remit To' address.")
     
-    origin: Optional[str] = Field(None, description="The FULL origin physical address. STRICT GUARDRAIL: ONLY extract this if it is explicitly labeled with tags like 'Ship From', 'Origin', 'From', or 'Pickup'. If these specific tags are missing, or if it is just a random secondary address, you MUST return null. Do NOT extract short alphanumeric codes or tank numbers.")
+    origin: Optional[str] = Field(None, description="The FULL origin physical address. STRICT GUARDRAIL: Only if labeled 'Ship From', etc.")
     origin_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
     
-    destination: Optional[str] = Field(None, description="The FULL destination physical address ('Ship To', 'To', 'Deliver To', 'Consignee'). STRICT RULE: Do NOT extract short alphanumeric facility codes or building numbers. If a full physical address is not present, leave null.")
+    destination: Optional[str] = Field(None, description="The FULL destination physical address.")
     destination_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
     
-    invoice_number: Optional[str] = Field(None, description="Unique invoice number. STRICT RULE: Only extract values explicitly labeled as 'Invoice Number' or 'Invoice #'. Do NOT extract Ticket No, Reference, Order ID, or Statement numbers.")
+    invoice_number: Optional[str] = Field(None, description="Unique invoice number.")
     invoice_number_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
     
     date: Optional[str] = Field(None, description="Date the invoice was issued")
     currency: Optional[str] = Field(None, description="3-letter currency code")
     
-    subtotal: Optional[float] = Field(None, description="The subtotal amount before taxes and shipping are added.")
+    subtotal: Optional[float] = Field(None, description="The subtotal amount before taxes and shipping.")
     
-    taxes: List[TaxItem] = Field(default_factory=list, description="STRICT RULE: Extract individual taxes ONLY from the summary block at the bottom of the invoice. CRITICAL GUARDRAIL: Before adding a tax here, verify you did not already extract it in `line_items`. No duplicates allowed. If a tax is already a line item, skip it here.")
+    taxes: List[TaxItem] = Field(default_factory=list, description="Extract individual taxes ONLY from the summary block.")
+    additional_fees: List[FeeItem] = Field(default_factory=list, description="ONLY extract fees from the summary block at the bottom.")
     
-    additional_fees: List[FeeItem] = Field(default_factory=list, description="STRICT RULE: ONLY extract fees from the summary block at the bottom. CRITICAL GUARDRAIL: Before adding a fee here, verify you did not already extract it in `line_items`. No duplicates allowed.")
-    
-    shipping_name: Optional[str] = Field(None, description="The exact printed name of the shipping charge (e.g., 'Freight', 'Handling', 'Delivery Fee').")
-    shipping_handling: Optional[float] = Field(0.0, description="STRICT RULE: ONLY extract this if it appears in the final summary block at the bottom of the invoice, AFTER the main line items and subtotal.")
+    shipping_name: Optional[str] = Field(None, description="The exact printed name of the shipping charge.")
+    shipping_handling: Optional[float] = Field(0.0, description="ONLY extract this if it appears in the final summary block.")
     
     total_amount: float = Field(description="Final total amount charged on the invoice")
     total_amount_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
     
     custom_fields: Dict[str, Optional[str]] = Field(
         default_factory=dict, 
-        description="Extract any custom fields requested by the user. The keys MUST match the requested column names exactly."
+        description="Extract any custom fields requested by the user. The keys MUST match exactly."
     )
     
     line_items: List[LineItem] = Field(description="List of all individual items purchased")
 
 class InvoiceDocument(BaseModel):
-    invoices: List[InvoiceData] = Field(description="List of distinct invoices. STRICT PAGING RULE: 1) If an invoice table extends across multiple pages but shares the SAME Invoice Number, MERGE all line items into ONE invoice record. 2) If the Invoice Number CHANGES on a new page, split it into a NEW separate invoice record in this list.")
+    invoices: List[InvoiceData] = Field(description="List of distinct invoices. STRICT PAGING RULE: Merge line items if the invoice number is the same across pages. Split into a new record if the invoice number changes.")
 
 # ==============================================================
 # 2. PDF to Image Conversion & Extraction
@@ -230,19 +233,6 @@ st.write("Upload PDF documents to extract structured data. Results are compiled 
 
 # Sidebar Configuration
 with st.sidebar:
-    st.header("⚙️ Azure Settings")
-    env_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "")
-    env_key = os.getenv("AZURE_OPENAI_KEY", "")
-    env_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "")
-    env_api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
-
-    azure_endpoint = st.text_input("Endpoint URL", value=env_endpoint)
-    azure_api_key = st.text_input("API Key", value=env_key, type="password")
-    azure_deployment = st.text_input("Deployment Name", value=env_deployment)
-    azure_api_version = st.text_input("API Version", value=env_api_version)
-
-    st.divider()
-    
     st.header("➕ Custom Extraction")
     custom_columns_input = st.text_area(
         "Custom Columns (Comma-separated)", 
@@ -259,12 +249,12 @@ with st.sidebar:
 if st.button("Start Extraction", type="primary"):
     if not uploaded_files:
         st.error("Please upload at least one PDF file from the sidebar.")
-    elif not all([azure_endpoint, azure_api_key, azure_deployment, azure_api_version]):
-        st.error("Please ensure all Azure OpenAI settings are filled out in the sidebar.")
+    elif not all([AZURE_ENDPOINT, AZURE_API_KEY, AZURE_DEPLOYMENT]):
+        st.error("⚠️ Azure credentials missing. Please check your `.env` file for AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_KEY, and AZURE_OPENAI_DEPLOYMENT.")
     else:
         try:
             client = instructor.from_openai(
-                AzureOpenAI(azure_endpoint=azure_endpoint, api_key=azure_api_key, api_version=azure_api_version)
+                AzureOpenAI(azure_endpoint=AZURE_ENDPOINT, api_key=AZURE_API_KEY, api_version=AZURE_API_VERSION)
             )
         except Exception as e:
             st.error(f"Failed to initialize Azure OpenAI client: {e}")
@@ -294,7 +284,7 @@ if st.button("Start Extraction", type="primary"):
             
             try:
                 file_bytes = file.read()
-                extracted_document = extract_invoice_data(client, azure_deployment, file_bytes, custom_columns_list)
+                extracted_document = extract_invoice_data(client, AZURE_DEPLOYMENT, file_bytes, custom_columns_list)
                 
                 if not extracted_document.invoices:
                     log_container.warning(f"⚠️ **FLAG:** No invoices detected in `{filename}`")
@@ -465,7 +455,6 @@ if st.button("Start Extraction", type="primary"):
             )
             
         with col_dl2:
-            # Provide download for the SQLite file
             if os.path.exists(DB_PATH):
                 with open(DB_PATH, "rb") as db_file:
                     st.download_button(
