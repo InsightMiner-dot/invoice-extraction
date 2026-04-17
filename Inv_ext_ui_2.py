@@ -231,7 +231,7 @@ if 'start_processing' not in st.session_state:
 if 'files_to_process' not in st.session_state:
     st.session_state.files_to_process = []
 
-def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict, max_pages, dpi):
+def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict, max_pages, dpi, prefix=""):
     client = instructor.from_openai(AzureOpenAI(azure_endpoint=AZURE_ENDPOINT, api_key=AZURE_API_KEY, api_version=AZURE_API_VERSION))
     
     custom_col_keys = list(custom_fields_dict.keys())
@@ -239,7 +239,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
     red_font = Font(color="9C0006", bold=True)
     
     success_count, error_count = 0, 0
-    progress_bar = st.progress(0, text=f"Initializing processing sequence...")
+    progress_bar = st.progress(0, text=f"Initializing {prefix} processing sequence...")
     status_text = st.empty()
     
     current_run_summary = []
@@ -293,48 +293,66 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                 status = "FAIL - NEEDS REVIEW" if needs_review else "PASS"
                 reasons_string = " | ".join(review_reasons) if needs_review else "N/A"
                 
-                def create_row(page_num, material, desc, qty, uom, uom_conf, price, line_total):
-                    base_row = [
-                        filename, page_num, extracted_data.vendor_name, extracted_data.vendor_address,
-                        extracted_data.bill_to, extracted_data.remit_to, 
-                        extracted_data.origin, extracted_data.destination, extracted_data.invoice_number,
-                        extracted_data.date, extracted_data.currency, 
-                        material, desc, qty, uom, price, line_total, extracted_data.subtotal, extracted_data.total_amount,
-                        extracted_data.invoice_number_confidence, extracted_data.origin_confidence, 
-                        extracted_data.destination_confidence, uom_conf, extracted_data.total_amount_confidence,
-                        status, reasons_string
-                    ]
-                    custom_values = [extracted_data.custom_fields.get(col, "Not Found") for col in custom_col_keys]
-                    return base_row + custom_values
-
-                def append_ui_detail_row(page_num, material, desc, qty, uom, unit_price, line_total):
-                    current_run_details.append({
-                        "File Name": filename, "Vendor": extracted_data.vendor_name, "Invoice #": extracted_data.invoice_number,
-                        "Page #": page_num, "Material/Fee": material, "Description": desc, "Qty": qty, "UOM": uom,
-                        "Price": unit_price, "Line Total": line_total
-                    })
+                # Unifies Excel & UI output to ensure full data is displayed
+                def create_row_dict(page_num, material, desc, qty, uom, uom_conf, price, line_total):
+                    row_data = {
+                        "File Name": filename,
+                        "Page #": page_num,
+                        "Vendor Name": extracted_data.vendor_name,
+                        "Vendor Address": extracted_data.vendor_address,
+                        "Bill To": extracted_data.bill_to,
+                        "Remit To": extracted_data.remit_to,
+                        "Origin": extracted_data.origin,
+                        "Destination": extracted_data.destination,
+                        "Invoice Number": extracted_data.invoice_number,
+                        "Date": extracted_data.date,
+                        "Currency": extracted_data.currency,
+                        "Material": material,
+                        "Description": desc,
+                        "Quantity": qty,
+                        "UOM": uom,
+                        "Unit Price": price,
+                        "Line Total": line_total,
+                        "Subtotal": extracted_data.subtotal,
+                        "Invoice Total": extracted_data.total_amount,
+                        "Inv# Conf": extracted_data.invoice_number_confidence,
+                        "Origin Conf": extracted_data.origin_confidence,
+                        "Dest Conf": extracted_data.destination_confidence,
+                        "UOM Conf": uom_conf,
+                        "Total Conf": extracted_data.total_amount_confidence,
+                        "Status": status,
+                        "Reason for Review": reasons_string
+                    }
+                    for col in custom_col_keys:
+                        row_data[col] = extracted_data.custom_fields.get(col, "Not Found")
+                    return row_data
 
                 if len(extracted_data.line_items) == 0:
-                    ws_details.append(create_row(None, None, None, None, None, None, None, 0.0))
-                    append_ui_detail_row(None, None, "NO ITEMS FOUND", None, None, None, 0.0)
+                    row_dict = create_row_dict(None, None, "NO ITEMS FOUND", None, None, None, None, 0.0)
+                    ws_details.append(list(row_dict.values()))
+                    current_run_details.append(row_dict)
                 else:
                     for item in extracted_data.line_items:
-                        ws_details.append(create_row(item.page_number, item.material, item.description, item.quantity, item.uom, item.uom_confidence, item.unit_price, item.line_total))
-                        append_ui_detail_row(item.page_number, item.material, item.description, item.quantity, item.uom, item.unit_price, item.line_total)
+                        row_dict = create_row_dict(item.page_number, item.material, item.description, item.quantity, item.uom, item.uom_confidence, item.unit_price, item.line_total)
+                        ws_details.append(list(row_dict.values()))
+                        current_run_details.append(row_dict)
                         
                 if safe_ship > 0: 
-                    ws_details.append(create_row(None, None, extracted_data.shipping_name or "Shipping", None, None, None, None, safe_ship))
-                    append_ui_detail_row(None, "SHIPPING", extracted_data.shipping_name or "Shipping", None, None, None, safe_ship)
+                    row_dict = create_row_dict(None, "SHIPPING", extracted_data.shipping_name or "Shipping", None, None, None, None, safe_ship)
+                    ws_details.append(list(row_dict.values()))
+                    current_run_details.append(row_dict)
                     
                 for tax in extracted_data.taxes:
                     if tax.tax_amount is not None and tax.tax_amount > 0: 
-                        ws_details.append(create_row(None, None, tax.tax_name, None, None, None, None, tax.tax_amount))
-                        append_ui_detail_row(None, "TAX", tax.tax_name, None, None, None, tax.tax_amount)
+                        row_dict = create_row_dict(None, "TAX", tax.tax_name, None, None, None, None, tax.tax_amount)
+                        ws_details.append(list(row_dict.values()))
+                        current_run_details.append(row_dict)
                         
                 for fee in extracted_data.additional_fees:
                     if fee.fee_amount is not None and fee.fee_amount > 0: 
-                        ws_details.append(create_row(None, None, fee.fee_name, None, None, None, None, fee.fee_amount))
-                        append_ui_detail_row(None, "FEE", fee.fee_name, None, None, None, fee.fee_amount)
+                        row_dict = create_row_dict(None, "FEE", fee.fee_name, None, None, None, None, fee.fee_amount)
+                        ws_details.append(list(row_dict.values()))
+                        current_run_details.append(row_dict)
                 
                 ws_qc.append([
                     filename, extracted_data.vendor_name, extracted_data.invoice_number, 
@@ -384,7 +402,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
     
     progress_bar.empty()
     status_text.empty()
-    st.success(f"🎉 Batch Processing Complete! Invoices Extracted: {success_count} | Errors: {error_count}")
+    st.success(f"🎉 {prefix} Batch Processing Complete! Invoices Extracted: {success_count} | Errors: {error_count}")
 
 
 @st.dialog("⚠️ Duplicate Files Detected")
@@ -428,7 +446,6 @@ with st.sidebar:
     with st.expander("1. Standard Field Aliases", expanded=False):
         st.write("Add alternative names (comma-separated) for built-in fields to help the AI find them.")
         
-        # ALL schema fields loaded for user-defined mapping
         default_standard = pd.DataFrame({
             "Standard Field": [
                 "invoice_number", "date", "vendor_name", "vendor_address", 
