@@ -239,7 +239,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
     red_font = Font(color="9C0006", bold=True)
     
     success_count, error_count = 0, 0
-    progress_bar = st.progress(0, text=f"Initializing {prefix} processing sequence...")
+    progress_bar = st.progress(0, text=f"Initializing processing sequence...")
     status_text = st.empty()
     
     current_run_summary = []
@@ -257,7 +257,6 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
         file_start_time = time.time()
         
         try:
-            # Ensure file pointer is at the beginning
             file.seek(0)
             file_bytes = file.read()
             extracted_document, total_pages = extract_invoice_data(client, AZURE_DEPLOYMENT, file_bytes, custom_fields_dict, standard_aliases_dict, max_pages, dpi)
@@ -295,65 +294,48 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                 status = "FAIL - NEEDS REVIEW" if needs_review else "PASS"
                 reasons_string = " | ".join(review_reasons) if needs_review else "N/A"
                 
-                def create_row_dict(page_num, material, desc, qty, uom, uom_conf, price, line_total):
-                    row_data = {
-                        "File Name": filename,
-                        "Page #": page_num,
-                        "Vendor Name": extracted_data.vendor_name,
-                        "Vendor Address": extracted_data.vendor_address,
-                        "Bill To": extracted_data.bill_to,
-                        "Remit To": extracted_data.remit_to,
-                        "Origin": extracted_data.origin,
-                        "Destination": extracted_data.destination,
-                        "Invoice Number": extracted_data.invoice_number,
-                        "Date": extracted_data.date,
-                        "Currency": extracted_data.currency,
-                        "Material": material,
-                        "Description": desc,
-                        "Quantity": qty,
-                        "UOM": uom,
-                        "Unit Price": price,
-                        "Line Total": line_total,
-                        "Subtotal": extracted_data.subtotal,
-                        "Invoice Total": extracted_data.total_amount,
-                        "Inv# Conf": extracted_data.invoice_number_confidence,
-                        "Origin Conf": extracted_data.origin_confidence,
-                        "Dest Conf": extracted_data.destination_confidence,
-                        "UOM Conf": uom_conf,
-                        "Total Conf": extracted_data.total_amount_confidence,
-                        "Status": status,
-                        "Reason for Review": reasons_string
-                    }
-                    for col in custom_col_keys:
-                        row_data[col] = extracted_data.custom_fields.get(col, "Not Found")
-                    return row_data
+                def create_row(page_num, material, desc, qty, uom, uom_conf, price, line_total):
+                    base_row = [
+                        filename, page_num, extracted_data.vendor_name, extracted_data.vendor_address,
+                        extracted_data.bill_to, extracted_data.remit_to, 
+                        extracted_data.origin, extracted_data.destination, extracted_data.invoice_number,
+                        extracted_data.date, extracted_data.currency, 
+                        material, desc, qty, uom, price, line_total, extracted_data.subtotal, extracted_data.total_amount,
+                        extracted_data.invoice_number_confidence, extracted_data.origin_confidence, 
+                        extracted_data.destination_confidence, uom_conf, extracted_data.total_amount_confidence,
+                        status, reasons_string
+                    ]
+                    custom_values = [extracted_data.custom_fields.get(col, "Not Found") for col in custom_col_keys]
+                    return base_row + custom_values
+
+                def append_ui_detail_row(page_num, material, desc, qty, uom, unit_price, line_total):
+                    current_run_details.append({
+                        "File Name": filename, "Vendor": extracted_data.vendor_name, "Invoice #": extracted_data.invoice_number,
+                        "Page #": page_num, "Material/Fee": material, "Description": desc, "Qty": qty, "UOM": uom,
+                        "Price": unit_price, "Line Total": line_total
+                    })
 
                 if len(extracted_data.line_items) == 0:
-                    row_dict = create_row_dict(None, None, "NO ITEMS FOUND", None, None, None, None, 0.0)
-                    ws_details.append(list(row_dict.values()))
-                    current_run_details.append(row_dict)
+                    ws_details.append(create_row(None, None, None, None, None, None, None, 0.0))
+                    append_ui_detail_row(None, None, "NO ITEMS FOUND", None, None, None, 0.0)
                 else:
                     for item in extracted_data.line_items:
-                        row_dict = create_row_dict(item.page_number, item.material, item.description, item.quantity, item.uom, item.uom_confidence, item.unit_price, item.line_total)
-                        ws_details.append(list(row_dict.values()))
-                        current_run_details.append(row_dict)
+                        ws_details.append(create_row(item.page_number, item.material, item.description, item.quantity, item.uom, item.uom_confidence, item.unit_price, item.line_total))
+                        append_ui_detail_row(item.page_number, item.material, item.description, item.quantity, item.uom, item.unit_price, item.line_total)
                         
                 if safe_ship > 0: 
-                    row_dict = create_row_dict(None, "SHIPPING", extracted_data.shipping_name or "Shipping", None, None, None, None, safe_ship)
-                    ws_details.append(list(row_dict.values()))
-                    current_run_details.append(row_dict)
+                    ws_details.append(create_row(None, None, extracted_data.shipping_name or "Shipping", None, None, None, None, safe_ship))
+                    append_ui_detail_row(None, "SHIPPING", extracted_data.shipping_name or "Shipping", None, None, None, safe_ship)
                     
                 for tax in extracted_data.taxes:
                     if tax.tax_amount is not None and tax.tax_amount > 0: 
-                        row_dict = create_row_dict(None, "TAX", tax.tax_name, None, None, None, None, tax.tax_amount)
-                        ws_details.append(list(row_dict.values()))
-                        current_run_details.append(row_dict)
+                        ws_details.append(create_row(None, None, tax.tax_name, None, None, None, None, tax.tax_amount))
+                        append_ui_detail_row(None, "TAX", tax.tax_name, None, None, None, tax.tax_amount)
                         
                 for fee in extracted_data.additional_fees:
                     if fee.fee_amount is not None and fee.fee_amount > 0: 
-                        row_dict = create_row_dict(None, "FEE", fee.fee_name, None, None, None, None, fee.fee_amount)
-                        ws_details.append(list(row_dict.values()))
-                        current_run_details.append(row_dict)
+                        ws_details.append(create_row(None, None, fee.fee_name, None, None, None, None, fee.fee_amount))
+                        append_ui_detail_row(None, "FEE", fee.fee_name, None, None, None, fee.fee_amount)
                 
                 ws_qc.append([
                     filename, extracted_data.vendor_name, extracted_data.invoice_number, 
@@ -407,7 +389,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
 
 
 @st.dialog("⚠️ Duplicate Files Detected")
-def confirm_duplicates_dialog(duplicate_files, unique_files, custom_fields_dict, standard_aliases_dict, max_pages, dpi, sleep_time):
+def confirm_duplicates_dialog(duplicate_files, unique_files):
     st.warning(f"Found {len(duplicate_files)} file(s) that have already been processed and exist in the master database.")
     for f in duplicate_files:
         st.write(f"- `{f.name}`")
@@ -508,7 +490,7 @@ with tab_extract:
             duplicate_files = [f for f in uploaded_files if f.name in existing_filenames]
             
             if duplicate_files:
-                confirm_duplicates_dialog(duplicate_files, unique_files, custom_fields_dict, standard_aliases_dict, config_max_pages, config_dpi, config_sleep_time)
+                confirm_duplicates_dialog(duplicate_files, unique_files)
             else:
                 st.session_state.files_to_process = unique_files
                 st.session_state.start_processing = True
@@ -546,31 +528,36 @@ with tab_extract:
 # ---------------------------------------------------------
 with tab_viewer:
     st.header("📄 Document Viewer")
+    
     if uploaded_files:
-        st.write("Use your browser's built-in controls to zoom or search (Ctrl+F).")
+        st.write("Browse through uploaded PDF pages natively.")
         
-        # Search Bar
         search_query = st.text_input("🔍 Search by File Name", "").lower()
-        
-        # Filter files based on search
         filtered_files = [f for f in uploaded_files if search_query in f.name.lower()]
         
         if not filtered_files:
             st.warning("No files match your search query.")
         else:
-            # 4-Column Grid layout
             cols = st.columns(4)
             for idx, file in enumerate(filtered_files):
                 col = cols[idx % 4]
                 with col:
                     st.subheader(file.name)
-                    # Ensure the pointer is at the beginning before reading
+                    
+                    # Convert PDF pages to HTML image tags for continuous scrolling
                     file.seek(0)
-                    base64_pdf = base64.b64encode(file.read()).decode('utf-8')
-                    pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="500" type="application/pdf"></iframe>'
-                    st.markdown(pdf_display, unsafe_allow_html=True)
-                    # Reset pointer for the extraction logic
-                    file.seek(0)
+                    doc = fitz.open(stream=file.read(), filetype="pdf")
+                    html_content = '<div style="height: 500px; overflow-y: scroll; border: 1px solid #ddd; padding: 10px; background-color: #f9f9f9;">'
+                    
+                    for page_num in range(len(doc)):
+                        page = doc[page_num]
+                        pix = page.get_pixmap(dpi=150) 
+                        img_b64 = base64.b64encode(pix.tobytes("jpeg")).decode('utf-8')
+                        html_content += f'<img src="data:image/jpeg;base64,{img_b64}" style="width: 100%; margin-bottom: 10px; border: 1px solid #ccc; box-shadow: 2px 2px 5px rgba(0,0,0,0.1);">'
+                        
+                    html_content += '</div>'
+                    st.markdown(html_content, unsafe_allow_html=True)
+                    file.seek(0) 
     else:
         st.info("Upload PDF documents in the sidebar to view them here.")
 
@@ -584,22 +571,15 @@ with tab_analytics:
     if df_audit.empty:
         st.info("📭 No data available. Process some invoices in the Extraction Suite to generate analytics.")
     else:
-        missing_flags = ['N/A', 'None', '', 'null', 'None']
-        df_audit['is_origin_missing'] = df_audit['origin'].isin(missing_flags) | df_audit['origin'].isna()
-        df_audit['is_dest_missing'] = df_audit['destination'].isin(missing_flags) | df_audit['destination'].isna()
-
-        st.subheader("Financial & Accuracy Overview")
-        col1, col2, col3, col4 = st.columns(4)
+        st.subheader("Invoice & Vendor Overview")
+        col1, col2, col3 = st.columns(3)
         total_invoices = len(df_audit)
-        passed_invoices = len(df_audit[df_audit['status'] == 'PASS'])
-        accuracy_rate = (passed_invoices / total_invoices) * 100 if total_invoices > 0 else 0
-        total_value = df_audit['extracted_total'].sum()
-        total_variance = df_audit['variance'].abs().sum()
+        total_vendors = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])]['vendor_name'].nunique()
+        total_spend = df_audit['extracted_total'].sum()
 
         col1.metric("Total Invoices", f"{total_invoices:,}")
-        col2.metric("Data Accuracy", f"{accuracy_rate:.1f}%")
-        col3.metric("Total Spend Processed", f"${total_value:,.2f}")
-        col4.metric("Mathematical Variance", f"${total_variance:,.2f}", delta_color="inverse")
+        col2.metric("Total Unique Vendors", f"{total_vendors:,}")
+        col3.metric("Total Spend Processed", f"${total_spend:,.2f}")
 
         st.divider()
 
@@ -632,34 +612,8 @@ with tab_analytics:
 
         st.divider()
 
-        c3, c4 = st.columns(2)
-        with c3:
-            st.subheader("⚠️ Top Reasons for LLM Review")
-            df_audit['Clean_Status'] = df_audit['status'].apply(lambda x: 'PASS' if x == 'PASS' else 'FAIL')
-            df_fails = df_audit[df_audit['Clean_Status'] == 'FAIL']
-            if not df_fails.empty:
-                reasons_series = df_fails['reason_for_review'].str.split(" | ").explode()
-                reason_counts = reasons_series.value_counts().reset_index().head(10)
-                reason_counts.columns = ['Reason', 'Frequency']
-                fig_err = px.bar(reason_counts, x='Reason', y='Frequency', color='Frequency', color_continuous_scale='Oranges')
-                st.plotly_chart(fig_err, use_container_width=True)
-            else:
-                st.success("No failures to analyze.")
-
-        with c4:
-            st.subheader("💸 Absolute Variance Magnitude by Vendor")
-            var_vendor = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])].groupby('vendor_name')['variance'].apply(lambda x: x.abs().sum()).reset_index()
-            var_vendor = var_vendor[var_vendor['variance'] > 0].sort_values(by='variance', ascending=False).head(10)
-            if not var_vendor.empty:
-                fig_var_vendor = px.bar(var_vendor, x='variance', y='vendor_name', orientation='h', color='variance', color_continuous_scale='Reds')
-                fig_var_vendor.update_layout(yaxis={'categoryorder':'total ascending'})
-                st.plotly_chart(fig_var_vendor, use_container_width=True)
-            else:
-                st.success("No variance detected across any vendors.")
-
-        st.divider()
-
         st.subheader("📍 Vendor Logistics Map (Origin & Destination)")
+        missing_flags = ['N/A', 'None', '', 'null', 'None']
         df_routes = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])]
 
         def get_unique_clean(series):
@@ -687,33 +641,40 @@ with tab_system:
         df_audit['datetime'] = pd.to_datetime(df_audit['extraction_date'] + ' ' + df_audit['extraction_time'])
         df_audit = df_audit.sort_values('datetime')
         df_audit['is_critical_error'] = df_audit['status'].str.contains("CRITICAL ERROR", na=False)
-        
+        df_audit['Clean_Status'] = df_audit['status'].apply(lambda x: 'PASS' if x == 'PASS' else 'FAIL')
         df_audit['processing_time_min'] = df_audit['processing_time'] / 60.0
 
-        sys1, sys2, sys3, sys4 = st.columns(4)
-        avg_proc_time_min = df_audit['processing_time_min'].mean() if 'processing_time_min' in df_audit.columns else 0.0
+        st.subheader("System Performance & Mathematical Accuracy")
+        sys1, sys2, sys3, sys4, sys5, sys6 = st.columns(6)
+        
+        total_invoices = len(df_audit)
         total_pages = df_audit['page_count'].sum() if 'page_count' in df_audit.columns else 0
-        sys_error_rate = (df_audit['is_critical_error'].sum() / len(df_audit)) * 100
+        avg_proc_time_min = df_audit['processing_time_min'].mean() if 'processing_time_min' in df_audit.columns else 0.0
         time_per_page_min = (df_audit['processing_time_min'].sum() / total_pages) if total_pages > 0 else 0.0
+        sys_error_rate = (df_audit['is_critical_error'].sum() / total_invoices) * 100 if total_invoices > 0 else 0
+        
+        passed_invoices = len(df_audit[df_audit['status'] == 'PASS'])
+        accuracy_rate = (passed_invoices / total_invoices) * 100 if total_invoices > 0 else 0
+        total_variance = df_audit['variance'].abs().sum()
 
-        sys1.metric("Avg Processing Time", f"{avg_proc_time_min:.2f}m", "Per Document")
-        sys2.metric("Processing Speed", f"{time_per_page_min:.2f}m", "Per Page")
-        sys3.metric("System API Failure Rate", f"{sys_error_rate:.1f}%", delta_color="inverse")
-        sys4.metric("Total Pages Indexed", f"{total_pages:,}")
+        sys1.metric("Avg Proc Time", f"{avg_proc_time_min:.2f}m", "Per Doc")
+        sys2.metric("Proc Speed", f"{time_per_page_min:.2f}m", "Per Page")
+        sys3.metric("API Failure Rate", f"{sys_error_rate:.1f}%", delta_color="inverse")
+        sys4.metric("Pages Indexed", f"{total_pages:,}")
+        sys5.metric("Data Accuracy", f"{accuracy_rate:.1f}%")
+        sys6.metric("Math Variance", f"${total_variance:,.2f}", delta_color="inverse")
 
         st.divider()
 
         s1, s2 = st.columns(2)
         with s1:
             st.subheader("Processing Speed Drift (Minutes)")
-            st.write("Tracks API latency and rendering time over time.")
             fig_speed = px.line(df_audit, x='datetime', y='processing_time_min', markers=True, title='Document Processing Time')
             fig_speed.update_layout(xaxis_title="Time", yaxis_title="Minutes")
             st.plotly_chart(fig_speed, use_container_width=True)
 
         with s2:
             st.subheader("Mathematical Hallucination Drift")
-            st.write("Tracks occurrences where the LLM's total did not match the line-item math.")
             df_variance = df_audit[df_audit['variance'] != 0.0].copy()
             if not df_variance.empty:
                 df_variance['Absolute_Variance'] = df_variance['variance'].abs()
@@ -722,3 +683,29 @@ with tab_system:
                 st.plotly_chart(fig_var, use_container_width=True)
             else:
                 st.success("No mathematical drift detected. Model math is perfect.")
+                
+        st.divider()
+
+        c3, c4 = st.columns(2)
+        with c3:
+            st.subheader("⚠️ Top Reasons for LLM Review")
+            df_fails = df_audit[df_audit['Clean_Status'] == 'FAIL']
+            if not df_fails.empty:
+                reasons_series = df_fails['reason_for_review'].str.split(" | ").explode()
+                reason_counts = reasons_series.value_counts().reset_index().head(10)
+                reason_counts.columns = ['Reason', 'Frequency']
+                fig_err = px.bar(reason_counts, x='Reason', y='Frequency', color='Frequency', color_continuous_scale='Oranges')
+                st.plotly_chart(fig_err, use_container_width=True)
+            else:
+                st.success("No failures to analyze.")
+
+        with c4:
+            st.subheader("💸 Absolute Variance Magnitude by Vendor")
+            var_vendor = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])].groupby('vendor_name')['variance'].apply(lambda x: x.abs().sum()).reset_index()
+            var_vendor = var_vendor[var_vendor['variance'] > 0].sort_values(by='variance', ascending=False).head(10)
+            if not var_vendor.empty:
+                fig_var_vendor = px.bar(var_vendor, x='variance', y='vendor_name', orientation='h', color='variance', color_continuous_scale='Reds')
+                fig_var_vendor.update_layout(yaxis={'categoryorder':'total ascending'})
+                st.plotly_chart(fig_var_vendor, use_container_width=True)
+            else:
+                st.success("No variance detected across any vendors.")
