@@ -164,13 +164,15 @@ def pdf_to_base64_images(file_bytes: bytes, max_pages: int, dpi: int) -> Tuple[L
         base64_images.append(base64.b64encode(pix.tobytes("jpeg")).decode('utf-8'))
     return base64_images, total_pages
 
-def extract_invoice_data(client, deployment: str, file_bytes: bytes, custom_cols: List[str], max_pages: int, dpi: int) -> Tuple[InvoiceDocument, int]:
+# ---> UPDATED: Uses the new Dictionary mapping for Custom Fields <---
+def extract_invoice_data(client, deployment: str, file_bytes: bytes, custom_fields_dict: Dict[str, str], max_pages: int, dpi: int) -> Tuple[InvoiceDocument, int]:
     base64_images, total_pages = pdf_to_base64_images(file_bytes, max_pages, dpi)
     
     system_prompt = "You are an expert accountant processing a document that may contain multiple distinct invoices. STRICT PAGING RULES: 1) If the same invoice number continues across multiple pages, combine all line items, taxes, and totals into a SINGLE invoice record. 2) If you see a NEW invoice number, start a NEW invoice record. CRITICAL RULE AGAINST DUPLICATES: Never extract the same tax or fee twice. Your extracted total for EACH invoice must mathematically equal the calculated sum of unique items for that invoice."
     
-    if custom_cols:
-        system_prompt += f"\n\nSTRICT RULE: The user has requested custom data extraction. You MUST also search the invoice for the following fields and place them in the 'custom_fields' dictionary: {', '.join(custom_cols)}. If a field is not found, leave its value as null."
+    if custom_fields_dict:
+        rules_str = "\n".join([f"- Field Key: '{k}' | Definition & Aliases: {v}" for k, v in custom_fields_dict.items()])
+        system_prompt += f"\n\nSTRICT RULE: The user has requested custom data extraction based on specific definitions and alias mappings. You MUST search the invoice for the following logic and place the results in the 'custom_fields' dictionary using the EXACT 'Field Key' provided:\n{rules_str}\nIf a field or its aliases are not found, leave its value as null."
 
     content_array = [{"type": "text", "text": "Extract data from this multi-page document. Pay close attention to invoice numbers. Evaluate confidence ('High', 'Medium', 'Low'). Note page numbers."}]
     for img_base64 in base64_images:
@@ -215,10 +217,13 @@ def setup_excel_workbook(custom_cols: List[str]):
 # 3. Streamlit UI & Core Logic Orchestrator
 # ==============================================================
 
-def run_extraction_process(files_list, custom_cols, max_pages, dpi, prefix=""):
-    """Isolates the extraction logic so it can be called cleanly for uniques or duplicates."""
+# ---> UPDATED: Uses Custom Fields Dict <---
+def run_extraction_process(files_list, custom_fields_dict, max_pages, dpi, prefix=""):
     client = instructor.from_openai(AzureOpenAI(azure_endpoint=AZURE_ENDPOINT, api_key=AZURE_API_KEY, api_version=AZURE_API_VERSION))
-    wb, ws_details, ws_qc = setup_excel_workbook(custom_cols)
+    
+    # Pass just the keys to the Excel setup
+    custom_col_keys = list(custom_fields_dict.keys())
+    wb, ws_details, ws_qc = setup_excel_workbook(custom_col_keys)
     red_font = Font(color="9C0006", bold=True)
     
     success_count, error_count = 0, 0
@@ -241,7 +246,7 @@ def run_extraction_process(files_list, custom_cols, max_pages, dpi, prefix=""):
         
         try:
             file_bytes = file.read()
-            extracted_document, total_pages = extract_invoice_data(client, AZURE_DEPLOYMENT, file_bytes, custom_cols, max_pages, dpi)
+            extracted_document, total_pages = extract_invoice_data(client, AZURE_DEPLOYMENT, file_bytes, custom_fields_dict, max_pages, dpi)
             file_proc_time = round(time.time() - file_start_time, 2)
             
             if not extracted_document.invoices:
@@ -287,7 +292,7 @@ def run_extraction_process(files_list, custom_cols, max_pages, dpi, prefix=""):
                         extracted_data.destination_confidence, uom_conf, extracted_data.total_amount_confidence,
                         status, reasons_string
                     ]
-                    custom_values = [extracted_data.custom_fields.get(col, "Not Found") for col in custom_cols]
+                    custom_values = [extracted_data.custom_fields.get(col, "Not Found") for col in custom_col_keys]
                     return base_row + custom_values
 
                 def append_ui_detail_row(page_num, material, desc, qty, uom, unit_price, line_total):
@@ -382,13 +387,13 @@ def run_extraction_process(files_list, custom_cols, max_pages, dpi, prefix=""):
     )
 
 @st.dialog("⚠️ Duplicate Files Detected")
-def confirm_duplicates_dialog(duplicate_files, custom_cols, max_pages, dpi):
+def confirm_duplicates_dialog(duplicate_files, custom_fields_dict, max_pages, dpi):
     st.warning(f"Found {len(duplicate_files)} file(s) that have already been processed and exist in the master database.")
     for f in duplicate_files:
         st.write(f"- `{f.name}`")
     st.write("Do you want to extract these again? (This will add duplicate entries to your audit logs).")
     if st.button("Yes, Process Duplicates", type="primary"):
-        run_extraction_process(duplicate_files, custom_cols, max_pages, dpi, prefix="Duplicate")
+        run_extraction_process(duplicate_files, custom_fields_dict, max_pages, dpi, prefix="Duplicate")
 
 # ==============================================================
 # 4. Streamlit App Layout
@@ -404,9 +409,25 @@ with st.sidebar:
         config_dpi = st.slider("Render Resolution (DPI)", min_value=72, max_value=600, value=300, step=72)
 
     st.divider()
-    st.header("➕ Custom Extraction")
-    custom_columns_input = st.text_area("Custom Columns (Comma-separated)", placeholder="e.g., PO Number, Cost Center")
-    custom_columns_list = [col.strip() for col in custom_columns_input.split(",")] if custom_columns_input.strip() else []
+    
+    # ---> NEW: UI Instructions for Aliases and Descriptions <---
+    st.header("➕ Custom Extraction Rules")
+    st.write("Define fields with descriptions/aliases to improve AI accuracy.")
+    st.caption("**Format:** `Field Name : Description (Aliases: alias1, alias2)`")
+    custom_columns_input = st.text_area(
+        "Custom Rules (One per line)", 
+        placeholder="PO Number : The purchase order reference (Aliases: PO#, Order No)\nCost Center : The department billing code"
+    )
+    
+    # Parse the custom rules into a Dictionary
+    custom_fields_dict = {}
+    if custom_columns_input.strip():
+        for line in custom_columns_input.split('\n'):
+            if ':' in line:
+                key, desc = line.split(':', 1)
+                custom_fields_dict[key.strip()] = desc.strip()
+            elif line.strip():
+                custom_fields_dict[line.strip()] = "Extract this field."
     
     st.divider()
     st.header("📄 Upload Files")
@@ -427,20 +448,17 @@ with tab_extract:
         elif not all([AZURE_ENDPOINT, AZURE_API_KEY, AZURE_DEPLOYMENT]):
             st.error("⚠️ Azure credentials missing. Check your `.env` file.")
         else:
-            # Check Database for previously processed files
             df_audit_existing = fetch_audit_data()
             existing_filenames = df_audit_existing['file_name'].unique().tolist() if not df_audit_existing.empty else []
             
             unique_files = [f for f in uploaded_files if f.name not in existing_filenames]
             duplicate_files = [f for f in uploaded_files if f.name in existing_filenames]
             
-            # Instantly process unique files first
             if unique_files:
-                run_extraction_process(unique_files, custom_columns_list, config_max_pages, config_dpi, prefix="Unique")
+                run_extraction_process(unique_files, custom_fields_dict, config_max_pages, config_dpi, prefix="Unique")
             
-            # If duplicates exist, trigger the confirmation dialog without halting the unique processing.
             if duplicate_files:
-                confirm_duplicates_dialog(duplicate_files, custom_columns_list, config_max_pages, config_dpi)
+                confirm_duplicates_dialog(duplicate_files, custom_fields_dict, config_max_pages, config_dpi)
 
 # ---------------------------------------------------------
 # TAB 2: BUSINESS ANALYTICS
@@ -471,7 +489,6 @@ with tab_analytics:
 
         st.divider()
 
-        # Added new Spend Over Time plot
         st.subheader("📈 Financial Spend Over Time")
         df_audit['extraction_date_dt'] = pd.to_datetime(df_audit['extraction_date'])
         spend_time = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])].groupby('extraction_date')['extracted_total'].sum().reset_index()
@@ -516,7 +533,6 @@ with tab_analytics:
                 st.success("No failures to analyze.")
 
         with c4:
-            # Added new Variance Magnitude by Vendor plot
             st.subheader("💸 Absolute Variance Magnitude by Vendor")
             var_vendor = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])].groupby('vendor_name')['variance'].apply(lambda x: x.abs().sum()).reset_index()
             var_vendor = var_vendor[var_vendor['variance'] > 0].sort_values(by='variance', ascending=False).head(10)
@@ -558,7 +574,6 @@ with tab_system:
         df_audit = df_audit.sort_values('datetime')
         df_audit['is_critical_error'] = df_audit['status'].str.contains("CRITICAL ERROR", na=False)
         
-        # ---> CONVERTED TO MINUTES <---
         df_audit['processing_time_min'] = df_audit['processing_time'] / 60.0
 
         sys1, sys2, sys3, sys4 = st.columns(4)
