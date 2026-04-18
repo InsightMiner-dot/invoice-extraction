@@ -74,7 +74,7 @@ def init_db():
     new_columns = [
         ("processing_time", "REAL"),
         ("page_count", "INTEGER"),
-        ("clean_supplier", "TEXT"),
+        ("original_supplier_name", "TEXT"),
         ("suggested_origin", "TEXT"),
         ("final_origin", "TEXT"),
         ("suggested_destination", "TEXT"),
@@ -118,7 +118,7 @@ def insert_audit_record(record: tuple):
         INSERT INTO qc_audit (
             extraction_date, extraction_time, file_name, vendor_name, 
             invoice_number, origin, destination, status, reason_for_review, 
-            extracted_total, calculated_sum, variance, processing_time, page_count, batch_id, clean_supplier
+            extracted_total, calculated_sum, variance, processing_time, page_count, batch_id, original_supplier_name
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', record)
     conn.commit()
@@ -385,18 +385,17 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
             for extracted_data in extracted_document.invoices:
                 
                 raw_vendor = extracted_data.vendor_name
-                clean_supp = None
+                orig_supp = None
                 
                 if master_suppliers_list and raw_vendor and raw_vendor not in ['N/A', 'ERROR', '']:
                     match_result = process.extractOne(raw_vendor, master_suppliers_list)
                     if match_result:
                         best_match, score = match_result
                         if score >= 60:
-                            clean_supp = best_match
+                            orig_supp = best_match
                 
-                # If no match found, do NOT append to CSV automatically. Just standardise it for the DB row.
-                if not clean_supp:
-                    clean_supp = standardize_vendor(raw_vendor)
+                if not orig_supp:
+                    orig_supp = standardize_vendor(raw_vendor)
 
                 calculated_line_sum = sum(item.line_total for item in extracted_data.line_items if item.line_total is not None)
                 safe_ship = extracted_data.shipping_handling or 0.0
@@ -489,7 +488,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                 insert_audit_record((
                     current_date, current_time, filename, extracted_data.vendor_name, extracted_data.invoice_number, 
                     str(qc_origin), str(qc_dest), status, reasons_string, 
-                    extracted_data.total_amount, total_calculated, variance, file_proc_time, total_pages, current_batch_id, clean_supp
+                    extracted_data.total_amount, total_calculated, variance, file_proc_time, total_pages, current_batch_id, orig_supp
                 ))
 
                 current_run_summary.append({
@@ -762,9 +761,9 @@ with tab_batch:
             st.markdown(f"**Latest Batch Date:** `{latest_date}`")
             latest_batch = None
             
-        vendor_col = 'clean_supplier' if 'clean_supplier' in batch_df.columns else 'vendor_name'
-        if vendor_col == 'clean_supplier':
-            batch_df['clean_supplier'] = batch_df['clean_supplier'].fillna(batch_df['vendor_name'].apply(standardize_vendor))
+        vendor_col = 'original_supplier_name' if 'original_supplier_name' in batch_df.columns else 'vendor_name'
+        if vendor_col == 'original_supplier_name':
+            batch_df['original_supplier_name'] = batch_df['original_supplier_name'].fillna(batch_df['vendor_name'].apply(standardize_vendor))
 
         batch_invoices = len(batch_df)
         batch_vendors = batch_df[vendor_col].nunique()
@@ -833,7 +832,7 @@ with tab_batch:
             valid_origins = df_audit[~df_audit['origin'].isin(batch_missing_flags) & df_audit['origin'].notna()]
             valid_dests = df_audit[~df_audit['destination'].isin(batch_missing_flags) & df_audit['destination'].notna()]
             
-            hist_vendor_col = 'clean_supplier' if 'clean_supplier' in df_audit.columns else 'vendor_name'
+            hist_vendor_col = 'original_supplier_name' if 'original_supplier_name' in df_audit.columns else 'vendor_name'
             
             orig_counts = valid_origins.groupby([hist_vendor_col, 'origin']).size().reset_index(name='count')
             orig_counts = orig_counts.sort_values([hist_vendor_col, 'count'], ascending=[True, False])
@@ -859,7 +858,7 @@ with tab_batch:
             ]
             
             for idx, row in batch_routing_issues.iterrows():
-                supp = row['clean_supplier'] if 'clean_supplier' in row and pd.notna(row['clean_supplier']) else standardize_vendor(row['vendor_name'])
+                supp = row['original_supplier_name'] if 'original_supplier_name' in row and pd.notna(row['original_supplier_name']) else standardize_vendor(row['vendor_name'])
                 sug_orig = orig_dict.get(supp, "No historical data")
                 sug_dest = dest_dict.get(supp, "No historical data")
                 update_audit_suggestions(row['id'], sug_orig, sug_dest)
@@ -882,10 +881,10 @@ with tab_batch:
             )].copy()
 
         if not current_batch_issues.empty:
-            if 'clean_supplier' not in current_batch_issues.columns:
-                current_batch_issues['clean_supplier'] = current_batch_issues['vendor_name'].apply(standardize_vendor)
+            if 'original_supplier_name' not in current_batch_issues.columns:
+                current_batch_issues['original_supplier_name'] = current_batch_issues['vendor_name'].apply(standardize_vendor)
                 
-            review_df = current_batch_issues[['id', 'file_name', 'clean_supplier', 'origin', 'suggested_origin', 'final_origin', 'destination', 'suggested_destination', 'final_destination']]
+            review_df = current_batch_issues[['id', 'file_name', 'original_supplier_name', 'origin', 'suggested_origin', 'final_origin', 'destination', 'suggested_destination', 'final_destination']]
             
             edited_routes = st.data_editor(
                 review_df,
@@ -894,7 +893,7 @@ with tab_batch:
                 column_config={
                     "id": st.column_config.NumberColumn("DB ID", disabled=True),
                     "file_name": st.column_config.TextColumn("File", disabled=True),
-                    "clean_supplier": st.column_config.TextColumn("Supplier", disabled=True),
+                    "original_supplier_name": st.column_config.TextColumn("Supplier", disabled=True),
                     "origin": st.column_config.TextColumn("Raw Origin", disabled=True),
                     "suggested_origin": st.column_config.TextColumn("🤖 Suggested Origins (Top 5)", disabled=True),
                     "final_origin": st.column_config.TextColumn("✅ Approved Origin"),
@@ -917,22 +916,27 @@ with tab_batch:
 
         st.divider()
         
+        # ---> UPDATED: Simplified Data Editor without extra buttons/inputs <---
         with st.expander("📂 Master Supplier Database (CSV)", expanded=False):
-            st.write("View the official Supplier names used for fuzzy matching. Auto-append is OFF. Manually add new vendors here.")
-            
-            col_add1, col_add2 = st.columns([3, 1])
-            with col_add1:
-                new_supp = st.text_input("Enter new Official Supplier Name:", label_visibility="collapsed", placeholder="e.g., Tata Steel Inc.")
-            with col_add2:
-                if st.button("➕ Add Supplier", use_container_width=True):
-                    if new_supp.strip():
-                        append_to_master(new_supp.strip())
-                        st.success(f"Added {new_supp.strip()}!")
-                        time.sleep(1)
-                        st.rerun()
+            st.write("View, edit, or add official Supplier names directly in the table below. These act as the fuzzy match targets for future runs. Scroll to the bottom to add a new row.")
             
             master_df = load_master_suppliers()
-            st.dataframe(master_df, use_container_width=True, hide_index=True)
+            
+            edited_master = st.data_editor(
+                master_df, 
+                num_rows="dynamic", 
+                use_container_width=True,
+                key="master_csv_editor"
+            )
+            
+            if st.button("💾 Save Changes to Master CSV", type="primary"):
+                # Clean up any empty rows before saving
+                edited_master = edited_master.dropna(subset=['Original_Supplier_Name'])
+                edited_master = edited_master[edited_master['Original_Supplier_Name'].str.strip() != '']
+                save_master_suppliers(edited_master)
+                st.success("Master CSV Rules Updated Successfully!")
+                time.sleep(1)
+                st.rerun()
 
 # ---------------------------------------------------------
 # TAB 4: BUSINESS ANALYTICS
@@ -944,8 +948,8 @@ with tab_analytics:
     if df_audit.empty:
         st.info("📭 No data available. Process some invoices in the Extraction Suite to generate analytics.")
     else:
-        if 'clean_supplier' in df_audit.columns:
-            df_audit['vendor_name'] = df_audit['clean_supplier'].fillna(df_audit['vendor_name'].apply(standardize_vendor))
+        if 'original_supplier_name' in df_audit.columns:
+            df_audit['vendor_name'] = df_audit['original_supplier_name'].fillna(df_audit['vendor_name'].apply(standardize_vendor))
         else:
             df_audit['vendor_name'] = df_audit['vendor_name'].apply(standardize_vendor)
             
@@ -1188,8 +1192,8 @@ with tab_system:
     if df_audit.empty:
         st.info("📭 No data available. Process some invoices to track system drift.")
     else:
-        if 'clean_supplier' in df_audit.columns:
-            df_audit['vendor_name'] = df_audit['clean_supplier'].fillna(df_audit['vendor_name'].apply(standardize_vendor))
+        if 'original_supplier_name' in df_audit.columns:
+            df_audit['vendor_name'] = df_audit['original_supplier_name'].fillna(df_audit['vendor_name'].apply(standardize_vendor))
         else:
             df_audit['vendor_name'] = df_audit['vendor_name'].apply(standardize_vendor)
         
