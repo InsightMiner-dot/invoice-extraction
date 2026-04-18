@@ -30,12 +30,12 @@ AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
 
 # ==============================================================
-# 0. Database & CSV Setup Functions
+# 0. Database & Excel Setup Functions
 # ==============================================================
 
 AUDIT_FOLDER = "audit"
 DB_PATH = os.path.join(AUDIT_FOLDER, "qc_master_database.sqlite")
-MASTER_CSV_PATH = os.path.join(AUDIT_FOLDER, "master_suppliers.csv")
+MASTER_EXCEL_PATH = os.path.join(AUDIT_FOLDER, "master_suppliers.xlsx")
 
 def init_db():
     os.makedirs(AUDIT_FOLDER, exist_ok=True)
@@ -91,22 +91,20 @@ def init_db():
     conn.commit()
     conn.close()
 
-# ---> UPDATED: Clean, simplified CSV Loader with Unicode fix <---
+# ---> UPDATED: Bulletproof Excel Loader <---
 def load_master_suppliers() -> pd.DataFrame:
-    if os.path.exists(MASTER_CSV_PATH):
+    if os.path.exists(MASTER_EXCEL_PATH):
         try:
-            # utf-8-sig safely handles both standard UTF-8 and Windows Excel BOM
-            df = pd.read_csv(MASTER_CSV_PATH, encoding='utf-8-sig')
+            df = pd.read_excel(MASTER_EXCEL_PATH, engine='openpyxl')
             if 'Original_Supplier_Name' in df.columns:
                 return df[['Original_Supplier_Name']].dropna()
         except Exception as e:
-            st.error(f"Error loading Master CSV: {e}")
+            st.error(f"Error loading Master Excel: {e}")
     
     return pd.DataFrame(columns=["Original_Supplier_Name"])
 
 def save_master_suppliers(df: pd.DataFrame):
-    # Also save as utf-8-sig to keep it consistent
-    df.to_csv(MASTER_CSV_PATH, index=False, encoding='utf-8-sig')
+    df.to_excel(MASTER_EXCEL_PATH, index=False, engine='openpyxl')
 
 def append_to_master(new_supplier: str):
     df = load_master_suppliers()
@@ -533,6 +531,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
     status_text.empty()
     st.success(f"🎉 {prefix} Batch Processing Complete! Invoices Extracted: {success_count} | Errors: {error_count}")
 
+
 # --- DB & UI Dialogs ---
 @st.dialog("⚠️ Duplicate Files Detected")
 def confirm_duplicates_dialog(duplicate_files, unique_files):
@@ -647,7 +646,7 @@ with st.sidebar:
     st.divider()
     
     st.header("📄 Batch Upload")
-    st.write("Upload your mixed batch of invoices here. The system will auto-map vendors via the Master CSV.")
+    st.write("Upload your mixed batch of invoices here. The system will auto-map vendors via the Master Database.")
     uploaded_files = st.file_uploader("Upload PDF Documents", type=["pdf"], accept_multiple_files=True)
 
 # Tabs
@@ -919,7 +918,7 @@ with tab_batch:
 
         st.divider()
         
-        with st.expander("📂 Master Supplier Database (CSV)", expanded=False):
+        with st.expander("📂 Master Supplier Database (Excel)", expanded=False):
             st.write("View, edit, or add official Supplier names directly in the table below. These act as the fuzzy match targets for future runs. Scroll to the bottom to add a new row.")
             
             master_df = load_master_suppliers()
@@ -928,15 +927,14 @@ with tab_batch:
                 master_df, 
                 num_rows="dynamic", 
                 use_container_width=True,
-                key="master_csv_editor"
+                key="master_excel_editor"
             )
             
-            if st.button("💾 Save Changes to Master CSV", type="primary"):
-                # Clean up any empty rows before saving
+            if st.button("💾 Save Changes to Master Excel Directly", type="primary"):
                 edited_master = edited_master.dropna(subset=['Original_Supplier_Name'])
-                edited_master = edited_master[edited_master['Original_Supplier_Name'].str.strip() != '']
+                edited_master = edited_master[edited_master['Original_Supplier_Name'].astype(str).str.strip() != '']
                 save_master_suppliers(edited_master)
-                st.success("Master CSV Rules Updated Successfully!")
+                st.success("Master Excel Rules Updated Successfully!")
                 time.sleep(1)
                 st.rerun()
 
@@ -1185,7 +1183,7 @@ with tab_analytics:
             st.dataframe(vendor_routes, use_container_width=True, hide_index=True)
 
 # ---------------------------------------------------------
-# TAB 5: SYSTEM & Drift Analysis
+# TAB 5: SYSTEM & DRIFT ANALYSIS
 # ---------------------------------------------------------
 with tab_system:
     st.header("🤖 System & Model Drift Analysis")
