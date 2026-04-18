@@ -409,27 +409,21 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                         ws_details.append(list(row_dict.values()))
                         current_run_details.append(row_dict)
                 
-                # Use first line origin for QC Summary table if available
-                first_line_orig = extracted_data.line_items[0].line_origin if len(extracted_data.line_items) > 0 else None
-                first_line_dest = extracted_data.line_items[0].line_destination if len(extracted_data.line_items) > 0 else None
-                qc_origin = first_line_orig if first_line_orig else extracted_data.origin
-                qc_dest = first_line_dest if first_line_dest else extracted_data.destination
-
                 ws_qc.append([
                     filename, extracted_data.vendor_name, extracted_data.invoice_number, 
-                    qc_origin, qc_dest,
+                    extracted_data.origin, extracted_data.destination,
                     status, reasons_string, extracted_data.total_amount, total_calculated, variance
                 ])
                 
                 insert_audit_record((
                     current_date, current_time, filename, extracted_data.vendor_name, extracted_data.invoice_number, 
-                    str(qc_origin), str(qc_dest), status, reasons_string, 
+                    str(extracted_data.origin), str(extracted_data.destination), status, reasons_string, 
                     extracted_data.total_amount, total_calculated, variance, file_proc_time, total_pages
                 ))
 
                 current_run_summary.append({
                     "File Name": filename, "Vendor Name": extracted_data.vendor_name, "Invoice #": extracted_data.invoice_number,
-                    "Origin": qc_origin or "Missing", "Destination": qc_dest or "Missing",
+                    "Origin": extracted_data.origin or "Missing", "Destination": extracted_data.destination or "Missing",
                     "Variance": f"${variance:,.2f}", "Status": "✅ PASS" if status == "PASS" else "⚠️ FAIL",
                     "Proc Time": f"{file_proc_time}s"
                 })
@@ -464,6 +458,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
     progress_bar.empty()
     status_text.empty()
     st.success(f"🎉 {prefix} Batch Processing Complete! Invoices Extracted: {success_count} | Errors: {error_count}")
+
 
 # --- DB & UI Dialogs ---
 @st.dialog("⚠️ Duplicate Files Detected")
@@ -705,15 +700,38 @@ with tab_analytics:
         col5.metric("⚠️ Duplicate Value", f"${dup_spend / 1_000_000:,.2f}M", delta_color="inverse")
 
         st.divider()
-        
+
+        st.subheader("📈 Financial Spend Over Time ($M)")
         df_audit['extraction_date_dt'] = pd.to_datetime(df_audit['extraction_date'])
         spend_time = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])].groupby('extraction_date')['extracted_total'].sum().reset_index()
         spend_time['extracted_total_M'] = spend_time['extracted_total'] / 1_000_000 
-
-        st.subheader("📈 Financial Spend Over Time ($M)")
-        fig_spend = px.line(spend_time, x='extraction_date', y='extracted_total_M', markers=True)
+        
+        fig_spend = px.line(spend_time, x='extraction_date', y='extracted_total_M', markers=True, color_discrete_sequence=['#00CC96'])
         fig_spend.update_layout(xaxis_title="Date", yaxis_title="Total Extracted (Millions)")
         st.plotly_chart(fig_spend, use_container_width=True)
+
+        st.divider()
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.subheader("Top Vendors by Invoice Volume")
+            vendor_counts = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])]['vendor_name'].value_counts().reset_index().head(10)
+            vendor_counts.columns = ['Vendor', 'Invoice Count']
+            # FIX: Removed the problematic color gradient, added safe solid color and text_auto for simple visibility
+            fig_bar = px.bar(vendor_counts, x='Invoice Count', y='Vendor', orientation='h', text_auto=True, color_discrete_sequence=['#3498db'])
+            fig_bar.update_layout(yaxis={'categoryorder':'total ascending'})
+            st.plotly_chart(fig_bar, use_container_width=True)
+
+        with c2:
+            st.subheader("Top Vendors by Financial Value ($M)")
+            vendor_value = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])].groupby('vendor_name')['extracted_total'].sum().reset_index()
+            vendor_value['extracted_total_M'] = vendor_value['extracted_total'] / 1_000_000
+            vendor_value = vendor_value.sort_values(by='extracted_total_M', ascending=False).head(10)
+            vendor_value.columns = ['Vendor', 'Total Value ($)', 'Total Value (Millions)']
+            # FIX: Removed the problematic color gradient, added safe solid color and text_auto for simple visibility
+            fig_val = px.bar(vendor_value, x='Total Value (Millions)', y='Vendor', orientation='h', text_auto='.2f', color_discrete_sequence=['#2ecc71'])
+            fig_val.update_layout(yaxis={'categoryorder':'total ascending'})
+            st.plotly_chart(fig_val, use_container_width=True)
 
         st.divider()
 
@@ -756,55 +774,6 @@ with tab_analytics:
 
         st.divider()
 
-        c1, c2 = st.columns(2)
-        with c1:
-            st.subheader("Top Vendors by Invoice Volume")
-            vendor_counts = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])]['vendor_name'].value_counts().reset_index().head(10)
-            vendor_counts.columns = ['Vendor', 'Invoice Count']
-            # Removed color arguments, added text_auto for simple readability
-            fig_bar = px.bar(vendor_counts, x='Invoice Count', y='Vendor', orientation='h', text_auto=True)
-            fig_bar.update_layout(yaxis={'categoryorder':'total ascending'})
-            st.plotly_chart(fig_bar, use_container_width=True)
-
-        with c2:
-            st.subheader("Top Vendors by Financial Value ($M)")
-            vendor_value = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])].groupby('vendor_name')['extracted_total'].sum().reset_index()
-            vendor_value['extracted_total_M'] = vendor_value['extracted_total'] / 1_000_000
-            vendor_value = vendor_value.sort_values(by='extracted_total_M', ascending=False).head(10)
-            vendor_value.columns = ['Vendor', 'Total Value ($)', 'Total Value (Millions)']
-            # Removed color arguments, added text_auto for simple readability
-            fig_val = px.bar(vendor_value, x='Total Value (Millions)', y='Vendor', orientation='h', text_auto='.2s')
-            fig_val.update_layout(yaxis={'categoryorder':'total ascending'})
-            st.plotly_chart(fig_val, use_container_width=True)
-
-        st.divider()
-
-        c3, c4 = st.columns(2)
-        with c3:
-            st.subheader("Pareto Analysis (Vendor Spend)")
-            vendor_spend = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])].groupby('vendor_name')['extracted_total'].sum().sort_values(ascending=False).reset_index()
-            vendor_spend['extracted_total_M'] = vendor_spend['extracted_total'] / 1_000_000
-            vendor_spend['Cumulative %'] = (vendor_spend['extracted_total'].cumsum() / vendor_spend['extracted_total'].sum()) * 100
-            
-            fig_pareto = px.bar(vendor_spend.head(20), x='vendor_name', y='extracted_total_M', title='Top 20 Vendors by Spend ($M)')
-            fig_pareto.add_scatter(x=vendor_spend['vendor_name'].head(20), y=vendor_spend['Cumulative %'].head(20), mode='lines+markers', yaxis='y2', name='Cumulative %', line=dict(color='red'))
-            fig_pareto.update_layout(yaxis2=dict(overlaying='y', side='right', range=[0, 100], title='Cumulative Percentage (%)'), xaxis_title="Vendor", yaxis_title="Total Spend (Millions)")
-            st.plotly_chart(fig_pareto, use_container_width=True)
-
-        with c4:
-            st.subheader("Invoice Value Distribution ($M)")
-            valid_spend = df_audit[df_audit['extracted_total'] > 0].copy()
-            valid_spend['extracted_total_M'] = valid_spend['extracted_total'] / 1_000_000
-            
-            if not valid_spend.empty:
-                fig_hist = px.histogram(valid_spend, x='extracted_total_M', nbins=20, title='Distribution of Invoice Amounts')
-                fig_hist.update_layout(xaxis_title="Invoice Amount (Millions)", yaxis_title="Count")
-                st.plotly_chart(fig_hist, use_container_width=True)
-            else:
-                st.info("Not enough spend data for distribution.")
-
-        st.divider()
-
         st.subheader("📍 Top Shipping Corridors")
         df_valid_routes = df_audit[~df_audit['origin'].isin(missing_flags) & ~df_audit['destination'].isin(missing_flags)].copy()
         
@@ -812,8 +781,8 @@ with tab_analytics:
             df_valid_routes['Corridor'] = df_valid_routes['origin'].astype(str) + " ➡️ " + df_valid_routes['destination'].astype(str)
             corridor_counts = df_valid_routes['Corridor'].value_counts().reset_index().head(10)
             corridor_counts.columns = ['Shipping Corridor', 'Volume']
-            # Removed color argument, added text_auto
-            fig_corridor = px.bar(corridor_counts, x='Volume', y='Shipping Corridor', orientation='h', text_auto=True)
+            # FIX: Removed color gradient, added solid color
+            fig_corridor = px.bar(corridor_counts, x='Volume', y='Shipping Corridor', orientation='h', text_auto=True, color_discrete_sequence=['#9b59b6'])
             fig_corridor.update_layout(yaxis={'categoryorder':'total ascending'})
             st.plotly_chart(fig_corridor, use_container_width=True)
         else:
@@ -870,7 +839,7 @@ with tab_system:
         s1, s2 = st.columns(2)
         with s1:
             st.subheader("Processing Speed Drift (Minutes)")
-            fig_speed = px.line(df_audit, x='datetime', y='processing_time_min', markers=True, title='Document Processing Time')
+            fig_speed = px.line(df_audit, x='datetime', y='processing_time_min', markers=True, title='Document Processing Time', color_discrete_sequence=['#3498db'])
             fig_speed.update_layout(xaxis_title="Time", yaxis_title="Minutes")
             st.plotly_chart(fig_speed, use_container_width=True)
 
@@ -880,37 +849,9 @@ with tab_system:
             day_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
             dow_counts = df_audit['day_of_week'].value_counts().reindex(day_order).reset_index()
             dow_counts.columns = ['Day', 'Volume']
-            # Removed color mapping, added text_auto
-            fig_dow = px.bar(dow_counts, x='Day', y='Volume', text_auto=True)
+            # FIX: Removed the problematic color gradient, added solid color
+            fig_dow = px.bar(dow_counts, x='Day', y='Volume', text_auto=True, color_discrete_sequence=['#1abc9c'])
             st.plotly_chart(fig_dow, use_container_width=True)
-                
-        st.divider()
-
-        c3, c4 = st.columns(2)
-        with c3:
-            st.subheader("⚠️ Top Reasons for LLM Review")
-            df_fails = df_audit[df_audit['Clean_Status'] == 'FAIL']
-            if not df_fails.empty:
-                reasons_series = df_fails['reason_for_review'].str.split(" | ").explode()
-                reason_counts = reasons_series.value_counts().reset_index().head(10)
-                reason_counts.columns = ['Reason', 'Frequency']
-                # Removed color argument
-                fig_err = px.bar(reason_counts, x='Reason', y='Frequency', text_auto=True)
-                st.plotly_chart(fig_err, use_container_width=True)
-            else:
-                st.success("No failures to analyze.")
-
-        with c4:
-            st.subheader("💸 Absolute Variance Magnitude by Vendor")
-            var_vendor = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])].groupby('vendor_name')['variance'].apply(lambda x: x.abs().sum()).reset_index()
-            var_vendor = var_vendor[var_vendor['variance'] > 0].sort_values(by='variance', ascending=False).head(10)
-            if not var_vendor.empty:
-                # Removed color mapping
-                fig_var_vendor = px.bar(var_vendor, x='variance', y='vendor_name', orientation='h', text_auto=True)
-                fig_var_vendor.update_layout(yaxis={'categoryorder':'total ascending'})
-                st.plotly_chart(fig_var_vendor, use_container_width=True)
-            else:
-                st.success("No variance detected across any vendors.")
                 
         st.divider()
             
