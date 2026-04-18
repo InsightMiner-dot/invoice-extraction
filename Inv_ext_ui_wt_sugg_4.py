@@ -29,11 +29,12 @@ AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
 
 # ==============================================================
-# 0. Database Setup & Query Functions
+# 0. Database & CSV Setup Functions
 # ==============================================================
 
 AUDIT_FOLDER = "audit"
 DB_PATH = os.path.join(AUDIT_FOLDER, "qc_master_database.sqlite")
+MASTER_CSV_PATH = os.path.join(AUDIT_FOLDER, "master_suppliers.csv")
 
 def init_db():
     os.makedirs(AUDIT_FOLDER, exist_ok=True)
@@ -89,7 +90,16 @@ def init_db():
     conn.commit()
     conn.close()
 
-# ---> UPDATED: Now safely inserts the pre-selected clean_supplier <---
+# ---> NEW: Master Supplier CSV Functions <---
+def load_master_suppliers() -> pd.DataFrame:
+    if os.path.exists(MASTER_CSV_PATH):
+        return pd.read_csv(MASTER_CSV_PATH)
+    else:
+        return pd.DataFrame(columns=["Raw_Vendor_Name", "Clean_Supplier_Name"])
+
+def save_master_suppliers(df: pd.DataFrame):
+    df.to_csv(MASTER_CSV_PATH, index=False)
+
 def insert_audit_record(record: tuple):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -139,14 +149,12 @@ def fetch_audit_data() -> pd.DataFrame:
 def remove_duplicates_db(user_name: str):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
     cursor.execute('''
         SELECT COUNT(*) FROM qc_audit 
         WHERE id NOT IN (SELECT MIN(id) FROM qc_audit GROUP BY vendor_name, invoice_number)
         AND invoice_number NOT IN ('N/A', 'ERROR', '')
     ''')
     count = cursor.fetchone()[0]
-    
     cursor.execute('''
         DELETE FROM qc_audit
         WHERE id NOT IN (
@@ -155,7 +163,6 @@ def remove_duplicates_db(user_name: str):
             GROUP BY vendor_name, invoice_number
         ) AND invoice_number NOT IN ('N/A', 'ERROR', '')
     ''')
-    
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     cursor.execute("INSERT INTO deletion_logs (timestamp, user_name, action_type, details) VALUES (?, ?, ?, ?)", 
                    (now, user_name, "REMOVE_DUPLICATES", f"Deleted {count} duplicate records based on Vendor+Invoice match."))
@@ -168,9 +175,7 @@ def wipe_master_db(user_name: str):
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM qc_audit")
     count = cursor.fetchone()[0]
-    
     cursor.execute("DELETE FROM qc_audit")
-    
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     cursor.execute("INSERT INTO deletion_logs (timestamp, user_name, action_type, details) VALUES (?, ?, ?, ?)", 
                    (now, user_name, "WIPE_DATABASE", f"Wiped entire Master Database ({count} records deleted)."))
@@ -202,14 +207,8 @@ class LineItem(BaseModel):
     unit_price: Optional[float] = Field(None, description="Price of a single unit")
     line_total: Optional[float] = Field(None, description="Total cost for this specific line item. Look for 'Amount', 'Total', 'Extended Price', or 'Extd Price'. STRICT RULE: If the column is blank (e.g., due to a backordered item), leave this null or 0.0. Do not guess.")
     
-    line_origin: Optional[str] = Field(
-        None, 
-        description="CRITICAL ANTI-LAZINESS RULE: You MUST read the exact Origin/Ship-From address printed for THIS specific row. DO NOT copy or repeat the value from the row above. Every single row is unique. Look closely at the image for this exact line. If it is blank for this specific row, you MUST leave it null."
-    )
-    line_destination: Optional[str] = Field(
-        None, 
-        description="CRITICAL ANTI-LAZINESS RULE: You MUST read the exact Destination/Ship-To address printed for THIS specific row. DO NOT copy or repeat the value from the row above. Every single row is unique. Look closely at the image for this exact line. If it is blank for this specific row, you MUST leave it null."
-    )
+    line_origin: Optional[str] = Field(None, description="CRITICAL ANTI-LAZINESS RULE: You MUST read the exact Origin/Ship-From address printed for THIS specific row. DO NOT copy or repeat the value from the row above. Every single row is unique. Look closely at the image for this exact line. If it is blank for this specific row, you MUST leave it null.")
+    line_destination: Optional[str] = Field(None, description="CRITICAL ANTI-LAZINESS RULE: You MUST read the exact Destination/Ship-To address printed for THIS specific row. DO NOT copy or repeat the value from the row above. Every single row is unique. Look closely at the image for this exact line. If it is blank for this specific row, you MUST leave it null.")
 
 class TaxItem(BaseModel):
     tax_name: str = Field(description="The exact printed name of the tax (e.g., 'GST/HST', 'TPS/TVH', 'QST').")
@@ -340,13 +339,16 @@ if 'start_processing' not in st.session_state:
 if 'files_to_process' not in st.session_state:
     st.session_state.files_to_process = []
 
-# ---> UPDATED: Now receives the pre_selected_vendor parameter <---
-def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict, max_pages, dpi, sleep_time, pre_selected_vendor=None, prefix=""):
+def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict, max_pages, dpi, sleep_time, prefix=""):
     client = instructor.from_openai(AzureOpenAI(azure_endpoint=AZURE_ENDPOINT, api_key=AZURE_API_KEY, api_version=AZURE_API_VERSION))
     
     custom_col_keys = list(custom_fields_dict.keys())
     wb, ws_details, ws_qc = setup_excel_workbook(custom_col_keys)
-    red_font = Font(color="9C0006", bold=True)
+    
+    # ---> NEW: Load Master CSV directly into memory for rapid mapping <---
+    master_supp_df = load_master_suppliers()
+    # Create O(1) lookup dictionary matching lowercase raw names to standard clean names
+    supplier_map = dict(zip(master_supp_df['Raw_Vendor_Name'].astype(str).str.lower(), master_supp_df['Clean_Supplier_Name']))
     
     success_count, error_count = 0, 0
     progress_bar = st.progress(0, text=f"Initializing {prefix} processing sequence...")
@@ -375,11 +377,17 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
             
             if not extracted_document.invoices:
                 ws_qc.append([filename, "N/A", "N/A", "N/A", "N/A", "FAIL - NO DATA", "0 Invoices Found in PDF", "", "", ""])
-                insert_audit_record((current_date, current_time, filename, "N/A", "N/A", "N/A", "N/A", "FAIL - NO DATA", "0 Invoices Found", 0.0, 0.0, 0.0, file_proc_time, total_pages, current_batch_id, pre_selected_vendor))
+                insert_audit_record((current_date, current_time, filename, "N/A", "N/A", "N/A", "N/A", "FAIL - NO DATA", "0 Invoices Found", 0.0, 0.0, 0.0, file_proc_time, total_pages, current_batch_id, "N/A"))
                 current_run_summary.append({"File Name": filename, "Vendor Name": "N/A", "Invoice #": "N/A", "Origin": "N/A", "Destination": "N/A", "Status": "FAIL", "Reason": "No Invoices Found in PDF"})
                 continue
             
             for extracted_data in extracted_document.invoices:
+                # ---> NEW: Dynamically cross-reference Master CSV <---
+                raw_vendor = extracted_data.vendor_name
+                clean_supp = supplier_map.get(str(raw_vendor).lower())
+                if not clean_supp:
+                    clean_supp = standardize_vendor(raw_vendor)
+                    
                 calculated_line_sum = sum(item.line_total for item in extracted_data.line_items if item.line_total is not None)
                 safe_ship = extracted_data.shipping_handling or 0.0
                 safe_total_tax = sum(tax.tax_amount for tax in extracted_data.taxes if tax.tax_amount is not None)
@@ -468,11 +476,11 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                     status, reasons_string, extracted_data.total_amount, total_calculated, variance
                 ])
                 
-                # Passes the clean_supplier variable into the database
+                # ---> NEW: Database now correctly saves the auto-mapped clean_supp <---
                 insert_audit_record((
                     current_date, current_time, filename, extracted_data.vendor_name, extracted_data.invoice_number, 
                     str(qc_origin), str(qc_dest), status, reasons_string, 
-                    extracted_data.total_amount, total_calculated, variance, file_proc_time, total_pages, current_batch_id, pre_selected_vendor
+                    extracted_data.total_amount, total_calculated, variance, file_proc_time, total_pages, current_batch_id, clean_supp
                 ))
 
                 current_run_summary.append({
@@ -485,7 +493,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                 
         except Exception as e:
             file_proc_time = round(time.time() - file_start_time, 2)
-            insert_audit_record((current_date, current_time, filename, "N/A", "N/A", "N/A", "N/A", "FAIL - CRITICAL ERROR", str(e), 0.0, 0.0, 0.0, file_proc_time, 0, current_batch_id, pre_selected_vendor))
+            insert_audit_record((current_date, current_time, filename, "N/A", "N/A", "N/A", "N/A", "FAIL - CRITICAL ERROR", str(e), 0.0, 0.0, 0.0, file_proc_time, 0, current_batch_id, "ERROR"))
             current_run_summary.append({"File Name": filename, "Vendor Name": "ERROR", "Invoice #": "ERROR", "Origin": "ERROR", "Destination": "ERROR", "Status": "❌ ERROR", "Reason": "API/System Crash", "Proc Time": f"{file_proc_time}s"})
             error_count += 1
         
@@ -584,29 +592,11 @@ st.title("🧾 AI Invoice Intelligence Platform")
 
 # Sidebar
 with st.sidebar:
-    st.header("📄 Batch Upload & Processing")
-    
-    # ---> NEW: Processing Mode Toggle <---
-    processing_mode = st.radio(
-        "Select Processing Mode:", 
-        ["Mixed Vendors (Auto-Detect)", "Single Vendor Batch"],
-        help="Use Single Vendor if all uploaded PDFs belong to the same supplier. This improves AI matching."
-    )
-    
-    pre_selected_supplier = None
-    if processing_mode == "Single Vendor Batch":
-        pre_selected_supplier = st.text_input("Enter Clean Supplier Name for this batch:", placeholder="e.g. Tata Steel")
-        st.info("📌 All PDFs uploaded below will be mapped to this supplier in the Master Database.")
-        
-    st.write("")
-    uploaded_files = st.file_uploader(
-        "Upload PDF Documents (Select multiple files or use Ctrl+A in folder)", 
-        type=["pdf"], 
-        accept_multiple_files=True
-    )
+    st.header("📄 File Upload")
+    uploaded_files = st.file_uploader("Upload PDF Documents", type=["pdf"], accept_multiple_files=True)
     
     st.divider()
-
+    
     with st.expander("⚙️ Processing Configuration", expanded=False):
         config_max_pages = st.number_input("Max Pages per PDF", min_value=1, max_value=100, value=15)
         config_dpi = st.slider("Render Resolution (DPI)", min_value=72, max_value=600, value=300, step=72)
@@ -660,8 +650,6 @@ with tab_extract:
     if st.button("🚀 Start Extraction", type="primary"):
         if not uploaded_files:
             st.error("Please upload at least one PDF file from the sidebar.")
-        elif processing_mode == "Single Vendor Batch" and not pre_selected_supplier:
-            st.error("⚠️ Please enter a Supplier Name in the sidebar before extracting a Single Vendor Batch.")
         elif not all([AZURE_ENDPOINT, AZURE_API_KEY, AZURE_DEPLOYMENT]):
             st.error("⚠️ Azure credentials missing. Check your `.env` file.")
         else:
@@ -670,10 +658,6 @@ with tab_extract:
             
             unique_files = [f for f in uploaded_files if f.name not in existing_filenames]
             duplicate_files = [f for f in uploaded_files if f.name in existing_filenames]
-            
-            # Pass the pre-selected vendor if chosen, otherwise pass None
-            vendor_to_pass = pre_selected_supplier if processing_mode == "Single Vendor Batch" else None
-            st.session_state.current_pre_selected_vendor = vendor_to_pass
             
             if duplicate_files:
                 confirm_duplicates_dialog(duplicate_files, unique_files)
@@ -688,8 +672,7 @@ with tab_extract:
             standard_aliases_dict, 
             config_max_pages, 
             config_dpi,
-            config_sleep_time,
-            pre_selected_vendor=st.session_state.get('current_pre_selected_vendor', None)
+            config_sleep_time
         )
         st.session_state.start_processing = False
         st.rerun()
@@ -783,12 +766,10 @@ with tab_batch:
         st.divider()
 
         st.subheader("1. Clean Supplier Mapping")
-        st.write("Map raw extracted vendor names to standard 'Clean Suppliers' to prepare the database for historical AI lookups.")
+        st.write("Map raw extracted vendor names to standard 'Clean Suppliers'. Saving updates both the Database and the Master CSV.")
         
         if 'clean_supplier' in batch_df.columns:
             mapping_df = batch_df[['id', 'file_name', 'vendor_name', 'clean_supplier']].copy()
-            # If the user pre-selected a vendor, it's already in the DB. If not, we auto-standardize it for them to review.
-            mapping_df['clean_supplier'] = mapping_df['clean_supplier'].fillna(mapping_df['vendor_name'].apply(standardize_vendor))
             
             edited_mapping = st.data_editor(
                 mapping_df, 
@@ -802,10 +783,20 @@ with tab_batch:
                 }
             )
             
-            if st.button("💾 Save Supplier Mappings to Master DB", type="primary"):
+            if st.button("💾 Save Mappings & Update Master CSV", type="primary"):
+                master_df = load_master_suppliers()
+                new_mappings = []
+                
                 for index, row in edited_mapping.iterrows():
                     update_audit_record_supplier(row['id'], row['clean_supplier'])
-                st.success("Successfully updated supplier mappings!")
+                    new_mappings.append({"Raw_Vendor_Name": row['vendor_name'], "Clean_Supplier_Name": row['clean_supplier']})
+                
+                # Merge new mappings with existing master CSV
+                new_df = pd.DataFrame(new_mappings)
+                combined_df = pd.concat([master_df, new_df]).drop_duplicates(subset=['Raw_Vendor_Name'], keep='last')
+                save_master_suppliers(combined_df)
+                
+                st.success("Successfully updated supplier mappings and Master CSV!")
                 st.rerun()
 
             st.divider()
@@ -890,6 +881,17 @@ with tab_batch:
             else:
                 st.info("No routing issues found in the current batch!")
 
+            st.divider()
+            
+            # ---> NEW: View & Edit Master CSV Directly <---
+            st.subheader("📂 Master Supplier Database (CSV)")
+            st.write("View or manually override the global mapping rules. These apply automatically to future extractions.")
+            master_df = load_master_suppliers()
+            edited_master = st.data_editor(master_df, num_rows="dynamic", use_container_width=True)
+            if st.button("💾 Update Master CSV Directly"):
+                save_master_suppliers(edited_master)
+                st.success("Master CSV Rules Updated!")
+
 # ---------------------------------------------------------
 # TAB 4: BUSINESS ANALYTICS
 # ---------------------------------------------------------
@@ -900,7 +902,12 @@ with tab_analytics:
     if df_audit.empty:
         st.info("📭 No data available. Process some invoices in the Extraction Suite to generate analytics.")
     else:
-        df_audit['vendor_name'] = df_audit['vendor_name'].apply(standardize_vendor)
+        # We use clean_supplier for analytics to ensure consistency
+        if 'clean_supplier' in df_audit.columns:
+            df_audit['vendor_name'] = df_audit['clean_supplier'].fillna(df_audit['vendor_name'].apply(standardize_vendor))
+        else:
+            df_audit['vendor_name'] = df_audit['vendor_name'].apply(standardize_vendor)
+            
         missing_flags = ['N/A', 'None', '', 'null', 'None']
         
         valid_df = df_audit[~df_audit['invoice_number'].isin(['N/A', 'ERROR', '', None]) & ~df_audit['vendor_name'].isin(['N/A', 'ERROR'])]
@@ -910,6 +917,7 @@ with tab_analytics:
         missing_origin_df = df_audit[df_audit['origin'].isin(missing_flags) | df_audit['origin'].isna()]
         missing_dest_df = df_audit[df_audit['destination'].isin(missing_flags) | df_audit['destination'].isna()]
 
+        # 1. KPIs
         st.subheader("Invoice & Vendor Overview")
         col1, col2, col3, col4, col5 = st.columns(5)
         
@@ -927,6 +935,7 @@ with tab_analytics:
 
         st.divider()
 
+        # 2. Quality Scatter & Box Plot
         st.subheader("🎯 Extraction Quality & Outlier Detection")
         st.write("Identifies severe mathematical anomalies where the LLM's extracted total deviates wildly from the raw line items.")
         
@@ -957,6 +966,7 @@ with tab_analytics:
 
         st.divider()
         
+        # 3. Document Complexity Impact
         st.subheader("📄 Document Complexity Impact")
         st.write("Analyzes if longer documents lead to a higher failure rate in data extraction.")
         
@@ -975,6 +985,7 @@ with tab_analytics:
             
         st.divider()
 
+        # 4. Filterable Vendor Routing & Exception Breakdown
         st.subheader("🔎 Vendor Routing & Exception Breakdown")
         st.write("Filter to see a detailed routing scorecard and math error count by vendor.")
         
@@ -1015,6 +1026,7 @@ with tab_analytics:
 
         st.divider()
 
+        # 5. Top Vendor Charts
         c1, c2 = st.columns(2)
         with c1:
             st.subheader("Top Vendors by Invoice Volume")
@@ -1036,6 +1048,7 @@ with tab_analytics:
             
         st.divider()
         
+        # 6. Exception Bar Charts
         st.subheader("⚠️ Vendor Exceptions & Missing Data Analysis")
         
         err1, err2, err3 = st.columns(3)
@@ -1074,6 +1087,7 @@ with tab_analytics:
 
         st.divider()
 
+        # 7. Top Corridors
         st.subheader("📍 Top Shipping Corridors")
         df_valid_routes = df_audit[~df_audit['origin'].isin(missing_flags) & ~df_audit['destination'].isin(missing_flags)].copy()
         
@@ -1089,6 +1103,7 @@ with tab_analytics:
 
         st.divider()
 
+        # 8. Hidden Expanders
         st.subheader("📋 Raw Data & Exception Tables")
         
         with st.expander("🚨 Routing Exception Report (Missing Data)", expanded=False):
@@ -1132,7 +1147,10 @@ with tab_system:
     if df_audit.empty:
         st.info("📭 No data available. Process some invoices to track system drift.")
     else:
-        df_audit['vendor_name'] = df_audit['vendor_name'].apply(standardize_vendor)
+        if 'clean_supplier' in df_audit.columns:
+            df_audit['vendor_name'] = df_audit['clean_supplier'].fillna(df_audit['vendor_name'].apply(standardize_vendor))
+        else:
+            df_audit['vendor_name'] = df_audit['vendor_name'].apply(standardize_vendor)
         
         df_audit['extraction_date_dt'] = pd.to_datetime(df_audit['extraction_date'])
         df_audit['datetime'] = pd.to_datetime(df_audit['extraction_date'] + ' ' + df_audit['extraction_time'])
