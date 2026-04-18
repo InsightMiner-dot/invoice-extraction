@@ -267,7 +267,7 @@ def setup_excel_workbook(custom_cols: List[str]):
     details_headers = [
         "File Name", "Page #", "Vendor Name", "Vendor Address", "Bill To", "Remit To",
         "Origin", "Destination", "Invoice Number", "Date", "Currency", 
-        "Material", "Description", "Quantity", "UOM", "Unit Price", "Line Total", "Subtotal", "Invoice Total",
+        "Material", "Description", "Line Origin", "Line Destination", "Quantity", "UOM", "Unit Price", "Line Total", "Subtotal", "Invoice Total",
         "Inv# Conf", "Origin Conf", "Dest Conf", "UOM Conf", "Total Conf", "Status", "Reason for Review"
     ]
     if custom_cols: details_headers.extend(custom_cols)
@@ -376,7 +376,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                         "Bill To": extracted_data.bill_to, "Remit To": extracted_data.remit_to,
                         "Origin": final_origin, "Destination": final_dest, 
                         "Invoice Number": extracted_data.invoice_number, "Date": extracted_data.date, "Currency": extracted_data.currency,
-                        "Material": material, "Description": desc, 
+                        "Material": material, "Description": desc, "Line Origin": line_orig, "Line Destination": line_dest,
                         "Quantity": qty, "UOM": uom, "Unit Price": price, "Line Total": line_total,
                         "Subtotal": extracted_data.subtotal, "Invoice Total": extracted_data.total_amount,
                         "Inv# Conf": extracted_data.invoice_number_confidence, "Origin Conf": extracted_data.origin_confidence,
@@ -697,7 +697,7 @@ with tab_analytics:
         df_audit['vendor_name'] = df_audit['vendor_name'].apply(standardize_vendor)
         missing_flags = ['N/A', 'None', '', 'null', 'None']
         
-        # Calculate Base Exception Dataframes
+        # Calculate Exception Dataframes for charts/filters
         valid_df = df_audit[~df_audit['invoice_number'].isin(['N/A', 'ERROR', '', None]) & ~df_audit['vendor_name'].isin(['N/A', 'ERROR'])]
         duplicates_df = valid_df[valid_df.duplicated(subset=['vendor_name', 'invoice_number'], keep='first')]
         missing_origin_df = df_audit[df_audit['origin'].isin(missing_flags) | df_audit['origin'].isna()]
@@ -705,9 +705,8 @@ with tab_analytics:
         routing_issues_df = df_audit[df_audit['origin'].isin(missing_flags) | df_audit['origin'].isna() | df_audit['destination'].isin(missing_flags) | df_audit['destination'].isna()]
         amount_mismatches_df = df_audit[df_audit['variance'] != 0.0]
 
-        # 1. 5-Metric Unified KPI Row
-        st.subheader("Invoice Overview")
-        col1, col2, col3, col4, col5 = st.columns(5)
+        # 1. Single-Line KPI Dashboard
+        st.subheader("Invoice & Vendor Overview")
         
         total_invoices = len(df_audit)
         total_vendors = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])]['vendor_name'].nunique()
@@ -715,6 +714,7 @@ with tab_analytics:
         dup_count = len(duplicates_df)
         dup_spend = duplicates_df['extracted_total'].sum()
 
+        col1, col2, col3, col4, col5 = st.columns(5)
         col1.metric("Total Invoices", f"{total_invoices:,}")
         col2.metric("Total Unique Vendors", f"{total_vendors:,}")
         col3.metric("Total Spend", f"${total_spend / 1_000_000:,.2f}M")
@@ -723,24 +723,38 @@ with tab_analytics:
 
         st.divider()
 
-        # 2. Filterable Vendor Exception Data
-        st.subheader("🔎 Vendor Exception Filter")
-        st.write("Select specific vendors to view their processing volume against missing data and math errors.")
+        # 2. Filterable Vendor Routing & Exception Breakdown
+        st.subheader("🔎 Vendor Routing & Exception Breakdown")
+        st.write("Filter to see a detailed routing scorecard and math error count by vendor.")
         
         vendor_df = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])].copy()
+        
+        # Calculate boolean flags
         vendor_df['missing_origin'] = vendor_df['origin'].isin(missing_flags) | vendor_df['origin'].isna()
+        vendor_df['valid_origin'] = ~vendor_df['missing_origin']
+        
         vendor_df['missing_dest'] = vendor_df['destination'].isin(missing_flags) | vendor_df['destination'].isna()
+        vendor_df['valid_dest'] = ~vendor_df['missing_dest']
+        
         vendor_df['amount_mismatch'] = vendor_df['variance'] != 0.0
 
+        # Aggregate the flags
         vendor_summary = vendor_df.groupby('vendor_name').agg(
             Total_Invoices=('id', 'count'),
+            Valid_Origin=('valid_origin', 'sum'),
             Missing_Origin=('missing_origin', 'sum'),
+            Valid_Destination=('valid_dest', 'sum'),
             Missing_Destination=('missing_dest', 'sum'),
             Amount_Mismatch=('amount_mismatch', 'sum')
         ).reset_index()
         
-        vendor_summary.columns = ['Vendor Name', 'Total Invoices Processed', 'Missing Origin', 'Missing Destination', 'Amount Mismatch']
-        vendor_summary = vendor_summary.sort_values('Total Invoices Processed', ascending=False)
+        vendor_summary.columns = [
+            'Vendor Name', 'Total Invoices', 
+            'Has Origin', 'Missing Origin', 
+            'Has Destination', 'Missing Destination', 
+            'Amount Mismatch'
+        ]
+        vendor_summary = vendor_summary.sort_values('Total Invoices', ascending=False)
         
         all_vendors = vendor_summary['Vendor Name'].tolist()
         selected_vendors = st.multiselect("Filter by Vendor(s):", options=all_vendors, default=[])
@@ -754,7 +768,7 @@ with tab_analytics:
 
         st.divider()
 
-        # 3. Top Vendor Charts
+        # 3. Top Vendor Charts (Kept as requested)
         c1, c2 = st.columns(2)
         with c1:
             st.subheader("Top Vendors by Invoice Volume")
@@ -776,7 +790,7 @@ with tab_analytics:
             
         st.divider()
 
-        # 4. Three Exception Bar Charts
+        # 4. Exception Bar Charts (Kept as requested)
         st.subheader("⚠️ Vendor Exceptions & Missing Data Analysis")
         err1, err2, err3 = st.columns(3)
         
@@ -815,7 +829,7 @@ with tab_analytics:
 
         st.divider()
 
-        # 5. Top Corridors
+        # 5. Top Corridors (Kept as requested)
         st.subheader("📍 Top Shipping Corridors")
         df_valid_routes = df_audit[~df_audit['origin'].isin(missing_flags) & ~df_audit['destination'].isin(missing_flags)].copy()
         
@@ -831,7 +845,7 @@ with tab_analytics:
 
         st.divider()
 
-        # 6. Hidden Expanders
+        # 6. Hidden Expanders (Kept as requested)
         st.subheader("📋 Raw Data & Exception Tables")
         
         with st.expander("🚨 Routing Exception Report (Missing Data)", expanded=False):
@@ -901,9 +915,9 @@ with tab_system:
         math_acc = (math_pass / total_invoices) * 100 if total_invoices > 0 else 0
 
         sys1.metric("Avg Proc Time", f"{avg_proc_time_min:.2f}m", "Per Doc")
-        sys2.metric("Proc Speed", f"{time_per_page_min:.2f}m", "Per Page")
-        sys3.metric("API Failure Rate", f"{sys_error_rate:.1f}%", delta_color="inverse")
-        sys4.metric("Data Accuracy (Math)", f"{math_acc:.1f}%")
+        sys2.metric("API Failure Rate", f"{sys_error_rate:.1f}%", delta_color="inverse")
+        sys3.metric("Overall Accuracy", f"{overall_acc:.1f}%")
+        sys4.metric("Math Accuracy", f"{math_acc:.1f}%")
         sys5.metric("% Pass", f"{overall_acc:.1f}%")
         sys6.metric("% Fail", f"{fail_pct:.1f}%", delta_color="inverse")
 
