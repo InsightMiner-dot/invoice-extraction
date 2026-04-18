@@ -90,12 +90,18 @@ def init_db():
     conn.commit()
     conn.close()
 
-# ---> NEW: Master Supplier CSV Functions <---
+# ---> THE FIX: Bulletproof CSV Loader <---
 def load_master_suppliers() -> pd.DataFrame:
     if os.path.exists(MASTER_CSV_PATH):
-        return pd.read_csv(MASTER_CSV_PATH)
-    else:
-        return pd.DataFrame(columns=["Raw_Vendor_Name", "Clean_Supplier_Name"])
+        try:
+            df = pd.read_csv(MASTER_CSV_PATH)
+            # Check if it's a valid file with the right columns
+            if 'Raw_Vendor_Name' in df.columns and 'Clean_Supplier_Name' in df.columns:
+                return df
+        except Exception:
+            pass # If it's empty or corrupt, ignore and build a fresh one
+            
+    return pd.DataFrame(columns=["Raw_Vendor_Name", "Clean_Supplier_Name"])
 
 def save_master_suppliers(df: pd.DataFrame):
     df.to_csv(MASTER_CSV_PATH, index=False)
@@ -345,9 +351,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
     custom_col_keys = list(custom_fields_dict.keys())
     wb, ws_details, ws_qc = setup_excel_workbook(custom_col_keys)
     
-    # ---> NEW: Load Master CSV directly into memory for rapid mapping <---
     master_supp_df = load_master_suppliers()
-    # Create O(1) lookup dictionary matching lowercase raw names to standard clean names
     supplier_map = dict(zip(master_supp_df['Raw_Vendor_Name'].astype(str).str.lower(), master_supp_df['Clean_Supplier_Name']))
     
     success_count, error_count = 0, 0
@@ -382,7 +386,6 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                 continue
             
             for extracted_data in extracted_document.invoices:
-                # ---> NEW: Dynamically cross-reference Master CSV <---
                 raw_vendor = extracted_data.vendor_name
                 clean_supp = supplier_map.get(str(raw_vendor).lower())
                 if not clean_supp:
@@ -476,7 +479,6 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                     status, reasons_string, extracted_data.total_amount, total_calculated, variance
                 ])
                 
-                # ---> NEW: Database now correctly saves the auto-mapped clean_supp <---
                 insert_audit_record((
                     current_date, current_time, filename, extracted_data.vendor_name, extracted_data.invoice_number, 
                     str(qc_origin), str(qc_dest), status, reasons_string, 
@@ -592,17 +594,14 @@ st.title("🧾 AI Invoice Intelligence Platform")
 
 # Sidebar
 with st.sidebar:
-    st.header("📄 File Upload")
-    uploaded_files = st.file_uploader("Upload PDF Documents", type=["pdf"], accept_multiple_files=True)
+    st.header("⚙️ Settings & Rules")
     
-    st.divider()
-    
-    with st.expander("⚙️ Processing Configuration", expanded=False):
+    with st.expander("Processing Configuration", expanded=False):
         config_max_pages = st.number_input("Max Pages per PDF", min_value=1, max_value=100, value=15)
         config_dpi = st.slider("Render Resolution (DPI)", min_value=72, max_value=600, value=300, step=72)
         config_sleep_time = st.number_input("API Sleep Time (seconds)", min_value=0, max_value=60, value=3)
 
-    with st.expander("🎯 Standard Field Aliases", expanded=False):
+    with st.expander("Standard Field Aliases", expanded=False):
         st.write("Add alternative names (comma-separated) for built-in fields to help the AI find them.")
         default_standard = pd.DataFrame({
             "Standard Field": [
@@ -621,7 +620,7 @@ with st.sidebar:
             if str(row["Aliases"]).strip() and str(row["Aliases"]) != "None":
                 standard_aliases_dict[row["Standard Field"]] = str(row["Aliases"]).strip()
                 
-    with st.expander("🎯 New Custom Fields", expanded=False):
+    with st.expander("New Custom Fields", expanded=False):
         st.write("Add entirely new columns to extract.")
         default_custom = pd.DataFrame({
             "Field Name": [""],
@@ -635,6 +634,13 @@ with st.sidebar:
             desc = str(row["Description & Aliases"]).strip()
             if name and name != "None":
                 custom_fields_dict[name] = desc
+    
+    st.divider()
+    
+    # ---> FIX: File Uploader moved to the bottom of the sidebar <---
+    st.header("📄 Batch Upload")
+    st.write("Upload your mixed batch of invoices here. The system will auto-map vendors via the Master CSV.")
+    uploaded_files = st.file_uploader("Upload PDF Documents", type=["pdf"], accept_multiple_files=True)
 
 # Tabs
 tab_extract, tab_viewer, tab_batch, tab_analytics, tab_system = st.tabs([
@@ -791,11 +797,13 @@ with tab_batch:
                     update_audit_record_supplier(row['id'], row['clean_supplier'])
                     new_mappings.append({"Raw_Vendor_Name": row['vendor_name'], "Clean_Supplier_Name": row['clean_supplier']})
                 
-                # Merge new mappings with existing master CSV
                 new_df = pd.DataFrame(new_mappings)
-                combined_df = pd.concat([master_df, new_df]).drop_duplicates(subset=['Raw_Vendor_Name'], keep='last')
-                save_master_suppliers(combined_df)
+                if not master_df.empty and 'Raw_Vendor_Name' in master_df.columns:
+                    combined_df = pd.concat([master_df, new_df]).drop_duplicates(subset=['Raw_Vendor_Name'], keep='last')
+                else:
+                    combined_df = new_df.drop_duplicates(subset=['Raw_Vendor_Name'], keep='last')
                 
+                save_master_suppliers(combined_df)
                 st.success("Successfully updated supplier mappings and Master CSV!")
                 st.rerun()
 
@@ -883,7 +891,6 @@ with tab_batch:
 
             st.divider()
             
-            # ---> NEW: View & Edit Master CSV Directly <---
             st.subheader("📂 Master Supplier Database (CSV)")
             st.write("View or manually override the global mapping rules. These apply automatically to future extractions.")
             master_df = load_master_suppliers()
@@ -902,7 +909,6 @@ with tab_analytics:
     if df_audit.empty:
         st.info("📭 No data available. Process some invoices in the Extraction Suite to generate analytics.")
     else:
-        # We use clean_supplier for analytics to ensure consistency
         if 'clean_supplier' in df_audit.columns:
             df_audit['vendor_name'] = df_audit['clean_supplier'].fillna(df_audit['vendor_name'].apply(standardize_vendor))
         else:
@@ -917,7 +923,6 @@ with tab_analytics:
         missing_origin_df = df_audit[df_audit['origin'].isin(missing_flags) | df_audit['origin'].isna()]
         missing_dest_df = df_audit[df_audit['destination'].isin(missing_flags) | df_audit['destination'].isna()]
 
-        # 1. KPIs
         st.subheader("Invoice & Vendor Overview")
         col1, col2, col3, col4, col5 = st.columns(5)
         
@@ -935,7 +940,6 @@ with tab_analytics:
 
         st.divider()
 
-        # 2. Quality Scatter & Box Plot
         st.subheader("🎯 Extraction Quality & Outlier Detection")
         st.write("Identifies severe mathematical anomalies where the LLM's extracted total deviates wildly from the raw line items.")
         
@@ -966,7 +970,6 @@ with tab_analytics:
 
         st.divider()
         
-        # 3. Document Complexity Impact
         st.subheader("📄 Document Complexity Impact")
         st.write("Analyzes if longer documents lead to a higher failure rate in data extraction.")
         
@@ -985,7 +988,6 @@ with tab_analytics:
             
         st.divider()
 
-        # 4. Filterable Vendor Routing & Exception Breakdown
         st.subheader("🔎 Vendor Routing & Exception Breakdown")
         st.write("Filter to see a detailed routing scorecard and math error count by vendor.")
         
@@ -1026,7 +1028,6 @@ with tab_analytics:
 
         st.divider()
 
-        # 5. Top Vendor Charts
         c1, c2 = st.columns(2)
         with c1:
             st.subheader("Top Vendors by Invoice Volume")
@@ -1048,7 +1049,6 @@ with tab_analytics:
             
         st.divider()
         
-        # 6. Exception Bar Charts
         st.subheader("⚠️ Vendor Exceptions & Missing Data Analysis")
         
         err1, err2, err3 = st.columns(3)
@@ -1087,7 +1087,6 @@ with tab_analytics:
 
         st.divider()
 
-        # 7. Top Corridors
         st.subheader("📍 Top Shipping Corridors")
         df_valid_routes = df_audit[~df_audit['origin'].isin(missing_flags) & ~df_audit['destination'].isin(missing_flags)].copy()
         
@@ -1103,7 +1102,6 @@ with tab_analytics:
 
         st.divider()
 
-        # 8. Hidden Expanders
         st.subheader("📋 Raw Data & Exception Tables")
         
         with st.expander("🚨 Routing Exception Report (Missing Data)", expanded=False):
