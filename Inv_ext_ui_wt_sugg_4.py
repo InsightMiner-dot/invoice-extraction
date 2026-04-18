@@ -69,7 +69,7 @@ def init_db():
         )
     ''')
     
-    # ---> THE FIX: Individual column checks so the DB always updates correctly <---
+    # Safe auto-healing schema updates, now including batch_id
     new_columns = [
         ("processing_time", "REAL"),
         ("page_count", "INTEGER"),
@@ -77,7 +77,8 @@ def init_db():
         ("suggested_origin", "TEXT"),
         ("final_origin", "TEXT"),
         ("suggested_destination", "TEXT"),
-        ("final_destination", "TEXT")
+        ("final_destination", "TEXT"),
+        ("batch_id", "TEXT")
     ]
     
     for col_name, col_type in new_columns:
@@ -96,8 +97,8 @@ def insert_audit_record(record: tuple):
         INSERT INTO qc_audit (
             extraction_date, extraction_time, file_name, vendor_name, 
             invoice_number, origin, destination, status, reason_for_review, 
-            extracted_total, calculated_sum, variance, processing_time, page_count
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            extracted_total, calculated_sum, variance, processing_time, page_count, batch_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', record)
     conn.commit()
     conn.close()
@@ -355,6 +356,9 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
 
     start_time_batch = time.time()
     total_files = len(files_list)
+    
+    # NEW: Generate a unique ID for this entire batch run
+    current_batch_id = datetime.now().strftime("BATCH_%Y%m%d_%H%M%S")
 
     for idx, file in enumerate(files_list):
         filename = file.name
@@ -372,7 +376,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
             
             if not extracted_document.invoices:
                 ws_qc.append([filename, "N/A", "N/A", "N/A", "N/A", "FAIL - NO DATA", "0 Invoices Found in PDF", "", "", ""])
-                insert_audit_record((current_date, current_time, filename, "N/A", "N/A", "N/A", "N/A", "FAIL - NO DATA", "0 Invoices Found", 0.0, 0.0, 0.0, file_proc_time, total_pages))
+                insert_audit_record((current_date, current_time, filename, "N/A", "N/A", "N/A", "N/A", "FAIL - NO DATA", "0 Invoices Found", 0.0, 0.0, 0.0, file_proc_time, total_pages, current_batch_id))
                 current_run_summary.append({"File Name": filename, "Vendor Name": "N/A", "Invoice #": "N/A", "Origin": "N/A", "Destination": "N/A", "Status": "FAIL", "Reason": "No Invoices Found in PDF"})
                 continue
             
@@ -468,7 +472,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                 insert_audit_record((
                     current_date, current_time, filename, extracted_data.vendor_name, extracted_data.invoice_number, 
                     str(qc_origin), str(qc_dest), status, reasons_string, 
-                    extracted_data.total_amount, total_calculated, variance, file_proc_time, total_pages
+                    extracted_data.total_amount, total_calculated, variance, file_proc_time, total_pages, current_batch_id
                 ))
 
                 current_run_summary.append({
@@ -481,7 +485,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                 
         except Exception as e:
             file_proc_time = round(time.time() - file_start_time, 2)
-            insert_audit_record((current_date, current_time, filename, "N/A", "N/A", "N/A", "N/A", "FAIL - CRITICAL ERROR", str(e), 0.0, 0.0, 0.0, file_proc_time, 0))
+            insert_audit_record((current_date, current_time, filename, "N/A", "N/A", "N/A", "N/A", "FAIL - CRITICAL ERROR", str(e), 0.0, 0.0, 0.0, file_proc_time, 0, current_batch_id))
             current_run_summary.append({"File Name": filename, "Vendor Name": "ERROR", "Invoice #": "ERROR", "Origin": "ERROR", "Destination": "ERROR", "Status": "❌ ERROR", "Reason": "API/System Crash", "Proc Time": f"{file_proc_time}s"})
             error_count += 1
         
@@ -627,7 +631,7 @@ with st.sidebar:
     st.header("📄 Upload Files")
     uploaded_files = st.file_uploader("Upload PDF Documents", type=["pdf"], accept_multiple_files=True)
 
-# ---> TAB REARRANGEMENT: Current Batch QA moved here <---
+# Tabs
 tab_extract, tab_viewer, tab_batch, tab_analytics, tab_system = st.tabs([
     "⚙️ Extraction Suite", "📄 Document Viewer", "✅ Current Batch QA", "📊 Business Analytics", "🤖 System & Drift Analysis"
 ])
@@ -720,7 +724,7 @@ with tab_viewer:
         st.info("Upload PDF documents in the sidebar to view them here.")
 
 # ---------------------------------------------------------
-# TAB 3: CURRENT BATCH QA & SUPPLIER MAPPING (Moved here)
+# TAB 3: CURRENT BATCH QA & SUPPLIER MAPPING
 # ---------------------------------------------------------
 with tab_batch:
     st.header("✅ Current Batch QA & Master Data Preparation")
@@ -731,11 +735,16 @@ with tab_batch:
     if df_audit.empty:
         st.info("Process a batch of invoices to view current metrics.")
     else:
-        # Isolate the latest extraction date to represent the "Current Batch"
-        latest_date = df_audit['extraction_date'].max()
-        batch_df = df_audit[df_audit['extraction_date'] == latest_date].copy()
-        
-        st.markdown(f"**Latest Batch Date:** `{latest_date}` | **Total Invoices in Batch:** `{len(batch_df)}`")
+        # ---> THE FIX: Safely retrieve the latest batch ID to perfectly isolate the run <---
+        if 'batch_id' in df_audit.columns and not df_audit['batch_id'].isna().all():
+            latest_batch = df_audit['batch_id'].dropna().iloc[-1]
+            batch_df = df_audit[df_audit['batch_id'] == latest_batch].copy()
+            st.markdown(f"**Latest Batch ID:** `{latest_batch}` | **Total Invoices in Batch:** `{len(batch_df)}`")
+        else:
+            # Fallback for old database rows that don't have a batch_id yet
+            latest_date = df_audit['extraction_date'].max()
+            batch_df = df_audit[df_audit['extraction_date'] == latest_date].copy()
+            st.markdown(f"**Latest Batch Date:** `{latest_date}` | **Total Invoices in Batch:** `{len(batch_df)}`")
         
         missing_flags = ['N/A', 'None', '', 'null', 'None']
         batch_routing_issues = batch_df[
@@ -744,6 +753,7 @@ with tab_batch:
         ]
         batch_mismatches = batch_df[batch_df['variance'] != 0.0]
         
+        # Batch specific KPIs
         bc1, bc2, bc3, bc4 = st.columns(4)
         bc1.metric("Batch Processing Volume", f"{len(batch_df)}")
         bc2.metric("Batch Math Mismatches", f"{len(batch_mismatches)}", delta_color="inverse")
@@ -756,7 +766,6 @@ with tab_batch:
         st.subheader("1. Clean Supplier Mapping")
         st.write("Map raw extracted vendor names to standard 'Clean Suppliers' to prepare the database for historical AI lookups.")
         
-        # Make sure the column exists in the dataframe before manipulating it
         if 'clean_supplier' in batch_df.columns:
             mapping_df = batch_df[['id', 'file_name', 'vendor_name', 'clean_supplier']].copy()
             mapping_df['clean_supplier'] = mapping_df['clean_supplier'].fillna(mapping_df['vendor_name'].apply(standardize_vendor))
@@ -785,10 +794,10 @@ with tab_batch:
             st.write("Scan the Master Database to suggest the Top 5 most frequent historical routes for invoices missing data.")
             
             if st.button("⚙️ Generate Top 5 Historical Suggestions"):
+                # Use the ENTIRE database history for learning
                 valid_origins = df_audit[~df_audit['origin'].isin(missing_flags) & df_audit['origin'].notna()]
                 valid_dests = df_audit[~df_audit['destination'].isin(missing_flags) & df_audit['destination'].notna()]
                 
-                # Top Origins calculation
                 orig_counts = valid_origins.groupby(['clean_supplier', 'origin']).size().reset_index(name='count')
                 orig_counts = orig_counts.sort_values(['clean_supplier', 'count'], ascending=[True, False])
                 top_origins = orig_counts.groupby('clean_supplier').head(5)
@@ -798,7 +807,6 @@ with tab_batch:
                     suggs = [f"{idx+1}. {row['origin']} (x{row['count']})" for idx, row in enumerate(group.to_dict('records'))]
                     orig_dict[supp] = " | ".join(suggs)
                     
-                # Top Destinations calculation
                 dest_counts = valid_dests.groupby(['clean_supplier', 'destination']).size().reset_index(name='count')
                 dest_counts = dest_counts.sort_values(['clean_supplier', 'count'], ascending=[True, False])
                 top_dests = dest_counts.groupby('clean_supplier').head(5)
@@ -808,6 +816,7 @@ with tab_batch:
                     suggs = [f"{idx+1}. {row['destination']} (x{row['count']})" for idx, row in enumerate(group.to_dict('records'))]
                     dest_dict[supp] = " | ".join(suggs)
                 
+                # Apply the historical learning ONLY to the current batch's missing data
                 for idx, row in batch_routing_issues.iterrows():
                     supp = row['clean_supplier'] if pd.notna(row['clean_supplier']) else standardize_vendor(row['vendor_name'])
                     sug_orig = orig_dict.get(supp, "No historical data")
@@ -819,12 +828,20 @@ with tab_batch:
                 
             st.write("Review the Top 5 historical suggestions below and type your final choice into the Approved column.")
             
+            # Fetch fresh data to populate the UI grid
             current_db = fetch_audit_data()
-            current_batch_issues = current_db[(current_db['extraction_date'] == latest_date) & (
-                current_db['origin'].isin(missing_flags) | current_db['origin'].isna() |
-                current_db['destination'].isin(missing_flags) | current_db['destination'].isna()
-            )].copy()
-            
+            if 'batch_id' in current_db.columns and not current_db['batch_id'].isna().all():
+                c_latest_batch = current_db['batch_id'].dropna().iloc[-1]
+                current_batch_issues = current_db[(current_db['batch_id'] == c_latest_batch) & (
+                    current_db['origin'].isin(missing_flags) | current_db['origin'].isna() |
+                    current_db['destination'].isin(missing_flags) | current_db['destination'].isna()
+                )].copy()
+            else:
+                current_batch_issues = current_db[(current_db['extraction_date'] == latest_date) & (
+                    current_db['origin'].isin(missing_flags) | current_db['origin'].isna() |
+                    current_db['destination'].isin(missing_flags) | current_db['destination'].isna()
+                )].copy()
+
             if not current_batch_issues.empty:
                 review_df = current_batch_issues[['id', 'file_name', 'clean_supplier', 'origin', 'suggested_origin', 'final_origin', 'destination', 'suggested_destination', 'final_destination']]
                 
@@ -876,7 +893,6 @@ with tab_analytics:
         missing_origin_df = df_audit[df_audit['origin'].isin(missing_flags) | df_audit['origin'].isna()]
         missing_dest_df = df_audit[df_audit['destination'].isin(missing_flags) | df_audit['destination'].isna()]
 
-        # 1. KPIs
         st.subheader("Invoice & Vendor Overview")
         col1, col2, col3, col4, col5 = st.columns(5)
         
@@ -894,7 +910,6 @@ with tab_analytics:
 
         st.divider()
 
-        # 2. Quality Scatter & Box Plot
         st.subheader("🎯 Extraction Quality & Outlier Detection")
         st.write("Identifies severe mathematical anomalies where the LLM's extracted total deviates wildly from the raw line items.")
         
@@ -925,7 +940,6 @@ with tab_analytics:
 
         st.divider()
         
-        # 3. Document Complexity Impact
         st.subheader("📄 Document Complexity Impact")
         st.write("Analyzes if longer documents lead to a higher failure rate in data extraction.")
         
@@ -944,7 +958,6 @@ with tab_analytics:
             
         st.divider()
 
-        # 4. Filterable Vendor Routing & Exception Breakdown
         st.subheader("🔎 Vendor Routing & Exception Breakdown")
         st.write("Filter to see a detailed routing scorecard and math error count by vendor.")
         
@@ -985,7 +998,6 @@ with tab_analytics:
 
         st.divider()
 
-        # 5. Top Vendor Charts
         c1, c2 = st.columns(2)
         with c1:
             st.subheader("Top Vendors by Invoice Volume")
@@ -1007,7 +1019,6 @@ with tab_analytics:
             
         st.divider()
         
-        # 6. Exception Bar Charts
         st.subheader("⚠️ Vendor Exceptions & Missing Data Analysis")
         
         err1, err2, err3 = st.columns(3)
@@ -1046,7 +1057,6 @@ with tab_analytics:
 
         st.divider()
 
-        # 7. Top Corridors
         st.subheader("📍 Top Shipping Corridors")
         df_valid_routes = df_audit[~df_audit['origin'].isin(missing_flags) & ~df_audit['destination'].isin(missing_flags)].copy()
         
@@ -1062,7 +1072,6 @@ with tab_analytics:
 
         st.divider()
 
-        # 8. Hidden Expanders
         st.subheader("📋 Raw Data & Exception Tables")
         
         with st.expander("🚨 Routing Exception Report (Missing Data)", expanded=False):
