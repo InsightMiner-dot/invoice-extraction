@@ -19,7 +19,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from wordcloud import WordCloud
 import matplotlib.pyplot as plt
-from fuzzywuzzy import process  # <--- NEW: Fuzzy Matching Library
+from fuzzywuzzy import process
 
 # Load environment variables from the backend
 load_dotenv(override=True)
@@ -91,26 +91,23 @@ def init_db():
     conn.commit()
     conn.close()
 
-# ---> UPDATED: 1-Column Master CSV Logic <---
 def load_master_suppliers() -> pd.DataFrame:
     if os.path.exists(MASTER_CSV_PATH):
         try:
             df = pd.read_csv(MASTER_CSV_PATH)
-            # Check for the new 1-column schema
-            if 'Supplier_Name' in df.columns:
+            if 'Original_Supplier_Name' in df.columns:
                 return df
         except Exception:
             pass 
-    return pd.DataFrame(columns=["Supplier_Name"])
+    return pd.DataFrame(columns=["Original_Supplier_Name"])
 
 def save_master_suppliers(df: pd.DataFrame):
     df.to_csv(MASTER_CSV_PATH, index=False)
 
 def append_to_master(new_supplier: str):
     df = load_master_suppliers()
-    if new_supplier not in df['Supplier_Name'].values:
-        # Append the new vendor and save immediately
-        new_row = pd.DataFrame([{"Supplier_Name": new_supplier}])
+    if new_supplier not in df['Original_Supplier_Name'].values:
+        new_row = pd.DataFrame([{"Original_Supplier_Name": new_supplier}])
         df = pd.concat([df, new_row], ignore_index=True)
         save_master_suppliers(df)
 
@@ -351,9 +348,8 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
     custom_col_keys = list(custom_fields_dict.keys())
     wb, ws_details, ws_qc = setup_excel_workbook(custom_col_keys)
     
-    # Load Master CSV into memory for Fuzzy Matching
     master_supp_df = load_master_suppliers()
-    master_suppliers_list = master_supp_df['Supplier_Name'].tolist() if not master_supp_df.empty else []
+    master_suppliers_list = master_supp_df['Original_Supplier_Name'].dropna().tolist() if not master_supp_df.empty else []
     
     success_count, error_count = 0, 0
     progress_bar = st.progress(0, text=f"Initializing {prefix} processing sequence...")
@@ -388,11 +384,9 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
             
             for extracted_data in extracted_document.invoices:
                 
-                # ---> NEW: Auto Fuzzy Match Logic <---
                 raw_vendor = extracted_data.vendor_name
                 clean_supp = None
                 
-                # Try to fuzzy match if we have an existing list
                 if master_suppliers_list and raw_vendor and raw_vendor not in ['N/A', 'ERROR', '']:
                     match_result = process.extractOne(raw_vendor, master_suppliers_list)
                     if match_result:
@@ -400,13 +394,9 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                         if score >= 60:
                             clean_supp = best_match
                 
-                # If score < 60 or the list was empty, standardize and append as a NEW master supplier
+                # If no match found, do NOT append to CSV automatically. Just standardise it for the DB row.
                 if not clean_supp:
                     clean_supp = standardize_vendor(raw_vendor)
-                    if clean_supp and clean_supp not in master_suppliers_list:
-                        master_suppliers_list.append(clean_supp)
-                        append_to_master(clean_supp)
-                # ----------------------------------------
 
                 calculated_line_sum = sum(item.line_total for item in extracted_data.line_items if item.line_total is not None)
                 safe_ship = extracted_data.shipping_handling or 0.0
@@ -496,7 +486,6 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                     status, reasons_string, extracted_data.total_amount, total_calculated, variance
                 ])
                 
-                # Insert safely with the fuzzy-matched clean_supplier
                 insert_audit_record((
                     current_date, current_time, filename, extracted_data.vendor_name, extracted_data.invoice_number, 
                     str(qc_origin), str(qc_dest), status, reasons_string, 
@@ -540,6 +529,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
     progress_bar.empty()
     status_text.empty()
     st.success(f"🎉 {prefix} Batch Processing Complete! Invoices Extracted: {success_count} | Errors: {error_count}")
+
 
 # --- DB & UI Dialogs ---
 @st.dialog("⚠️ Duplicate Files Detected")
@@ -928,12 +918,21 @@ with tab_batch:
         st.divider()
         
         with st.expander("📂 Master Supplier Database (CSV)", expanded=False):
-            st.write("View or manually add/edit the official Supplier names. These act as the fuzzy match targets for future runs.")
+            st.write("View the official Supplier names used for fuzzy matching. Auto-append is OFF. Manually add new vendors here.")
+            
+            col_add1, col_add2 = st.columns([3, 1])
+            with col_add1:
+                new_supp = st.text_input("Enter new Official Supplier Name:", label_visibility="collapsed", placeholder="e.g., Tata Steel Inc.")
+            with col_add2:
+                if st.button("➕ Add Supplier", use_container_width=True):
+                    if new_supp.strip():
+                        append_to_master(new_supp.strip())
+                        st.success(f"Added {new_supp.strip()}!")
+                        time.sleep(1)
+                        st.rerun()
+            
             master_df = load_master_suppliers()
-            edited_master = st.data_editor(master_df, num_rows="dynamic", use_container_width=True)
-            if st.button("💾 Update Master CSV Directly"):
-                save_master_suppliers(edited_master)
-                st.success("Master CSV Updated!")
+            st.dataframe(master_df, use_container_width=True, hide_index=True)
 
 # ---------------------------------------------------------
 # TAB 4: BUSINESS ANALYTICS
