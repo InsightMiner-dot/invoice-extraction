@@ -89,7 +89,7 @@ def fetch_audit_data() -> pd.DataFrame:
 init_db()
 
 # ==============================================================
-# 1. Define Data Schema (CORE LOGIC UNTOUCHED)
+# 1. Define Data Schema (UPDATED FOR INLINE ORIGIN/DESTINATION)
 # ==============================================================
 
 class LineItem(BaseModel):
@@ -101,6 +101,10 @@ class LineItem(BaseModel):
     uom_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
     unit_price: Optional[float] = Field(None, description="Price of a single unit")
     line_total: Optional[float] = Field(None, description="Total cost for this specific line item. Look for 'Amount', 'Total', 'Extended Price', or 'Extd Price'. STRICT RULE: If the column is blank (e.g., due to a backordered item), leave this null or 0.0. Do not guess.")
+    
+    # ---> THE FIX: Line-Level Origin & Destination <---
+    line_origin: Optional[str] = Field(None, description="ONLY extract if the Origin/Ship-From address is explicitly listed per-item INSIDE the table row.")
+    line_destination: Optional[str] = Field(None, description="ONLY extract if the Destination/Ship-To address is explicitly listed per-item INSIDE the table row.")
 
 class TaxItem(BaseModel):
     tax_name: str = Field(description="The exact printed name of the tax (e.g., 'GST/HST', 'TPS/TVH', 'QST').")
@@ -116,10 +120,10 @@ class InvoiceData(BaseModel):
     bill_to: Optional[str] = Field(None, description="The FULL complete 'Bill To' or 'Sold To' address including street, city, state/province, and postal code.")
     remit_to: Optional[str] = Field(None, description="The FULL complete 'Remit To' address including street, city, state/province, and postal code.")
     
-    origin: Optional[str] = Field(None, description="The FULL origin physical address. STRICT GUARDRAIL: ONLY extract this if it is explicitly labeled with tags like 'Ship From', 'Origin', 'From', or 'Pickup'. If these specific tags are missing, or if it is just a random secondary address, you MUST return null. Do NOT extract short alphanumeric codes or tank numbers.")
+    origin: Optional[str] = Field(None, description="The FULL origin physical address for the overall invoice. STRICT GUARDRAIL: ONLY extract this if it is explicitly labeled with tags like 'Ship From', 'Origin', 'From', or 'Pickup'. Do NOT extract short alphanumeric codes or tank numbers.")
     origin_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
     
-    destination: Optional[str] = Field(None, description="The FULL destination physical address ('Ship To', 'To', 'Deliver To', 'Consignee'). STRICT RULE: Do NOT extract short alphanumeric facility codes or building numbers. If a full physical address is not present, leave null.")
+    destination: Optional[str] = Field(None, description="The FULL destination physical address for the overall invoice ('Ship To', 'To', 'Deliver To', 'Consignee'). STRICT RULE: Do NOT extract short alphanumeric facility codes or building numbers.")
     destination_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
     
     invoice_number: Optional[str] = Field(None, description="Unique invoice number. STRICT RULE: Only extract values explicitly labeled as 'Invoice Number' or 'Invoice #'. Do NOT extract Ticket No, Reference, Order ID, or Statement numbers.")
@@ -142,7 +146,7 @@ class InvoiceData(BaseModel):
     
     custom_fields: Dict[str, Optional[str]] = Field(default_factory=dict, description="Extract any custom fields requested by the user. The keys MUST match exactly.")
     
-    line_items: List[LineItem] = Field(description="List of all individual items purchased")
+    line_items: List[LineItem] = Field(description="List of all individual items purchased. CRITICAL GUARDRAIL: You must extract EVERY SINGLE ROW from the invoice table. Do NOT skip, summarize, or abbreviate rows. You must capture 100% of the items to ensure accounting math is perfectly accurate.")
 
 class InvoiceDocument(BaseModel):
     invoices: List[InvoiceData] = Field(description="List of distinct invoices. STRICT PAGING RULE: 1) If an invoice table extends across multiple pages but shares the SAME Invoice Number, MERGE all line items into ONE invoice record. 2) If the Invoice Number CHANGES on a new page, split it into a NEW separate invoice record in this list.")
@@ -167,7 +171,7 @@ def pdf_to_base64_images(file_bytes: bytes, max_pages: int, dpi: int) -> Tuple[L
 def extract_invoice_data(client, deployment: str, file_bytes: bytes, custom_fields_dict: Dict[str, str], standard_aliases_dict: Dict[str, str], max_pages: int, dpi: int) -> Tuple[InvoiceDocument, int]:
     base64_images, total_pages = pdf_to_base64_images(file_bytes, max_pages, dpi)
     
-    system_prompt = "You are an expert accountant processing a document that may contain multiple distinct invoices. STRICT PAGING RULES: 1) If the same invoice number continues across multiple pages, combine all line items, taxes, and totals into a SINGLE invoice record. 2) If you see a NEW invoice number, start a NEW invoice record. CRITICAL RULE AGAINST DUPLICATES: Never extract the same tax or fee twice. Your extracted total for EACH invoice must mathematically equal the calculated sum of unique items for that invoice."
+    system_prompt = "You are an expert accountant processing a document that may contain multiple distinct invoices. STRICT PAGING RULES: 1) If the same invoice number continues across multiple pages, combine all line items, taxes, and totals into a SINGLE invoice record. 2) If you see a NEW invoice number, start a NEW invoice record. CRITICAL RULE AGAINST DUPLICATES: Never extract the same tax or fee twice. ANTI-LAZINESS RULE: DO NOT BE LAZY. You must extract every single line item row by row. Skipping the middle of a table, abbreviating, or summarizing items is a CRITICAL FAILURE. Your extracted total for EACH invoice must mathematically equal the calculated sum of unique items for that invoice."
     
     if standard_aliases_dict:
         alias_str = "\n".join([f"- {k}: Also look for '{v}'" for k, v in standard_aliases_dict.items()])
@@ -192,6 +196,7 @@ def setup_excel_workbook(custom_cols: List[str]):
     wb = openpyxl.Workbook()
     ws_details = wb.active
     ws_details.title = "Invoice Details"
+    # Unchanged Headers as requested
     details_headers = [
         "File Name", "Page #", "Vendor Name", "Vendor Address", "Bill To", "Remit To",
         "Origin", "Destination", "Invoice Number", "Date", "Currency", 
@@ -239,7 +244,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
     red_font = Font(color="9C0006", bold=True)
     
     success_count, error_count = 0, 0
-    progress_bar = st.progress(0, text=f"Initializing processing sequence...")
+    progress_bar = st.progress(0, text=f"Initializing {prefix} processing sequence...")
     status_text = st.empty()
     
     current_run_summary = []
@@ -294,48 +299,71 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                 status = "FAIL - NEEDS REVIEW" if needs_review else "PASS"
                 reasons_string = " | ".join(review_reasons) if needs_review else "N/A"
                 
-                def create_row(page_num, material, desc, qty, uom, uom_conf, price, line_total):
-                    base_row = [
-                        filename, page_num, extracted_data.vendor_name, extracted_data.vendor_address,
-                        extracted_data.bill_to, extracted_data.remit_to, 
-                        extracted_data.origin, extracted_data.destination, extracted_data.invoice_number,
-                        extracted_data.date, extracted_data.currency, 
-                        material, desc, qty, uom, price, line_total, extracted_data.subtotal, extracted_data.total_amount,
-                        extracted_data.invoice_number_confidence, extracted_data.origin_confidence, 
-                        extracted_data.destination_confidence, uom_conf, extracted_data.total_amount_confidence,
-                        status, reasons_string
-                    ]
-                    custom_values = [extracted_data.custom_fields.get(col, "Not Found") for col in custom_col_keys]
-                    return base_row + custom_values
-
-                def append_ui_detail_row(page_num, material, desc, qty, uom, unit_price, line_total):
-                    current_run_details.append({
-                        "File Name": filename, "Vendor": extracted_data.vendor_name, "Invoice #": extracted_data.invoice_number,
-                        "Page #": page_num, "Material/Fee": material, "Description": desc, "Qty": qty, "UOM": uom,
-                        "Price": unit_price, "Line Total": line_total
-                    })
+                # ---> THE FIX: Fallback Logic injected directly into the row generator <---
+                def create_row_dict(page_num, material, desc, qty, uom, uom_conf, price, line_total, line_orig=None, line_dest=None):
+                    # Check line item first. If blank, fallback to the global invoice address.
+                    final_origin = line_orig if line_orig else extracted_data.origin
+                    final_dest = line_dest if line_dest else extracted_data.destination
+                    
+                    row_data = {
+                        "File Name": filename,
+                        "Page #": page_num,
+                        "Vendor Name": extracted_data.vendor_name,
+                        "Vendor Address": extracted_data.vendor_address,
+                        "Bill To": extracted_data.bill_to,
+                        "Remit To": extracted_data.remit_to,
+                        "Origin": final_origin,        # Uses fallback logic
+                        "Destination": final_dest,     # Uses fallback logic
+                        "Invoice Number": extracted_data.invoice_number,
+                        "Date": extracted_data.date,
+                        "Currency": extracted_data.currency,
+                        "Material": material,
+                        "Description": desc,
+                        "Quantity": qty,
+                        "UOM": uom,
+                        "Unit Price": price,
+                        "Line Total": line_total,
+                        "Subtotal": extracted_data.subtotal,
+                        "Invoice Total": extracted_data.total_amount,
+                        "Inv# Conf": extracted_data.invoice_number_confidence,
+                        "Origin Conf": extracted_data.origin_confidence,
+                        "Dest Conf": extracted_data.destination_confidence,
+                        "UOM Conf": uom_conf,
+                        "Total Conf": extracted_data.total_amount_confidence,
+                        "Status": status,
+                        "Reason for Review": reasons_string
+                    }
+                    for col in custom_col_keys:
+                        row_data[col] = extracted_data.custom_fields.get(col, "Not Found")
+                    return row_data
 
                 if len(extracted_data.line_items) == 0:
-                    ws_details.append(create_row(None, None, None, None, None, None, None, 0.0))
-                    append_ui_detail_row(None, None, "NO ITEMS FOUND", None, None, None, 0.0)
+                    row_dict = create_row_dict(None, None, "NO ITEMS FOUND", None, None, None, None, 0.0)
+                    ws_details.append(list(row_dict.values()))
+                    current_run_details.append(row_dict)
                 else:
                     for item in extracted_data.line_items:
-                        ws_details.append(create_row(item.page_number, item.material, item.description, item.quantity, item.uom, item.uom_confidence, item.unit_price, item.line_total))
-                        append_ui_detail_row(item.page_number, item.material, item.description, item.quantity, item.uom, item.unit_price, item.line_total)
+                        # Passing the new line_orig and line_dest to the builder
+                        row_dict = create_row_dict(item.page_number, item.material, item.description, item.quantity, item.uom, item.uom_confidence, item.unit_price, item.line_total, line_orig=item.line_origin, line_dest=item.line_destination)
+                        ws_details.append(list(row_dict.values()))
+                        current_run_details.append(row_dict)
                         
                 if safe_ship > 0: 
-                    ws_details.append(create_row(None, None, extracted_data.shipping_name or "Shipping", None, None, None, None, safe_ship))
-                    append_ui_detail_row(None, "SHIPPING", extracted_data.shipping_name or "Shipping", None, None, None, safe_ship)
+                    row_dict = create_row_dict(None, "SHIPPING", extracted_data.shipping_name or "Shipping", None, None, None, None, safe_ship)
+                    ws_details.append(list(row_dict.values()))
+                    current_run_details.append(row_dict)
                     
                 for tax in extracted_data.taxes:
                     if tax.tax_amount is not None and tax.tax_amount > 0: 
-                        ws_details.append(create_row(None, None, tax.tax_name, None, None, None, None, tax.tax_amount))
-                        append_ui_detail_row(None, "TAX", tax.tax_name, None, None, None, tax.tax_amount)
+                        row_dict = create_row_dict(None, "TAX", tax.tax_name, None, None, None, None, tax.tax_amount)
+                        ws_details.append(list(row_dict.values()))
+                        current_run_details.append(row_dict)
                         
                 for fee in extracted_data.additional_fees:
                     if fee.fee_amount is not None and fee.fee_amount > 0: 
-                        ws_details.append(create_row(None, None, fee.fee_name, None, None, None, None, fee.fee_amount))
-                        append_ui_detail_row(None, "FEE", fee.fee_name, None, None, None, fee.fee_amount)
+                        row_dict = create_row_dict(None, "FEE", fee.fee_name, None, None, None, None, fee.fee_amount)
+                        ws_details.append(list(row_dict.values()))
+                        current_run_details.append(row_dict)
                 
                 ws_qc.append([
                     filename, extracted_data.vendor_name, extracted_data.invoice_number, 
@@ -472,7 +500,7 @@ tab_extract, tab_viewer, tab_analytics, tab_system = st.tabs([
 ])
 
 # ---------------------------------------------------------
-# TAB 1: EXTRACTION SUITE
+# TAB 1: EXTRACTION Suite
 # ---------------------------------------------------------
 with tab_extract:
     st.write("Upload invoices via the sidebar and click below to process them. Results will appear here instantly.")
@@ -530,7 +558,7 @@ with tab_viewer:
     st.header("📄 Document Viewer")
     
     if uploaded_files:
-        st.write("Browse through uploaded PDF pages natively.")
+        st.write("Use your browser's built-in controls to zoom or search (Ctrl+F).")
         
         search_query = st.text_input("🔍 Search by File Name", "").lower()
         filtered_files = [f for f in uploaded_files if search_query in f.name.lower()]
@@ -543,21 +571,11 @@ with tab_viewer:
                 col = cols[idx % 4]
                 with col:
                     st.subheader(file.name)
-                    
-                    # Convert PDF pages to HTML image tags for continuous scrolling
                     file.seek(0)
-                    doc = fitz.open(stream=file.read(), filetype="pdf")
-                    html_content = '<div style="height: 500px; overflow-y: scroll; border: 1px solid #ddd; padding: 10px; background-color: #f9f9f9;">'
-                    
-                    for page_num in range(len(doc)):
-                        page = doc[page_num]
-                        pix = page.get_pixmap(dpi=150) 
-                        img_b64 = base64.b64encode(pix.tobytes("jpeg")).decode('utf-8')
-                        html_content += f'<img src="data:image/jpeg;base64,{img_b64}" style="width: 100%; margin-bottom: 10px; border: 1px solid #ccc; box-shadow: 2px 2px 5px rgba(0,0,0,0.1);">'
-                        
-                    html_content += '</div>'
-                    st.markdown(html_content, unsafe_allow_html=True)
-                    file.seek(0) 
+                    base64_pdf = base64.b64encode(file.read()).decode('utf-8')
+                    pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="500" type="application/pdf"></iframe>'
+                    st.markdown(pdf_display, unsafe_allow_html=True)
+                    file.seek(0)
     else:
         st.info("Upload PDF documents in the sidebar to view them here.")
 
@@ -571,6 +589,10 @@ with tab_analytics:
     if df_audit.empty:
         st.info("📭 No data available. Process some invoices in the Extraction Suite to generate analytics.")
     else:
+        missing_flags = ['N/A', 'None', '', 'null', 'None']
+        df_audit['is_origin_missing'] = df_audit['origin'].isin(missing_flags) | df_audit['origin'].isna()
+        df_audit['is_dest_missing'] = df_audit['destination'].isin(missing_flags) | df_audit['destination'].isna()
+
         st.subheader("Invoice & Vendor Overview")
         col1, col2, col3 = st.columns(3)
         total_invoices = len(df_audit)
@@ -613,13 +635,12 @@ with tab_analytics:
         st.divider()
 
         st.subheader("📍 Vendor Logistics Map (Origin & Destination)")
-        missing_flags = ['N/A', 'None', '', 'null', 'None']
-        df_routes = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])]
-
+        
         def get_unique_clean(series):
             vals = [str(x) for x in series if pd.notna(x) and str(x) not in missing_flags]
             return " | ".join(sorted(list(set(vals)))) if vals else "⚠️ Missing"
 
+        df_routes = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])]
         vendor_routes = df_routes.groupby('vendor_name').agg({
             'id': 'count', 'origin': get_unique_clean, 'destination': get_unique_clean
         }).reset_index().rename(columns={
