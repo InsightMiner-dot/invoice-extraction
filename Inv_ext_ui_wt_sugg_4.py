@@ -19,6 +19,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from wordcloud import WordCloud
 import matplotlib.pyplot as plt
+from fuzzywuzzy import process  # <--- NEW: Fuzzy Matching Library
 
 # Load environment variables from the backend
 load_dotenv(override=True)
@@ -90,18 +91,28 @@ def init_db():
     conn.commit()
     conn.close()
 
+# ---> UPDATED: 1-Column Master CSV Logic <---
 def load_master_suppliers() -> pd.DataFrame:
     if os.path.exists(MASTER_CSV_PATH):
         try:
             df = pd.read_csv(MASTER_CSV_PATH)
-            if 'Raw_Vendor_Name' in df.columns and 'Clean_Supplier_Name' in df.columns:
+            # Check for the new 1-column schema
+            if 'Supplier_Name' in df.columns:
                 return df
         except Exception:
             pass 
-    return pd.DataFrame(columns=["Raw_Vendor_Name", "Clean_Supplier_Name"])
+    return pd.DataFrame(columns=["Supplier_Name"])
 
 def save_master_suppliers(df: pd.DataFrame):
     df.to_csv(MASTER_CSV_PATH, index=False)
+
+def append_to_master(new_supplier: str):
+    df = load_master_suppliers()
+    if new_supplier not in df['Supplier_Name'].values:
+        # Append the new vendor and save immediately
+        new_row = pd.DataFrame([{"Supplier_Name": new_supplier}])
+        df = pd.concat([df, new_row], ignore_index=True)
+        save_master_suppliers(df)
 
 def insert_audit_record(record: tuple):
     conn = sqlite3.connect(DB_PATH)
@@ -115,14 +126,6 @@ def insert_audit_record(record: tuple):
     ''', record)
     conn.commit()
     conn.close()
-
-def update_audit_record_supplier(record_id: int, clean_supplier: str):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("UPDATE qc_audit SET clean_supplier = ? WHERE id = ?", (clean_supplier, record_id))
-    conn.commit()
-    conn.close()
-    fetch_audit_data.clear()
 
 def update_audit_suggestions(record_id: int, sug_orig: str, sug_dest: str):
     conn = sqlite3.connect(DB_PATH)
@@ -348,8 +351,9 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
     custom_col_keys = list(custom_fields_dict.keys())
     wb, ws_details, ws_qc = setup_excel_workbook(custom_col_keys)
     
+    # Load Master CSV into memory for Fuzzy Matching
     master_supp_df = load_master_suppliers()
-    supplier_map = dict(zip(master_supp_df['Raw_Vendor_Name'].astype(str).str.lower(), master_supp_df['Clean_Supplier_Name']))
+    master_suppliers_list = master_supp_df['Supplier_Name'].tolist() if not master_supp_df.empty else []
     
     success_count, error_count = 0, 0
     progress_bar = st.progress(0, text=f"Initializing {prefix} processing sequence...")
@@ -383,11 +387,27 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                 continue
             
             for extracted_data in extracted_document.invoices:
+                
+                # ---> NEW: Auto Fuzzy Match Logic <---
                 raw_vendor = extracted_data.vendor_name
-                clean_supp = supplier_map.get(str(raw_vendor).lower())
+                clean_supp = None
+                
+                # Try to fuzzy match if we have an existing list
+                if master_suppliers_list and raw_vendor and raw_vendor not in ['N/A', 'ERROR', '']:
+                    match_result = process.extractOne(raw_vendor, master_suppliers_list)
+                    if match_result:
+                        best_match, score = match_result
+                        if score >= 60:
+                            clean_supp = best_match
+                
+                # If score < 60 or the list was empty, standardize and append as a NEW master supplier
                 if not clean_supp:
                     clean_supp = standardize_vendor(raw_vendor)
-                    
+                    if clean_supp and clean_supp not in master_suppliers_list:
+                        master_suppliers_list.append(clean_supp)
+                        append_to_master(clean_supp)
+                # ----------------------------------------
+
                 calculated_line_sum = sum(item.line_total for item in extracted_data.line_items if item.line_total is not None)
                 safe_ship = extracted_data.shipping_handling or 0.0
                 safe_total_tax = sum(tax.tax_amount for tax in extracted_data.taxes if tax.tax_amount is not None)
@@ -476,6 +496,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                     status, reasons_string, extracted_data.total_amount, total_calculated, variance
                 ])
                 
+                # Insert safely with the fuzzy-matched clean_supplier
                 insert_audit_record((
                     current_date, current_time, filename, extracted_data.vendor_name, extracted_data.invoice_number, 
                     str(qc_origin), str(qc_dest), status, reasons_string, 
@@ -519,7 +540,6 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
     progress_bar.empty()
     status_text.empty()
     st.success(f"🎉 {prefix} Batch Processing Complete! Invoices Extracted: {success_count} | Errors: {error_count}")
-
 
 # --- DB & UI Dialogs ---
 @st.dialog("⚠️ Duplicate Files Detected")
@@ -735,14 +755,13 @@ with tab_viewer:
 # ---------------------------------------------------------
 with tab_batch:
     st.header("✅ Current Batch QA")
-    st.write("Review the extraction quality specifically for the batch you just processed.")
+    st.write("Review the quality of the most recent extraction batch and execute AI Routing Suggestions.")
     
     df_audit = fetch_audit_data()
     
     if df_audit.empty:
         st.info("Process a batch of invoices to view current metrics.")
     else:
-        # Determine the latest batch isolation dynamically
         if 'batch_id' in df_audit.columns and not df_audit['batch_id'].isna().all():
             latest_batch = df_audit['batch_id'].dropna().iloc[-1]
             batch_df = df_audit[df_audit['batch_id'] == latest_batch].copy()
@@ -753,7 +772,6 @@ with tab_batch:
             st.markdown(f"**Latest Batch Date:** `{latest_date}`")
             latest_batch = None
             
-        # Ensure we have a valid clean supplier column to group by
         vendor_col = 'clean_supplier' if 'clean_supplier' in batch_df.columns else 'vendor_name'
         if vendor_col == 'clean_supplier':
             batch_df['clean_supplier'] = batch_df['clean_supplier'].fillna(batch_df['vendor_name'].apply(standardize_vendor))
@@ -762,7 +780,6 @@ with tab_batch:
         batch_vendors = batch_df[vendor_col].nunique()
         batch_spend_k = batch_df['extracted_total'].sum() / 1000.0
         
-        # Calculate duplicates specifically for this batch
         batch_dup_count = 0
         if 'batch_id' in df_audit.columns and latest_batch:
             valid_df = df_audit[~df_audit['invoice_number'].isin(['N/A', 'ERROR', '', None]) & ~df_audit['vendor_name'].isin(['N/A', 'ERROR'])]
@@ -826,7 +843,6 @@ with tab_batch:
             valid_origins = df_audit[~df_audit['origin'].isin(batch_missing_flags) & df_audit['origin'].notna()]
             valid_dests = df_audit[~df_audit['destination'].isin(batch_missing_flags) & df_audit['destination'].notna()]
             
-            # Using clean_supplier to group historical data accurately
             hist_vendor_col = 'clean_supplier' if 'clean_supplier' in df_audit.columns else 'vendor_name'
             
             orig_counts = valid_origins.groupby([hist_vendor_col, 'origin']).size().reset_index(name='count')
@@ -912,12 +928,12 @@ with tab_batch:
         st.divider()
         
         with st.expander("📂 Master Supplier Database (CSV)", expanded=False):
-            st.write("View or manually override the global mapping rules. These apply automatically to future extractions.")
+            st.write("View or manually add/edit the official Supplier names. These act as the fuzzy match targets for future runs.")
             master_df = load_master_suppliers()
             edited_master = st.data_editor(master_df, num_rows="dynamic", use_container_width=True)
             if st.button("💾 Update Master CSV Directly"):
                 save_master_suppliers(edited_master)
-                st.success("Master CSV Rules Updated!")
+                st.success("Master CSV Updated!")
 
 # ---------------------------------------------------------
 # TAB 4: BUSINESS ANALYTICS
