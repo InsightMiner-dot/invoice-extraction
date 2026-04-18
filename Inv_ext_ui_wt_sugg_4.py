@@ -276,7 +276,7 @@ def pdf_to_base64_images(file_bytes: bytes, max_pages: int, dpi: int) -> Tuple[L
         base64_images.append(base64.b64encode(pix.tobytes("jpeg")).decode('utf-8'))
     return base64_images, total_pages
 
-def extract_invoice_data(client, deployment: str, file_bytes: bytes, custom_fields_dict: Dict[str, str], standard_aliases_dict: Dict[str, max_pages: int, dpi: int) -> Tuple[InvoiceDocument, int]:
+def extract_invoice_data(client, deployment: str, file_bytes: bytes, custom_fields_dict: Dict[str, str], standard_aliases_dict: Dict[str, str], max_pages: int, dpi: int) -> Tuple[InvoiceDocument, int]:
     base64_images, total_pages = pdf_to_base64_images(file_bytes, max_pages, dpi)
     
     system_prompt = "You are an expert accountant processing a document that may contain multiple distinct invoices. STRICT PAGING RULES: 1) If the same invoice number continues across multiple pages, combine all line items, taxes, and totals into a SINGLE invoice record. 2) If you see a NEW invoice number, start a NEW invoice record. CRITICAL RULE AGAINST DUPLICATES: Never extract the same tax or fee twice. ANTI-LAZINESS RULE: DO NOT BE LAZY. You must extract every single line item row by row. Skipping the middle of a table, abbreviating, or summarizing items is a CRITICAL FAILURE. Your extracted total for EACH invoice must mathematically equal the calculated sum of unique items for that invoice."
@@ -300,12 +300,13 @@ def extract_invoice_data(client, deployment: str, file_bytes: bytes, custom_fiel
     )
     return response, total_pages
 
+# ---> UPDATED: Added 'Original Supplier Name' to Excel export <---
 def setup_excel_workbook(custom_cols: List[str]):
     wb = openpyxl.Workbook()
     ws_details = wb.active
     ws_details.title = "Invoice Details"
     details_headers = [
-        "File Name", "Page #", "Vendor Name", "Vendor Address", "Bill To", "Remit To",
+        "File Name", "Page #", "Vendor Name", "Original Supplier Name", "Vendor Address", "Bill To", "Remit To",
         "Origin", "Destination", "Invoice Number", "Date", "Currency", 
         "Material", "Description", "Quantity", "UOM", "Unit Price", "Line Total", "Subtotal", "Invoice Total",
         "Inv# Conf", "Origin Conf", "Dest Conf", "UOM Conf", "Total Conf", "Status", "Reason for Review"
@@ -315,7 +316,7 @@ def setup_excel_workbook(custom_cols: List[str]):
     
     ws_qc = wb.create_sheet(title="QC Summary")
     qc_headers = [
-        "File Name", "Vendor Name", "Invoice Number", "Origin", "Destination", "Status", "Reason for Review", 
+        "File Name", "Vendor Name", "Original Supplier Name", "Invoice Number", "Origin", "Destination", "Status", "Reason for Review", 
         "Extracted Total", "Calculated Sum", "Variance"
     ]
     ws_qc.append(qc_headers)
@@ -378,7 +379,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
             file_proc_time = round(time.time() - file_start_time, 2)
             
             if not extracted_document.invoices:
-                ws_qc.append([filename, "N/A", "N/A", "N/A", "N/A", "FAIL - NO DATA", "0 Invoices Found in PDF", "", "", ""])
+                ws_qc.append([filename, "N/A", "N/A", "N/A", "N/A", "N/A", "FAIL - NO DATA", "0 Invoices Found in PDF", "", "", ""])
                 insert_audit_record((current_date, current_time, filename, "N/A", "N/A", "N/A", "N/A", "FAIL - NO DATA", "0 Invoices Found", 0.0, 0.0, 0.0, file_proc_time, total_pages, current_batch_id, "N/A"))
                 current_run_summary.append({"File Name": filename, "Vendor Name": "N/A", "Invoice #": "N/A", "Origin": "N/A", "Destination": "N/A", "Status": "FAIL", "Reason": "No Invoices Found in PDF"})
                 continue
@@ -388,13 +389,15 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                 raw_vendor = extracted_data.vendor_name
                 orig_supp = None
                 
+                # ---> UPDATED: Fuzzy Match Threshold Increased to 85 <---
                 if master_suppliers_list and raw_vendor and raw_vendor not in ['N/A', 'ERROR', '']:
                     match_result = process.extractOne(raw_vendor, master_suppliers_list)
                     if match_result:
                         best_match, score = match_result
-                        if score >= 60:
+                        if score >= 85: 
                             orig_supp = best_match
                 
+                # Fallback: if not mapped perfectly, standardizes raw vendor name
                 if not orig_supp:
                     orig_supp = standardize_vendor(raw_vendor)
 
@@ -423,13 +426,16 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                 status = "FAIL - NEEDS REVIEW" if needs_review else "PASS"
                 reasons_string = " | ".join(review_reasons) if needs_review else "N/A"
                 
+                # ---> UPDATED: Including Original Supplier Name in Full Details Data <---
                 def create_row_dict(page_num, material, desc, qty, uom, uom_conf, price, line_total, line_orig=None, line_dest=None):
                     final_origin = line_orig if line_orig else extracted_data.origin
                     final_dest = line_dest if line_dest else extracted_data.destination
                     
                     row_data = {
                         "File Name": filename, "Page #": page_num,
-                        "Vendor Name": extracted_data.vendor_name, "Vendor Address": extracted_data.vendor_address,
+                        "Vendor Name": extracted_data.vendor_name,
+                        "Original Supplier Name": orig_supp,  
+                        "Vendor Address": extracted_data.vendor_address,
                         "Bill To": extracted_data.bill_to, "Remit To": extracted_data.remit_to,
                         "Origin": final_origin, "Destination": final_dest, 
                         "Invoice Number": extracted_data.invoice_number, "Date": extracted_data.date, "Currency": extracted_data.currency,
@@ -480,8 +486,9 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                 qc_origin = first_line_orig if first_line_orig else extracted_data.origin
                 qc_dest = first_line_dest if first_line_dest else extracted_data.destination
 
+                # ---> UPDATED: Include orig_supp in QC Excel export <---
                 ws_qc.append([
-                    filename, extracted_data.vendor_name, extracted_data.invoice_number, 
+                    filename, extracted_data.vendor_name, orig_supp, extracted_data.invoice_number, 
                     qc_origin, qc_dest,
                     status, reasons_string, extracted_data.total_amount, total_calculated, variance
                 ])
@@ -699,10 +706,11 @@ with tab_extract:
         st.dataframe(pd.DataFrame(st.session_state.extraction_summary), use_container_width=True, hide_index=True)
 
         st.download_button(
-            label="📥 Download Excel Report (Legacy View)",
+            label="📥 Download Full Extract Data (Excel)",
             data=st.session_state.extraction_excel,
-            file_name=f"Extraction_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            file_name=f"Full_Extraction_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary"
         )
 
 # ---------------------------------------------------------
@@ -789,8 +797,8 @@ with tab_batch:
 
         st.divider()
         
-        st.subheader("📥 Download Batch Data")
-        st.write("Download the raw QC database table specifically for this batch, including your clean supplier mappings.")
+        st.subheader("📥 Download Batch DB Data")
+        st.write("Download the raw QC database table specifically for this batch.")
         
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -807,7 +815,7 @@ with tab_batch:
             data=output,
             file_name=f"Batch_QC_{latest_batch or latest_date}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary"
+            type="secondary"
         )
         
         st.divider()
