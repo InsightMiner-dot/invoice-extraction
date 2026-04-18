@@ -30,12 +30,13 @@ AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
 
 # ==============================================================
-# 0. Database & CSV Setup Functions
+# 0. Database & Excel Setup Functions
 # ==============================================================
 
 AUDIT_FOLDER = "audit"
 DB_PATH = os.path.join(AUDIT_FOLDER, "qc_master_database.sqlite")
-MASTER_CSV_PATH = os.path.join(AUDIT_FOLDER, "master_suppliers.csv")
+# ---> FIX: Strictly using Excel now <---
+MASTER_EXCEL_PATH = os.path.join(AUDIT_FOLDER, "master_suppliers.xlsx")
 
 def init_db():
     os.makedirs(AUDIT_FOLDER, exist_ok=True)
@@ -91,19 +92,20 @@ def init_db():
     conn.commit()
     conn.close()
 
+# ---> FIX: Reading and writing only via openpyxl <---
 def load_master_suppliers() -> pd.DataFrame:
-    if os.path.exists(MASTER_CSV_PATH):
+    if os.path.exists(MASTER_EXCEL_PATH):
         try:
-            df = pd.read_csv(MASTER_CSV_PATH, encoding='utf-8-sig')
+            df = pd.read_excel(MASTER_EXCEL_PATH, engine='openpyxl')
             if 'Original_Supplier_Name' in df.columns:
                 return df[['Original_Supplier_Name']].dropna()
         except Exception as e:
-            st.error(f"Error loading Master CSV: {e}")
+            st.error(f"Error loading Master Excel: {e}")
     
     return pd.DataFrame(columns=["Original_Supplier_Name"])
 
 def save_master_suppliers(df: pd.DataFrame):
-    df.to_csv(MASTER_CSV_PATH, index=False, encoding='utf-8-sig')
+    df.to_excel(MASTER_EXCEL_PATH, index=False, engine='openpyxl')
 
 def append_to_master(new_supplier: str):
     df = load_master_suppliers()
@@ -300,7 +302,6 @@ def extract_invoice_data(client, deployment: str, file_bytes: bytes, custom_fiel
     )
     return response, total_pages
 
-# ---> UPDATED: Added 'Original Supplier Name' to Excel export <---
 def setup_excel_workbook(custom_cols: List[str]):
     wb = openpyxl.Workbook()
     ws_details = wb.active
@@ -389,7 +390,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                 raw_vendor = extracted_data.vendor_name
                 orig_supp = None
                 
-                # ---> UPDATED: Fuzzy Match Threshold Increased to 85 <---
+                # Threshold at 85 for high confidence
                 if master_suppliers_list and raw_vendor and raw_vendor not in ['N/A', 'ERROR', '']:
                     match_result = process.extractOne(raw_vendor, master_suppliers_list)
                     if match_result:
@@ -426,7 +427,6 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                 status = "FAIL - NEEDS REVIEW" if needs_review else "PASS"
                 reasons_string = " | ".join(review_reasons) if needs_review else "N/A"
                 
-                # ---> UPDATED: Including Original Supplier Name in Full Details Data <---
                 def create_row_dict(page_num, material, desc, qty, uom, uom_conf, price, line_total, line_orig=None, line_dest=None):
                     final_origin = line_orig if line_orig else extracted_data.origin
                     final_dest = line_dest if line_dest else extracted_data.destination
@@ -486,7 +486,6 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                 qc_origin = first_line_orig if first_line_orig else extracted_data.origin
                 qc_dest = first_line_dest if first_line_dest else extracted_data.destination
 
-                # ---> UPDATED: Include orig_supp in QC Excel export <---
                 ws_qc.append([
                     filename, extracted_data.vendor_name, orig_supp, extracted_data.invoice_number, 
                     qc_origin, qc_dest,
@@ -652,7 +651,7 @@ with st.sidebar:
     st.divider()
     
     st.header("📄 Batch Upload")
-    st.write("Upload your mixed batch of invoices here. The system will auto-map vendors via the Master CSV.")
+    st.write("Upload your mixed batch of invoices here. The system will auto-map vendors via the Master Database.")
     uploaded_files = st.file_uploader("Upload PDF Documents", type=["pdf"], accept_multiple_files=True)
 
 # Tabs
@@ -661,7 +660,7 @@ tab_extract, tab_viewer, tab_batch, tab_analytics, tab_system = st.tabs([
 ])
 
 # ---------------------------------------------------------
-# TAB 1: EXTRACTION SUITE
+# TAB 1: EXTRACTION Suite
 # ---------------------------------------------------------
 with tab_extract:
     st.write("Upload invoices via the sidebar and click below to process them. Results will appear here instantly.")
@@ -965,7 +964,7 @@ with tab_batch:
 
         st.divider()
         
-        with st.expander("📂 Master Supplier Database (CSV)", expanded=False):
+        with st.expander("📂 Master Supplier Database (Excel)", expanded=False):
             st.write("View, edit, or add official Supplier names directly in the table below. These act as the fuzzy match targets for future runs. Scroll to the bottom to add a new row.")
             
             master_df = load_master_suppliers()
@@ -974,14 +973,14 @@ with tab_batch:
                 master_df, 
                 num_rows="dynamic", 
                 use_container_width=True,
-                key="master_csv_editor"
+                key="master_excel_editor"
             )
             
-            if st.button("💾 Save Changes to Master CSV", type="primary"):
+            if st.button("💾 Save Changes to Master Excel Directly", type="primary"):
                 edited_master = edited_master.dropna(subset=['Original_Supplier_Name'])
                 edited_master = edited_master[edited_master['Original_Supplier_Name'].astype(str).str.strip() != '']
                 save_master_suppliers(edited_master)
-                st.success("Master CSV Rules Updated Successfully!")
+                st.success("Master Excel Rules Updated Successfully!")
                 time.sleep(1)
                 st.rerun()
 
