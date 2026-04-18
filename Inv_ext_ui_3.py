@@ -258,7 +258,7 @@ def setup_excel_workbook(custom_cols: List[str]):
     details_headers = [
         "File Name", "Page #", "Vendor Name", "Vendor Address", "Bill To", "Remit To",
         "Origin", "Destination", "Invoice Number", "Date", "Currency", 
-        "Material", "Description", "Quantity", "UOM", "Unit Price", "Line Total", "Subtotal", "Invoice Total",
+        "Material", "Description", "Line Origin", "Line Destination", "Quantity", "UOM", "Unit Price", "Line Total", "Subtotal", "Invoice Total",
         "Inv# Conf", "Origin Conf", "Dest Conf", "UOM Conf", "Total Conf", "Status", "Reason for Review"
     ]
     if custom_cols: details_headers.extend(custom_cols)
@@ -367,7 +367,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                         "Bill To": extracted_data.bill_to, "Remit To": extracted_data.remit_to,
                         "Origin": final_origin, "Destination": final_dest, 
                         "Invoice Number": extracted_data.invoice_number, "Date": extracted_data.date, "Currency": extracted_data.currency,
-                        "Material": material, "Description": desc,
+                        "Material": material, "Description": desc, "Line Origin": line_orig, "Line Destination": line_dest,
                         "Quantity": qty, "UOM": uom, "Unit Price": price, "Line Total": line_total,
                         "Subtotal": extracted_data.subtotal, "Invoice Total": extracted_data.total_amount,
                         "Inv# Conf": extracted_data.invoice_number_confidence, "Origin Conf": extracted_data.origin_confidence,
@@ -686,32 +686,35 @@ with tab_analytics:
     else:
         missing_flags = ['N/A', 'None', '', 'null', 'None']
         
-        # Calculate Duplicates & Routing Issues for KPIs
+        # Determine specific errors for KPIs and Charts
         valid_df = df_audit[~df_audit['invoice_number'].isin(['N/A', 'ERROR', '', None]) & ~df_audit['vendor_name'].isin(['N/A', 'ERROR'])]
         duplicates_df = valid_df[valid_df.duplicated(subset=['vendor_name', 'invoice_number'], keep='first')]
         
-        routing_issues_df = df_audit[
-            df_audit['origin'].isin(missing_flags) | df_audit['origin'].isna() |
-            df_audit['destination'].isin(missing_flags) | df_audit['destination'].isna()
-        ]
+        missing_origin_df = df_audit[df_audit['origin'].isin(missing_flags) | df_audit['origin'].isna()]
+        missing_dest_df = df_audit[df_audit['destination'].isin(missing_flags) | df_audit['destination'].isna()]
+        routing_issues_df = df_audit[df_audit['origin'].isin(missing_flags) | df_audit['origin'].isna() | df_audit['destination'].isin(missing_flags) | df_audit['destination'].isna()]
         
-        amount_mismatches = df_audit[df_audit['variance'] != 0.0]
+        amount_mismatches_df = df_audit[df_audit['variance'] != 0.0]
 
-        st.subheader("Invoice & Extraction Overview")
+        # Standard KPI Cards Restored
+        st.subheader("Invoice & Vendor Overview")
         col1, col2, col3, col4, col5 = st.columns(5)
         
         total_invoices = len(df_audit)
+        total_vendors = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])]['vendor_name'].nunique()
         total_spend = df_audit['extracted_total'].sum()
+        dup_count = len(duplicates_df)
+        dup_spend = duplicates_df['extracted_total'].sum()
 
         col1.metric("Total Invoices", f"{total_invoices:,}")
-        col2.metric("Total Spend", f"${total_spend / 1_000_000:,.2f}M")
-        col3.metric("Amount Mismatches", f"{len(amount_mismatches):,}", delta_color="inverse")
-        col4.metric("Missing Routing", f"{len(routing_issues_df):,}", delta_color="inverse")
-        col5.metric("Duplicates", f"{len(duplicates_df):,}", delta_color="inverse")
+        col2.metric("Total Unique Vendors", f"{total_vendors:,}")
+        col3.metric("Total Spend", f"${total_spend / 1_000_000:,.2f}M")
+        col4.metric("⚠️ Duplicates Found", f"{dup_count:,}", delta_color="inverse")
+        col5.metric("⚠️ Duplicate Value", f"${dup_spend / 1_000_000:,.2f}M", delta_color="inverse")
 
         st.divider()
 
-        # Graphs at the Top
+        # Graphs at Top
         st.subheader("📈 Financial Spend Over Time ($M)")
         df_audit['extraction_date_dt'] = pd.to_datetime(df_audit['extraction_date'])
         spend_time = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])].groupby('extraction_date')['extracted_total'].sum().reset_index()
@@ -741,6 +744,45 @@ with tab_analytics:
             fig_val = px.bar(vendor_value, x='Total Value (Millions)', y='Vendor', orientation='h', text_auto='.2f', color_discrete_sequence=['#9b59b6'])
             fig_val.update_layout(yaxis={'categoryorder':'total ascending'})
             st.plotly_chart(fig_val, use_container_width=True)
+            
+        st.divider()
+
+        # Three New Vendor Exception Graphs
+        st.subheader("⚠️ Vendor Exceptions & Missing Data Analysis")
+        err1, err2, err3 = st.columns(3)
+        
+        with err1:
+            st.markdown("**Vendors Missing Origin**")
+            if not missing_origin_df.empty:
+                mo_vendor = missing_origin_df['vendor_name'].value_counts().reset_index().head(10)
+                mo_vendor.columns = ['Vendor', 'Count']
+                fig_mo = px.bar(mo_vendor, x='Count', y='Vendor', orientation='h', text_auto=True, color_discrete_sequence=['#e74c3c'])
+                fig_mo.update_layout(yaxis={'categoryorder':'total ascending'}, height=300, margin=dict(l=0, r=0, t=30, b=0))
+                st.plotly_chart(fig_mo, use_container_width=True)
+            else:
+                st.success("No missing origins.")
+
+        with err2:
+            st.markdown("**Vendors Missing Destination**")
+            if not missing_dest_df.empty:
+                md_vendor = missing_dest_df['vendor_name'].value_counts().reset_index().head(10)
+                md_vendor.columns = ['Vendor', 'Count']
+                fig_md = px.bar(md_vendor, x='Count', y='Vendor', orientation='h', text_auto=True, color_discrete_sequence=['#e67e22'])
+                fig_md.update_layout(yaxis={'categoryorder':'total ascending'}, height=300, margin=dict(l=0, r=0, t=30, b=0))
+                st.plotly_chart(fig_md, use_container_width=True)
+            else:
+                st.success("No missing destinations.")
+
+        with err3:
+            st.markdown("**Vendors with Amount Mismatches**")
+            if not amount_mismatches_df.empty:
+                am_vendor = amount_mismatches_df['vendor_name'].value_counts().reset_index().head(10)
+                am_vendor.columns = ['Vendor', 'Count']
+                fig_am = px.bar(am_vendor, x='Count', y='Vendor', orientation='h', text_auto=True, color_discrete_sequence=['#f1c40f'])
+                fig_am.update_layout(yaxis={'categoryorder':'total ascending'}, height=300, margin=dict(l=0, r=0, t=30, b=0))
+                st.plotly_chart(fig_am, use_container_width=True)
+            else:
+                st.success("No math errors detected.")
 
         st.divider()
 
@@ -751,19 +793,19 @@ with tab_analytics:
             df_valid_routes['Corridor'] = df_valid_routes['origin'].astype(str) + " ➡️ " + df_valid_routes['destination'].astype(str)
             corridor_counts = df_valid_routes['Corridor'].value_counts().reset_index().head(10)
             corridor_counts.columns = ['Shipping Corridor', 'Volume']
-            fig_corridor = px.bar(corridor_counts, x='Volume', y='Shipping Corridor', orientation='h', text_auto=True, color_discrete_sequence=['#e67e22'])
+            fig_corridor = px.bar(corridor_counts, x='Volume', y='Shipping Corridor', orientation='h', text_auto=True, color_discrete_sequence=['#34495e'])
             fig_corridor.update_layout(yaxis={'categoryorder':'total ascending'})
             st.plotly_chart(fig_corridor, use_container_width=True)
         else:
             st.info("Not enough valid Origin & Destination pairs to map corridors.")
 
         st.divider()
-        
-        # Tables moved to Expanders at the bottom
-        st.subheader("📋 Raw Data & Exception Reports")
+
+        # Data Tables stored neatly in Expanders at the bottom
+        st.subheader("📋 Raw Data & Exception Tables")
         
         with st.expander("🚨 Routing Exception Report (Missing Data)", expanded=False):
-            st.write("Invoices missing Origin or Destination data:")
+            st.write("Invoices strictly missing Origin or Destination data:")
             if not routing_issues_df.empty:
                 review_cols = ['file_name', 'vendor_name', 'invoice_number', 'origin', 'destination', 'reason_for_review']
                 st.dataframe(routing_issues_df[review_cols], use_container_width=True, hide_index=True)
@@ -771,7 +813,7 @@ with tab_analytics:
                 st.success("All extracted invoices have complete Origin and Destination data.")
 
         with st.expander("📑 Duplicate Invoices Detected", expanded=False):
-            st.write("Invoices with the same Vendor Name and Invoice Number:")
+            st.write("Invoices sharing the same Vendor Name and Invoice Number:")
             if not duplicates_df.empty:
                 duplicates_df['extracted_total_M'] = duplicates_df['extracted_total'].apply(lambda x: f"${x/1_000_000:,.2f}M")
                 st.dataframe(duplicates_df[['vendor_name', 'invoice_number', 'file_name', 'extracted_total_M', 'extraction_date']], use_container_width=True, hide_index=True)
@@ -779,7 +821,7 @@ with tab_analytics:
                 st.success("No duplicate invoices detected in the master database.")
                 
         with st.expander("📍 Vendor Logistics Map", expanded=False):
-            st.write("Aggregated origins and destinations per vendor:")
+            st.write("Aggregated unique origins and destinations per vendor:")
             def get_unique_clean(series):
                 vals = [str(x) for x in series if pd.notna(x) and str(x) not in missing_flags]
                 return " | ".join(sorted(list(set(vals)))) if vals else "⚠️ Missing"
@@ -810,26 +852,30 @@ with tab_system:
         df_audit['Clean_Status'] = df_audit['status'].apply(lambda x: 'PASS' if x == 'PASS' else 'FAIL')
         df_audit['processing_time_min'] = df_audit['processing_time'] / 60.0
 
-        st.subheader("System Performance & Mathematical Accuracy")
+        st.subheader("System Performance & Accuracy Metrics")
         sys1, sys2, sys3, sys4, sys5, sys6 = st.columns(6)
         
         total_invoices = len(df_audit)
         total_pages = df_audit['page_count'].sum() if 'page_count' in df_audit.columns else 0
         avg_proc_time_min = df_audit['processing_time_min'].mean() if 'processing_time_min' in df_audit.columns else 0.0
-        time_per_page_min = (df_audit['processing_time_min'].sum() / total_pages) if total_pages > 0 else 0.0
         sys_error_rate = (df_audit['is_critical_error'].sum() / total_invoices) * 100 if total_invoices > 0 else 0
         
-        # Accuracy explicitly calculated ONLY on perfect math validation (variance == 0)
-        math_passed = len(df_audit[df_audit['variance'] == 0.0])
-        accuracy_rate = (math_passed / total_invoices) * 100 if total_invoices > 0 else 0
-        total_variance = df_audit['variance'].abs().sum()
+        # Calculate Pass/Fail Percentages (Overall System Review)
+        overall_pass = len(df_audit[df_audit['Clean_Status'] == 'PASS'])
+        overall_fail = len(df_audit[df_audit['Clean_Status'] == 'FAIL'])
+        overall_acc = (overall_pass / total_invoices) * 100 if total_invoices > 0 else 0
+        fail_pct = (overall_fail / total_invoices) * 100 if total_invoices > 0 else 0
+        
+        # Calculate Math Accuracy (Strictly on Variance, ignoring missing routing)
+        math_pass = len(df_audit[df_audit['variance'] == 0.0])
+        math_acc = (math_pass / total_invoices) * 100 if total_invoices > 0 else 0
 
         sys1.metric("Avg Proc Time", f"{avg_proc_time_min:.2f}m", "Per Doc")
-        sys2.metric("Proc Speed", f"{time_per_page_min:.2f}m", "Per Page")
-        sys3.metric("API Failure Rate", f"{sys_error_rate:.1f}%", delta_color="inverse")
-        sys4.metric("Pages Indexed", f"{total_pages:,}")
-        sys5.metric("Data Accuracy (Math)", f"{accuracy_rate:.1f}%")
-        sys6.metric("Math Variance", f"${total_variance:,.2f}", delta_color="inverse")
+        sys2.metric("API Failure Rate", f"{sys_error_rate:.1f}%", delta_color="inverse")
+        sys3.metric("Overall Accuracy", f"{overall_acc:.1f}%")
+        sys4.metric("Math Accuracy", f"{math_acc:.1f}%")
+        sys5.metric("% Pass", f"{overall_acc:.1f}%")
+        sys6.metric("% Fail", f"{fail_pct:.1f}%", delta_color="inverse")
 
         st.divider()
 
@@ -856,21 +902,21 @@ with tab_system:
             st.subheader("⚠️ Top Reasons for LLM Review")
             df_fails = df_audit[df_audit['Clean_Status'] == 'FAIL']
             if not df_fails.empty:
-                # Normalizing raw strings to full, meaningful sentences so the WordCloud doesn't fragment them
+                # Normalizing raw strings to full, meaningful sentences for clean WordCloud generation
                 reasons_series = df_fails['reason_for_review'].str.split(" | ").explode()
                 
                 normalized_reasons = []
                 for r in reasons_series:
                     r_str = str(r)
                     if "Math Variance" in r_str: normalized_reasons.append("Amount Mismatch")
-                    elif "Origin" in r_str: normalized_reasons.append("Origin Missing or Low Confidence")
-                    elif "Destination" in r_str: normalized_reasons.append("Destination Missing or Low Confidence")
+                    elif "Origin" in r_str: normalized_reasons.append("Origin Missing")
+                    elif "Destination" in r_str: normalized_reasons.append("Destination Missing")
                     elif "UOM" in r_str: normalized_reasons.append("UOM Missing or Low Confidence")
                     elif "Invoice #" in r_str: normalized_reasons.append("Invoice Number Issue")
                     elif "0 Line Items" in r_str: normalized_reasons.append("No Line Items Found")
                     else: normalized_reasons.append("General Extraction Issue")
                 
-                # We replace spaces with non-breaking spaces so WordCloud treats the full phrase as one block
+                # Replace spaces with non-breaking spaces so WordCloud treats the full phrase as one block
                 reason_counts = pd.Series(normalized_reasons).value_counts().to_dict()
                 phrase_counts = {k.replace(" ", "\xA0"): v for k, v in reason_counts.items()}
                 
