@@ -30,12 +30,12 @@ AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
 
 # ==============================================================
-# 0. Database & Excel Setup Functions
+# 0. Database & CSV Setup Functions
 # ==============================================================
 
 AUDIT_FOLDER = "audit"
 DB_PATH = os.path.join(AUDIT_FOLDER, "qc_master_database.sqlite")
-MASTER_EXCEL_PATH = os.path.join(AUDIT_FOLDER, "master_suppliers.xlsx")
+MASTER_CSV_PATH = os.path.join(AUDIT_FOLDER, "master_suppliers.csv")
 
 def init_db():
     os.makedirs(AUDIT_FOLDER, exist_ok=True)
@@ -91,20 +91,19 @@ def init_db():
     conn.commit()
     conn.close()
 
-# ---> UPDATED: Bulletproof Excel Loader <---
 def load_master_suppliers() -> pd.DataFrame:
-    if os.path.exists(MASTER_EXCEL_PATH):
+    if os.path.exists(MASTER_CSV_PATH):
         try:
-            df = pd.read_excel(MASTER_EXCEL_PATH, engine='openpyxl')
+            df = pd.read_csv(MASTER_CSV_PATH, encoding='utf-8-sig')
             if 'Original_Supplier_Name' in df.columns:
                 return df[['Original_Supplier_Name']].dropna()
         except Exception as e:
-            st.error(f"Error loading Master Excel: {e}")
+            st.error(f"Error loading Master CSV: {e}")
     
     return pd.DataFrame(columns=["Original_Supplier_Name"])
 
 def save_master_suppliers(df: pd.DataFrame):
-    df.to_excel(MASTER_EXCEL_PATH, index=False, engine='openpyxl')
+    df.to_csv(MASTER_CSV_PATH, index=False, encoding='utf-8-sig')
 
 def append_to_master(new_supplier: str):
     df = load_master_suppliers()
@@ -646,7 +645,7 @@ with st.sidebar:
     st.divider()
     
     st.header("📄 Batch Upload")
-    st.write("Upload your mixed batch of invoices here. The system will auto-map vendors via the Master Database.")
+    st.write("Upload your mixed batch of invoices here. The system will auto-map vendors via the Master CSV.")
     uploaded_files = st.file_uploader("Upload PDF Documents", type=["pdf"], accept_multiple_files=True)
 
 # Tabs
@@ -699,8 +698,9 @@ with tab_extract:
         st.subheader("🛡️ QC Summary")
         st.dataframe(pd.DataFrame(st.session_state.extraction_summary), use_container_width=True, hide_index=True)
 
+        # Legacy Download (Full Session State)
         st.download_button(
-            label="📥 Download Excel Report",
+            label="📥 Download Excel Report (Legacy View)",
             data=st.session_state.extraction_excel,
             file_name=f"Extraction_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -746,13 +746,14 @@ with tab_viewer:
 # ---------------------------------------------------------
 with tab_batch:
     st.header("✅ Current Batch QA")
-    st.write("Review the quality of the most recent extraction batch and execute AI Routing Suggestions.")
+    st.write("Review the extraction quality specifically for the batch you just processed.")
     
     df_audit = fetch_audit_data()
     
     if df_audit.empty:
         st.info("Process a batch of invoices to view current metrics.")
     else:
+        # Determine current batch scope
         if 'batch_id' in df_audit.columns and not df_audit['batch_id'].isna().all():
             latest_batch = df_audit['batch_id'].dropna().iloc[-1]
             batch_df = df_audit[df_audit['batch_id'] == latest_batch].copy()
@@ -767,6 +768,7 @@ with tab_batch:
         if vendor_col == 'original_supplier_name':
             batch_df['original_supplier_name'] = batch_df['original_supplier_name'].fillna(batch_df['vendor_name'].apply(standardize_vendor))
 
+        # KPI Calculations
         batch_invoices = len(batch_df)
         batch_vendors = batch_df[vendor_col].nunique()
         batch_spend_k = batch_df['extracted_total'].sum() / 1000.0
@@ -777,12 +779,58 @@ with tab_batch:
             all_duplicates = valid_df[valid_df.duplicated(subset=['vendor_name', 'invoice_number'], keep=False)]
             batch_dups = all_duplicates[all_duplicates['batch_id'] == latest_batch]
             batch_dup_count = len(batch_dups)
+            
+        # ---> NEW: Calculate Total Execution Time for the batch <---
+        total_time_sec = batch_df['processing_time'].sum() if 'processing_time' in batch_df.columns else 0.0
+        mins, secs = divmod(int(total_time_sec), 60)
         
-        bc1, bc2, bc3, bc4 = st.columns(4)
+        # Display 5 KPIs instead of 4
+        bc1, bc2, bc3, bc4, bc5 = st.columns(5)
         bc1.metric("Current Invoices Processed", f"{batch_invoices:,}")
         bc2.metric("Total Unique Vendors", f"{batch_vendors:,}")
         bc3.metric("Total Spend", f"${batch_spend_k:,.1f}K")
         bc4.metric("Duplicates Found", f"{batch_dup_count:,}", delta_color="inverse")
+        bc5.metric("Batch Execution Time", f"{mins}m {secs}s")
+
+        st.divider()
+        
+        # ---> NEW: Dynamic Excel Download for Current Batch <---
+        st.subheader("📥 Download Batch Data")
+        st.write("Download the raw QC database table specifically for this batch, including your clean supplier mappings.")
+        
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            cols = batch_df.columns.tolist()
+            # Bring original_supplier_name next to vendor_name for easier readability in Excel
+            if 'original_supplier_name' in cols and 'vendor_name' in cols:
+                cols.insert(cols.index('vendor_name') + 1, cols.pop(cols.index('original_supplier_name')))
+            
+            export_df = batch_df[cols]
+            export_df.to_excel(writer, index=False, sheet_name='Batch_Raw_QC_Data')
+        output.seek(0)
+        
+        st.download_button(
+            label="📥 Download Current Batch QC (Excel)",
+            data=output,
+            file_name=f"Batch_QC_{latest_batch or latest_date}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary"
+        )
+        
+        st.divider()
+        
+        # ---> NEW: Pass/Fail Status Overview Table <---
+        st.subheader("📄 Status Overview (Pass/Fail)")
+        st.write("Quickly identify which files passed and which need manual review.")
+        
+        status_df = batch_df[['file_name', 'invoice_number', 'vendor_name', 'original_supplier_name', 'status', 'reason_for_review']].copy()
+        # Add some color to make it easy to scan
+        def color_status(val):
+            color = '#2ecc71' if val == 'PASS' else '#e74c3c'
+            return f'color: {color}; font-weight: bold;'
+            
+        styled_status_df = status_df.style.applymap(color_status, subset=['status'])
+        st.dataframe(styled_status_df, use_container_width=True, hide_index=True)
 
         st.divider()
 
@@ -918,7 +966,7 @@ with tab_batch:
 
         st.divider()
         
-        with st.expander("📂 Master Supplier Database (Excel)", expanded=False):
+        with st.expander("📂 Master Supplier Database (CSV)", expanded=False):
             st.write("View, edit, or add official Supplier names directly in the table below. These act as the fuzzy match targets for future runs. Scroll to the bottom to add a new row.")
             
             master_df = load_master_suppliers()
@@ -927,14 +975,14 @@ with tab_batch:
                 master_df, 
                 num_rows="dynamic", 
                 use_container_width=True,
-                key="master_excel_editor"
+                key="master_csv_editor"
             )
             
-            if st.button("💾 Save Changes to Master Excel Directly", type="primary"):
+            if st.button("💾 Save Changes to Master CSV", type="primary"):
                 edited_master = edited_master.dropna(subset=['Original_Supplier_Name'])
                 edited_master = edited_master[edited_master['Original_Supplier_Name'].astype(str).str.strip() != '']
                 save_master_suppliers(edited_master)
-                st.success("Master Excel Rules Updated Successfully!")
+                st.success("Master CSV Rules Updated Successfully!")
                 time.sleep(1)
                 st.rerun()
 
