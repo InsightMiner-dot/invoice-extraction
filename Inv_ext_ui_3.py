@@ -12,7 +12,7 @@ from typing import List, Optional, Dict, Tuple
 import time
 import io
 from datetime import datetime
-import re  # Added for Vendor Standardization
+import re
 from dotenv import load_dotenv
 import pandas as pd
 import plotly.express as px
@@ -141,15 +141,13 @@ def wipe_master_db(user_name: str):
     conn.close()
     fetch_audit_data.clear()
 
-# ---> NEW: Vendor Standardization Logic <---
 def standardize_vendor(name):
-    """Strips capitalization, punctuation, and corporate suffixes to unify vendor names."""
     if not isinstance(name, str) or name in ['N/A', 'ERROR', '']:
         return name
     name = name.upper()
-    name = re.sub(r'[.,]', '', name) # Remove punctuation
-    name = re.sub(r'\b(LLC|INC|LTD|CORP|CORPORATION|CO|COMPANY)\b', '', name) # Remove suffixes
-    return re.sub(r'\s+', ' ', name).strip() # Remove double spaces
+    name = re.sub(r'[.,]', '', name)
+    name = re.sub(r'\b(LLC|INC|LTD|CORP|CORPORATION|CO|COMPANY)\b', '', name)
+    return re.sub(r'\s+', ' ', name).strip()
 
 init_db()
 
@@ -378,7 +376,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                         "Bill To": extracted_data.bill_to, "Remit To": extracted_data.remit_to,
                         "Origin": final_origin, "Destination": final_dest, 
                         "Invoice Number": extracted_data.invoice_number, "Date": extracted_data.date, "Currency": extracted_data.currency,
-                        "Material": material, "Description": desc,
+                        "Material": material, "Description": desc, 
                         "Quantity": qty, "UOM": uom, "Unit Price": price, "Line Total": line_total,
                         "Subtotal": extracted_data.subtotal, "Invoice Total": extracted_data.total_amount,
                         "Inv# Conf": extracted_data.invoice_number_confidence, "Origin Conf": extracted_data.origin_confidence,
@@ -695,21 +693,21 @@ with tab_analytics:
     if df_audit.empty:
         st.info("📭 No data available. Process some invoices in the Extraction Suite to generate analytics.")
     else:
-        # Standardize Vendor Names dynamically to fix naming inconsistencies 
+        # Standardize Vendor Names 
         df_audit['vendor_name'] = df_audit['vendor_name'].apply(standardize_vendor)
         missing_flags = ['N/A', 'None', '', 'null', 'None']
         
-        # Calculate Specific Errors for KPIs
+        # Calculate Base Exception Dataframes
         valid_df = df_audit[~df_audit['invoice_number'].isin(['N/A', 'ERROR', '', None]) & ~df_audit['vendor_name'].isin(['N/A', 'ERROR'])]
         duplicates_df = valid_df[valid_df.duplicated(subset=['vendor_name', 'invoice_number'], keep='first')]
-        
         missing_origin_df = df_audit[df_audit['origin'].isin(missing_flags) | df_audit['origin'].isna()]
         missing_dest_df = df_audit[df_audit['destination'].isin(missing_flags) | df_audit['destination'].isna()]
         routing_issues_df = df_audit[df_audit['origin'].isin(missing_flags) | df_audit['origin'].isna() | df_audit['destination'].isin(missing_flags) | df_audit['destination'].isna()]
         amount_mismatches_df = df_audit[df_audit['variance'] != 0.0]
 
-        # ALL 7 KPI CARDS RESTORED IN A 2-ROW LAYOUT
-        st.subheader("Invoice & Extraction Overview")
+        # 1. 5-Metric Unified KPI Row
+        st.subheader("Invoice Overview")
+        col1, col2, col3, col4, col5 = st.columns(5)
         
         total_invoices = len(df_audit)
         total_vendors = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])]['vendor_name'].nunique()
@@ -717,33 +715,46 @@ with tab_analytics:
         dup_count = len(duplicates_df)
         dup_spend = duplicates_df['extracted_total'].sum()
 
-        kpi_col1, kpi_col2, kpi_col3 = st.columns(3)
-        kpi_col1.metric("Total Invoices", f"{total_invoices:,}")
-        kpi_col2.metric("Total Unique Vendors", f"{total_vendors:,}")
-        kpi_col3.metric("Total Spend", f"${total_spend / 1_000_000:,.2f}M")
-        
-        st.write("") # Spacer
-        
-        kpi_col4, kpi_col5, kpi_col6, kpi_col7 = st.columns(4)
-        kpi_col4.metric("Amount Mismatches", f"{len(amount_mismatches_df):,}", delta_color="inverse")
-        kpi_col5.metric("Missing Routing", f"{len(routing_issues_df):,}", delta_color="inverse")
-        kpi_col6.metric("⚠️ Duplicates Found", f"{dup_count:,}", delta_color="inverse")
-        kpi_col7.metric("⚠️ Duplicate Value", f"${dup_spend / 1_000_000:,.2f}M", delta_color="inverse")
+        col1.metric("Total Invoices", f"{total_invoices:,}")
+        col2.metric("Total Unique Vendors", f"{total_vendors:,}")
+        col3.metric("Total Spend", f"${total_spend / 1_000_000:,.2f}M")
+        col4.metric("⚠️ Duplicates Found", f"{dup_count:,}", delta_color="inverse")
+        col5.metric("⚠️ Duplicate Value", f"${dup_spend / 1_000_000:,.2f}M", delta_color="inverse")
 
         st.divider()
 
-        # Graphs at Top
-        st.subheader("📈 Financial Spend Over Time ($M)")
-        df_audit['extraction_date_dt'] = pd.to_datetime(df_audit['extraction_date'])
-        spend_time = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])].groupby('extraction_date')['extracted_total'].sum().reset_index()
-        spend_time['extracted_total_M'] = spend_time['extracted_total'] / 1_000_000 
+        # 2. Filterable Vendor Exception Data
+        st.subheader("🔎 Vendor Exception Filter")
+        st.write("Select specific vendors to view their processing volume against missing data and math errors.")
         
-        fig_spend = px.line(spend_time, x='extraction_date', y='extracted_total_M', markers=True, color_discrete_sequence=['#3498db'])
-        fig_spend.update_layout(xaxis_title="Date", yaxis_title="Total Extracted (Millions)")
-        st.plotly_chart(fig_spend, use_container_width=True)
+        vendor_df = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])].copy()
+        vendor_df['missing_origin'] = vendor_df['origin'].isin(missing_flags) | vendor_df['origin'].isna()
+        vendor_df['missing_dest'] = vendor_df['destination'].isin(missing_flags) | vendor_df['destination'].isna()
+        vendor_df['amount_mismatch'] = vendor_df['variance'] != 0.0
+
+        vendor_summary = vendor_df.groupby('vendor_name').agg(
+            Total_Invoices=('id', 'count'),
+            Missing_Origin=('missing_origin', 'sum'),
+            Missing_Destination=('missing_dest', 'sum'),
+            Amount_Mismatch=('amount_mismatch', 'sum')
+        ).reset_index()
+        
+        vendor_summary.columns = ['Vendor Name', 'Total Invoices Processed', 'Missing Origin', 'Missing Destination', 'Amount Mismatch']
+        vendor_summary = vendor_summary.sort_values('Total Invoices Processed', ascending=False)
+        
+        all_vendors = vendor_summary['Vendor Name'].tolist()
+        selected_vendors = st.multiselect("Filter by Vendor(s):", options=all_vendors, default=[])
+        
+        if selected_vendors:
+            filtered_summary = vendor_summary[vendor_summary['Vendor Name'].isin(selected_vendors)]
+        else:
+            filtered_summary = vendor_summary
+            
+        st.dataframe(filtered_summary, use_container_width=True, hide_index=True)
 
         st.divider()
 
+        # 3. Top Vendor Charts
         c1, c2 = st.columns(2)
         with c1:
             st.subheader("Top Vendors by Invoice Volume")
@@ -765,7 +776,7 @@ with tab_analytics:
             
         st.divider()
 
-        # Three New Vendor Exception Graphs
+        # 4. Three Exception Bar Charts
         st.subheader("⚠️ Vendor Exceptions & Missing Data Analysis")
         err1, err2, err3 = st.columns(3)
         
@@ -804,6 +815,7 @@ with tab_analytics:
 
         st.divider()
 
+        # 5. Top Corridors
         st.subheader("📍 Top Shipping Corridors")
         df_valid_routes = df_audit[~df_audit['origin'].isin(missing_flags) & ~df_audit['destination'].isin(missing_flags)].copy()
         
@@ -819,7 +831,7 @@ with tab_analytics:
 
         st.divider()
 
-        # Data Tables stored neatly in Expanders at the bottom
+        # 6. Hidden Expanders
         st.subheader("📋 Raw Data & Exception Tables")
         
         with st.expander("🚨 Routing Exception Report (Missing Data)", expanded=False):
@@ -863,7 +875,6 @@ with tab_system:
     if df_audit.empty:
         st.info("📭 No data available. Process some invoices to track system drift.")
     else:
-        # Standardize Names here too so system drill-downs map correctly
         df_audit['vendor_name'] = df_audit['vendor_name'].apply(standardize_vendor)
         
         df_audit['extraction_date_dt'] = pd.to_datetime(df_audit['extraction_date'])
@@ -890,9 +901,9 @@ with tab_system:
         math_acc = (math_pass / total_invoices) * 100 if total_invoices > 0 else 0
 
         sys1.metric("Avg Proc Time", f"{avg_proc_time_min:.2f}m", "Per Doc")
-        sys2.metric("API Failure Rate", f"{sys_error_rate:.1f}%", delta_color="inverse")
-        sys3.metric("Overall Accuracy", f"{overall_acc:.1f}%")
-        sys4.metric("Math Accuracy", f"{math_acc:.1f}%")
+        sys2.metric("Proc Speed", f"{time_per_page_min:.2f}m", "Per Page")
+        sys3.metric("API Failure Rate", f"{sys_error_rate:.1f}%", delta_color="inverse")
+        sys4.metric("Data Accuracy (Math)", f"{math_acc:.1f}%")
         sys5.metric("% Pass", f"{overall_acc:.1f}%")
         sys6.metric("% Fail", f"{fail_pct:.1f}%", delta_color="inverse")
 
@@ -921,7 +932,6 @@ with tab_system:
             st.subheader("⚠️ Top Reasons for LLM Review")
             df_fails = df_audit[df_audit['Clean_Status'] == 'FAIL']
             if not df_fails.empty:
-                # Normalizing raw strings to full, meaningful sentences for clean WordCloud generation
                 reasons_series = df_fails['reason_for_review'].str.split(" | ").explode()
                 
                 normalized_reasons = []
@@ -935,7 +945,6 @@ with tab_system:
                     elif "0 Line Items" in r_str: normalized_reasons.append("No Line Items Found")
                     else: normalized_reasons.append("General Extraction Issue")
                 
-                # Replace spaces with non-breaking spaces so WordCloud treats the full phrase as one block
                 reason_counts = pd.Series(normalized_reasons).value_counts().to_dict()
                 phrase_counts = {k.replace(" ", "\xA0"): v for k, v in reason_counts.items()}
                 
