@@ -16,6 +16,7 @@ import re
 from dotenv import load_dotenv
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go  # <--- FIXED: Added missing import here
 from wordcloud import WordCloud
 import matplotlib.pyplot as plt
 
@@ -707,8 +708,10 @@ with tab_analytics:
         duplicates_df = valid_df[valid_df.duplicated(subset=['vendor_name', 'invoice_number'], keep='first')]
         amount_mismatches_df = df_audit[df_audit['variance'] != 0.0]
         routing_issues_df = df_audit[df_audit['origin'].isin(missing_flags) | df_audit['origin'].isna() | df_audit['destination'].isin(missing_flags) | df_audit['destination'].isna()]
+        missing_origin_df = df_audit[df_audit['origin'].isin(missing_flags) | df_audit['origin'].isna()]
+        missing_dest_df = df_audit[df_audit['destination'].isin(missing_flags) | df_audit['destination'].isna()]
 
-        # 1. KPIs (Restored and Unified)
+        # 1. KPIs
         st.subheader("Invoice & Vendor Overview")
         col1, col2, col3, col4, col5 = st.columns(5)
         
@@ -726,7 +729,57 @@ with tab_analytics:
 
         st.divider()
 
-        # 2. Filterable Vendor Exception Data
+        # 2. Quality Scatter & Box Plot
+        st.subheader("🎯 Extraction Quality & Outlier Detection")
+        st.write("Identifies severe mathematical anomalies where the LLM's extracted total deviates wildly from the raw line items.")
+        
+        c1, c2 = st.columns(2)
+        with c1:
+            fig_scatter = px.scatter(
+                df_audit[df_audit['status'] != 'FAIL - CRITICAL ERROR'], 
+                x='calculated_sum', y='extracted_total', 
+                color='vendor_name', hover_data=['file_name', 'variance'],
+                title="Math Validity: Expected vs. Extracted Total"
+            )
+            max_val = max(df_audit['calculated_sum'].max(), df_audit['extracted_total'].max())
+            fig_scatter.add_trace(go.Scatter(x=[0, max_val], y=[0, max_val], mode='lines', line=dict(color='black', dash='dash'), name='Perfect Match'))
+            fig_scatter.update_layout(xaxis_title="Calculated Sum (Items + Tax + Fees)", yaxis_title="Extracted Total")
+            st.plotly_chart(fig_scatter, use_container_width=True)
+            
+        with c2:
+            if not amount_mismatches_df.empty:
+                fig_box = px.box(
+                    amount_mismatches_df, x='vendor_name', y='variance', 
+                    title="Variance Range by Vendor (Identifies erratic extraction)",
+                    color_discrete_sequence=['#e74c3c']
+                )
+                fig_box.update_layout(xaxis_title="Vendor", yaxis_title="Variance Magnitude ($)")
+                st.plotly_chart(fig_box, use_container_width=True)
+            else:
+                st.success("No math variance detected across vendors.")
+
+        st.divider()
+        
+        # 3. Document Complexity Impact
+        st.subheader("📄 Document Complexity Impact")
+        st.write("Analyzes if longer documents lead to a higher failure rate in data extraction.")
+        
+        if 'page_count' in df_audit.columns:
+            df_audit['Clean_Status'] = df_audit['status'].apply(lambda x: 'PASS' if x == 'PASS' else 'FAIL')
+            complexity_df = df_audit.groupby(['page_count', 'Clean_Status']).size().reset_index(name='count')
+            
+            fig_complex = px.bar(
+                complexity_df, x='page_count', y='count', color='Clean_Status', 
+                barmode='stack', color_discrete_map={'PASS': '#2ecc71', 'FAIL': '#e74c3c'}
+            )
+            fig_complex.update_layout(xaxis_title="Number of Pages in Document", yaxis_title="Number of Invoices")
+            st.plotly_chart(fig_complex, use_container_width=True)
+        else:
+            st.info("Page count analytics will populate on new extractions.")
+            
+        st.divider()
+
+        # 4. Filterable Vendor Routing & Exception Breakdown
         st.subheader("🔎 Vendor Routing & Exception Breakdown")
         st.write("Filter to see a detailed routing scorecard and math error count by vendor.")
         
@@ -734,8 +787,10 @@ with tab_analytics:
         
         vendor_df['missing_origin'] = vendor_df['origin'].isin(missing_flags) | vendor_df['origin'].isna()
         vendor_df['valid_origin'] = ~vendor_df['missing_origin']
+        
         vendor_df['missing_dest'] = vendor_df['destination'].isin(missing_flags) | vendor_df['destination'].isna()
         vendor_df['valid_dest'] = ~vendor_df['missing_dest']
+        
         vendor_df['amount_mismatch'] = vendor_df['variance'] != 0.0
 
         vendor_summary = vendor_df.groupby('vendor_name').agg(
@@ -767,40 +822,9 @@ with tab_analytics:
 
         st.divider()
 
-        # 3. Quality Scatter & Box Plot
-        st.subheader("🎯 Extraction Quality & Outlier Detection")
-        st.write("Identifies severe mathematical anomalies where the LLM's extracted total deviates wildly from the raw line items.")
-        
+        # 5. Top Vendor Charts
         c1, c2 = st.columns(2)
         with c1:
-            fig_scatter = px.scatter(
-                df_audit[df_audit['status'] != 'FAIL - CRITICAL ERROR'], 
-                x='calculated_sum', y='extracted_total', 
-                color='vendor_name', hover_data=['file_name', 'variance'],
-                title="Math Validity: Expected vs. Extracted Total"
-            )
-            max_val = max(df_audit['calculated_sum'].max(), df_audit['extracted_total'].max())
-            fig_scatter.add_trace(go.Scatter(x=[0, max_val], y=[0, max_val], mode='lines', line=dict(color='black', dash='dash'), name='Perfect Match'))
-            fig_scatter.update_layout(xaxis_title="Calculated Sum (Items + Tax + Fees)", yaxis_title="Extracted Total")
-            st.plotly_chart(fig_scatter, use_container_width=True)
-            
-        with c2:
-            if not amount_mismatches_df.empty:
-                fig_box = px.box(
-                    amount_mismatches_df, x='vendor_name', y='variance', 
-                    title="Variance Range by Vendor",
-                    color_discrete_sequence=['#e74c3c']
-                )
-                fig_box.update_layout(xaxis_title="Vendor", yaxis_title="Variance Magnitude ($)")
-                st.plotly_chart(fig_box, use_container_width=True)
-            else:
-                st.success("No math variance detected across vendors.")
-
-        st.divider()
-
-        # 4. Top Vendor Charts
-        c3, c4 = st.columns(2)
-        with c3:
             st.subheader("Top Vendors by Invoice Volume")
             vendor_counts = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])]['vendor_name'].value_counts().reset_index().head(10)
             vendor_counts.columns = ['Vendor', 'Invoice Count']
@@ -808,7 +832,7 @@ with tab_analytics:
             fig_bar.update_layout(yaxis={'categoryorder':'total ascending'})
             st.plotly_chart(fig_bar, use_container_width=True)
 
-        with c4:
+        with c2:
             st.subheader("Top Vendors by Financial Value ($M)")
             vendor_value = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])].groupby('vendor_name')['extracted_total'].sum().reset_index()
             vendor_value['extracted_total_M'] = vendor_value['extracted_total'] / 1_000_000
@@ -819,11 +843,9 @@ with tab_analytics:
             st.plotly_chart(fig_val, use_container_width=True)
             
         st.divider()
-
-        # 5. Three Exception Bar Charts
+        
+        # 6. Exception Bar Charts
         st.subheader("⚠️ Vendor Exceptions & Missing Data Analysis")
-        missing_origin_df = df_audit[df_audit['origin'].isin(missing_flags) | df_audit['origin'].isna()]
-        missing_dest_df = df_audit[df_audit['destination'].isin(missing_flags) | df_audit['destination'].isna()]
         
         err1, err2, err3 = st.columns(3)
         with err1:
@@ -858,22 +880,6 @@ with tab_analytics:
                 st.plotly_chart(fig_am, use_container_width=True)
             else:
                 st.success("No math errors detected.")
-
-        st.divider()
-
-        # 6. Top Corridors
-        st.subheader("📍 Top Shipping Corridors")
-        df_valid_routes = df_audit[~df_audit['origin'].isin(missing_flags) & ~df_audit['destination'].isin(missing_flags)].copy()
-        
-        if not df_valid_routes.empty:
-            df_valid_routes['Corridor'] = df_valid_routes['origin'].astype(str) + " ➡️ " + df_valid_routes['destination'].astype(str)
-            corridor_counts = df_valid_routes['Corridor'].value_counts().reset_index().head(10)
-            corridor_counts.columns = ['Shipping Corridor', 'Volume']
-            fig_corridor = px.bar(corridor_counts, x='Volume', y='Shipping Corridor', orientation='h', text_auto=True, color_discrete_sequence=['#34495e'])
-            fig_corridor.update_layout(yaxis={'categoryorder':'total ascending'})
-            st.plotly_chart(fig_corridor, use_container_width=True)
-        else:
-            st.info("Not enough valid Origin & Destination pairs to map corridors.")
 
         st.divider()
 
@@ -1013,17 +1019,27 @@ with tab_system:
                 st.success("No failures to analyze.")
 
         with c4:
-            st.subheader("📄 Document Complexity Impact")
-            df_audit['Clean_Status'] = df_audit['status'].apply(lambda x: 'PASS' if x == 'PASS' else 'FAIL')
-            complexity_df = df_audit.groupby(['page_count', 'Clean_Status']).size().reset_index(name='count')
+            st.subheader("💸 Absolute Variance Magnitude by Vendor")
+            var_vendor = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])].groupby('vendor_name')['variance'].apply(lambda x: x.abs().sum()).reset_index()
+            var_vendor = var_vendor[var_vendor['variance'] > 0].sort_values(by='variance', ascending=False).head(10)
+            if not var_vendor.empty:
+                fig_var_vendor = px.bar(var_vendor, x='variance', y='vendor_name', orientation='h', text_auto=True, color_discrete_sequence=['#e74c3c'])
+                fig_var_vendor.update_layout(yaxis={'categoryorder':'total ascending'})
+                st.plotly_chart(fig_var_vendor, use_container_width=True)
+            else:
+                st.success("No variance detected across any vendors.")
+                
+        st.divider()
             
-            fig_complex = px.bar(
-                complexity_df, x='page_count', y='count', color='Clean_Status', 
-                barmode='stack', color_discrete_map={'PASS': '#2ecc71', 'FAIL': '#e74c3c'},
-                title="Page Count vs. Failure Rate"
-            )
-            fig_complex.update_layout(xaxis_title="Number of Pages in Document", yaxis_title="Number of Invoices")
-            st.plotly_chart(fig_complex, use_container_width=True)
+        st.subheader("⚙️ Database Management")
+        st.write("Use these controls to maintain system health and clear test data.")
+        col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 2])
+        with col_btn1:
+            if st.button("🗑️ Remove Duplicates", use_container_width=True):
+                dialog_remove_duplicates()
+        with col_btn2:
+            if st.button("⚠️ Wipe Database", type="secondary", use_container_width=True):
+                dialog_wipe_db()
 
 # ---------------------------------------------------------
 # TAB 5: CURRENT BATCH QA & SUPPLIER MAPPING
@@ -1084,16 +1100,13 @@ with tab_batch:
 
         st.divider()
         
-        # ---> NEW: Historical HitL Suggestion Engine <---
         st.subheader("2. AI Routing Suggestions (HitL Framework)")
         st.write("Scan the Master Database to suggest the Top 5 most frequent historical routes for invoices missing data.")
         
         if st.button("⚙️ Generate Top 5 Historical Suggestions"):
-            # 1. Get all valid historical data for frequency counting
             valid_origins = df_audit[~df_audit['origin'].isin(missing_flags) & df_audit['origin'].notna()]
             valid_dests = df_audit[~df_audit['destination'].isin(missing_flags) & df_audit['destination'].notna()]
             
-            # 2. Pre-calculate Top 5 Origins per supplier
             orig_counts = valid_origins.groupby(['clean_supplier', 'origin']).size().reset_index(name='count')
             orig_counts = orig_counts.sort_values(['clean_supplier', 'count'], ascending=[True, False])
             top_origins = orig_counts.groupby('clean_supplier').head(5)
@@ -1103,7 +1116,6 @@ with tab_batch:
                 suggs = [f"{idx+1}. {row['origin']} (x{row['count']})" for idx, row in enumerate(group.to_dict('records'))]
                 orig_dict[supp] = " | ".join(suggs)
                 
-            # 3. Pre-calculate Top 5 Destinations per supplier
             dest_counts = valid_dests.groupby(['clean_supplier', 'destination']).size().reset_index(name='count')
             dest_counts = dest_counts.sort_values(['clean_supplier', 'count'], ascending=[True, False])
             top_dests = dest_counts.groupby('clean_supplier').head(5)
@@ -1113,7 +1125,6 @@ with tab_batch:
                 suggs = [f"{idx+1}. {row['destination']} (x{row['count']})" for idx, row in enumerate(group.to_dict('records'))]
                 dest_dict[supp] = " | ".join(suggs)
             
-            # 4. Update the missing records in the database with the Top 5 strings
             for idx, row in batch_routing_issues.iterrows():
                 supp = row['clean_supplier'] if pd.notna(row['clean_supplier']) else standardize_vendor(row['vendor_name'])
                 sug_orig = orig_dict.get(supp, "No historical data")
@@ -1125,7 +1136,6 @@ with tab_batch:
             
         st.write("Review the Top 5 historical suggestions below and type your final choice into the Approved column.")
         
-        # Refresh data to get the new suggestions
         current_db = fetch_audit_data()
         current_batch_issues = current_db[(current_db['extraction_date'] == latest_date) & (
             current_db['origin'].isin(missing_flags) | current_db['origin'].isna() |
@@ -1154,7 +1164,6 @@ with tab_batch:
             
             if st.button("💾 Save Approved Routes to DB", type="primary"):
                 for index, row in edited_routes.iterrows():
-                    # Only update if the user actually typed something into the final columns
                     if pd.notna(row['final_origin']) or pd.notna(row['final_destination']):
                         f_orig = row['final_origin'] if pd.notna(row['final_origin']) else None
                         f_dest = row['final_destination'] if pd.notna(row['final_destination']) else None
