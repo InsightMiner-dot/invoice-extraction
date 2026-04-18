@@ -35,7 +35,6 @@ def init_db():
     os.makedirs(AUDIT_FOLDER, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    # Main Extraction Table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS qc_audit (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -56,7 +55,6 @@ def init_db():
         )
     ''')
     
-    # Audit Log for Database Deletions
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS deletion_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -102,7 +100,6 @@ def remove_duplicates_db(user_name: str):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # Count how many will be deleted
     cursor.execute('''
         SELECT COUNT(*) FROM qc_audit 
         WHERE id NOT IN (SELECT MIN(id) FROM qc_audit GROUP BY vendor_name, invoice_number)
@@ -110,7 +107,6 @@ def remove_duplicates_db(user_name: str):
     ''')
     count = cursor.fetchone()[0]
     
-    # Keep the lowest ID (oldest) for each Vendor+Invoice pair, delete the rest
     cursor.execute('''
         DELETE FROM qc_audit
         WHERE id NOT IN (
@@ -145,7 +141,7 @@ def wipe_master_db(user_name: str):
 init_db()
 
 # ==============================================================
-# 1. Define Data Schema (ROLLED BACK TO HYPER-AGGRESSIVE ANTI-LAZINESS)
+# 1. Define Data Schema 
 # ==============================================================
 
 class LineItem(BaseModel):
@@ -158,7 +154,6 @@ class LineItem(BaseModel):
     unit_price: Optional[float] = Field(None, description="Price of a single unit")
     line_total: Optional[float] = Field(None, description="Total cost for this specific line item. Look for 'Amount', 'Total', 'Extended Price', or 'Extd Price'. STRICT RULE: If the column is blank (e.g., due to a backordered item), leave this null or 0.0. Do not guess.")
     
-    # ---> THE FIX: Hyper-Aggressive Anti-Laziness Prompts <---
     line_origin: Optional[str] = Field(
         None, 
         description="CRITICAL ANTI-LAZINESS RULE: You MUST read the exact Origin/Ship-From address printed for THIS specific row. DO NOT copy or repeat the value from the row above. Every single row is unique. Look closely at the image for this exact line. If it is blank for this specific row, you MUST leave it null."
@@ -261,8 +256,7 @@ def setup_excel_workbook(custom_cols: List[str]):
     details_headers = [
         "File Name", "Page #", "Vendor Name", "Vendor Address", "Bill To", "Remit To",
         "Origin", "Destination", "Invoice Number", "Date", "Currency", 
-        "Material", "Description", "Line Origin", "Line Destination",
-        "Quantity", "UOM", "Unit Price", "Line Total", "Subtotal", "Invoice Total",
+        "Material", "Description", "Line Origin", "Line Destination", "Quantity", "UOM", "Unit Price", "Line Total", "Subtotal", "Invoice Total",
         "Inv# Conf", "Origin Conf", "Dest Conf", "UOM Conf", "Total Conf", "Status", "Reason for Review"
     ]
     if custom_cols: details_headers.extend(custom_cols)
@@ -669,9 +663,7 @@ with tab_analytics:
         st.info("📭 No data available. Process some invoices in the Extraction Suite to generate analytics.")
     else:
         missing_flags = ['N/A', 'None', '', 'null', 'None']
-        df_audit['is_origin_missing'] = df_audit['origin'].isin(missing_flags) | df_audit['origin'].isna()
-        df_audit['is_dest_missing'] = df_audit['destination'].isin(missing_flags) | df_audit['destination'].isna()
-
+        
         st.subheader("Invoice & Vendor Overview")
         
         # Calculate Duplicates (Vendor Name + Invoice Number)
@@ -687,72 +679,96 @@ with tab_analytics:
 
         col1.metric("Total Invoices", f"{total_invoices:,}")
         col2.metric("Total Unique Vendors", f"{total_vendors:,}")
-        col3.metric("Total Spend Processed", f"${total_spend:,.2f}")
+        col3.metric("Total Spend", f"${total_spend:,.2f}")
         col4.metric("⚠️ Duplicates Found", f"{dup_count:,}", delta_color="inverse")
         col5.metric("⚠️ Duplicate Value", f"${dup_spend:,.2f}", delta_color="inverse")
 
         st.divider()
 
-        st.subheader("📈 Financial Spend Over Time")
-        df_audit['extraction_date_dt'] = pd.to_datetime(df_audit['extraction_date'])
-        spend_time = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])].groupby('extraction_date')['extracted_total'].sum().reset_index()
-        fig_spend = px.line(spend_time, x='extraction_date', y='extracted_total', markers=True, title='Total Value Extracted per Day ($)')
-        fig_spend.update_layout(xaxis_title="Date", yaxis_title="Total Extracted ($)")
-        st.plotly_chart(fig_spend, use_container_width=True)
+        # ---> NEW: Routing Exception Report <---
+        st.subheader("🚨 Routing Exception Report")
+        st.write("Identifies specific invoices where the Origin or Destination is missing, allowing you to easily locate and review the source files in the Document Viewer.")
+        
+        # Filter for rows where origin or destination is missing
+        routing_issues_df = df_audit[
+            df_audit['origin'].isin(missing_flags) | df_audit['origin'].isna() |
+            df_audit['destination'].isin(missing_flags) | df_audit['destination'].isna()
+        ]
+        
+        if not routing_issues_df.empty:
+            review_cols = ['file_name', 'vendor_name', 'invoice_number', 'origin', 'destination', 'reason_for_review']
+            st.dataframe(routing_issues_df[review_cols], use_container_width=True, hide_index=True)
+        else:
+            st.success("Excellent! All extracted invoices have complete Origin and Destination data.")
+
+        st.divider()
+
+        st.subheader("🔍 Deep Vendor Insights (Reliability Matrix)")
+        st.write("Evaluates vendors based on their ability to provide valid Origins, Destinations, and accurate mathematical totals.")
+        
+        vr_df = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])].copy()
+        vr_df['origin_pass'] = ~vr_df['origin'].isin(missing_flags)
+        vr_df['dest_pass'] = ~vr_df['destination'].isin(missing_flags)
+        vr_df['math_pass'] = vr_df['variance'] == 0.0
+        
+        vendor_rel = vr_df.groupby('vendor_name').agg(
+            Volume=('id', 'count'),
+            Origin_Extracted=('origin_pass', 'mean'),
+            Dest_Extracted=('dest_pass', 'mean'),
+            Math_Accuracy=('math_pass', 'mean')
+        ).reset_index()
+        
+        for col in ['Origin_Extracted', 'Dest_Extracted', 'Math_Accuracy']:
+            vendor_rel[col] = (vendor_rel[col] * 100).round(1).astype(str) + '%'
+            
+        vendor_rel = vendor_rel.sort_values('Volume', ascending=False)
+        st.dataframe(vendor_rel, use_container_width=True, hide_index=True)
 
         st.divider()
 
         c1, c2 = st.columns(2)
         with c1:
-            st.subheader("Top Vendors by Invoice Volume")
-            vendor_counts = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])]['vendor_name'].value_counts().reset_index().head(10)
-            vendor_counts.columns = ['Vendor', 'Invoice Count']
-            fig_bar = px.bar(vendor_counts, x='Invoice Count', y='Vendor', orientation='h', color='Invoice Count', color_continuous_scale='Blues')
-            fig_bar.update_layout(yaxis={'categoryorder':'total ascending'})
-            st.plotly_chart(fig_bar, use_container_width=True)
+            st.subheader("Pareto Analysis (Vendor Spend)")
+            vendor_spend = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])].groupby('vendor_name')['extracted_total'].sum().sort_values(ascending=False).reset_index()
+            vendor_spend['Cumulative %'] = (vendor_spend['extracted_total'].cumsum() / vendor_spend['extracted_total'].sum()) * 100
+            
+            fig_pareto = px.bar(vendor_spend.head(20), x='vendor_name', y='extracted_total', title='Top 20 Vendors by Spend')
+            fig_pareto.add_scatter(x=vendor_spend['vendor_name'].head(20), y=vendor_spend['Cumulative %'].head(20), mode='lines+markers', yaxis='y2', name='Cumulative %', line=dict(color='red'))
+            fig_pareto.update_layout(yaxis2=dict(overlaying='y', side='right', range=[0, 100], title='Cumulative Percentage (%)'), xaxis_title="Vendor")
+            st.plotly_chart(fig_pareto, use_container_width=True)
 
         with c2:
-            st.subheader("Top Vendors by Financial Value")
-            vendor_value = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])].groupby('vendor_name')['extracted_total'].sum().reset_index()
-            vendor_value = vendor_value.sort_values(by='extracted_total', ascending=False).head(10)
-            vendor_value.columns = ['Vendor', 'Total Value ($)']
-            fig_val = px.bar(vendor_value, x='Total Value ($)', y='Vendor', orientation='h', color='Total Value ($)', color_continuous_scale='Greens')
-            fig_val.update_layout(yaxis={'categoryorder':'total ascending'})
-            st.plotly_chart(fig_val, use_container_width=True)
+            st.subheader("Invoice Value Distribution")
+            valid_spend = df_audit[df_audit['extracted_total'] > 0]
+            if not valid_spend.empty:
+                fig_hist = px.histogram(valid_spend, x='extracted_total', nbins=20, title='Distribution of Invoice Amounts ($)', color_discrete_sequence=['#2ecc71'])
+                fig_hist.update_layout(xaxis_title="Invoice Amount ($)", yaxis_title="Count")
+                st.plotly_chart(fig_hist, use_container_width=True)
+            else:
+                st.info("Not enough spend data for distribution.")
 
         st.divider()
 
-        st.subheader("📍 Vendor Logistics Map (Origin & Destination)")
+        st.subheader("📍 Top Shipping Corridors")
+        df_valid_routes = df_audit[~df_audit['origin'].isin(missing_flags) & ~df_audit['destination'].isin(missing_flags)].copy()
         
-        def get_unique_clean(series):
-            vals = [str(x) for x in series if pd.notna(x) and str(x) not in missing_flags]
-            return " | ".join(sorted(list(set(vals)))) if vals else "⚠️ Missing"
-
-        df_routes = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])]
-        vendor_routes = df_routes.groupby('vendor_name').agg({
-            'id': 'count', 'origin': get_unique_clean, 'destination': get_unique_clean
-        }).reset_index().rename(columns={
-            'vendor_name': 'Vendor Name', 'id': 'Invoice Count', 'origin': 'Unique Origins', 'destination': 'Unique Destinations'
-        }).sort_values(by='Invoice Count', ascending=False)
-        
-        st.dataframe(vendor_routes, use_container_width=True, hide_index=True)
-        
+        if not df_valid_routes.empty:
+            df_valid_routes['Corridor'] = df_valid_routes['origin'].astype(str) + " ➡️ " + df_valid_routes['destination'].astype(str)
+            corridor_counts = df_valid_routes['Corridor'].value_counts().reset_index().head(10)
+            corridor_counts.columns = ['Shipping Corridor', 'Volume']
+            fig_corridor = px.bar(corridor_counts, x='Volume', y='Shipping Corridor', orientation='h', color='Volume', color_continuous_scale='Purples')
+            fig_corridor.update_layout(yaxis={'categoryorder':'total ascending'})
+            st.plotly_chart(fig_corridor, use_container_width=True)
+        else:
+            st.info("Not enough valid Origin & Destination pairs to map corridors.")
+            
         st.divider()
         
         st.subheader("📑 Duplicate Invoices Detected")
         if not duplicates_df.empty:
-            st.dataframe(duplicates_df[['vendor_name', 'invoice_number', 'file_name', 'extracted_total']], use_container_width=True, hide_index=True)
+            st.dataframe(duplicates_df[['vendor_name', 'invoice_number', 'file_name', 'extracted_total', 'extraction_date']], use_container_width=True, hide_index=True)
         else:
             st.success("No duplicate invoices detected in the master database.")
-            
-        st.subheader("⚙️ Database Management")
-        col_btn1, col_btn2 = st.columns(2)
-        with col_btn1:
-            if st.button("🗑️ Remove Duplicates", use_container_width=True):
-                dialog_remove_duplicates()
-        with col_btn2:
-            if st.button("⚠️ Clean Master Database", type="secondary", use_container_width=True):
-                dialog_wipe_db()
 
 # ---------------------------------------------------------
 # TAB 4: SYSTEM & DRIFT ANALYSIS
@@ -764,6 +780,7 @@ with tab_system:
     if df_audit.empty:
         st.info("📭 No data available. Process some invoices to track system drift.")
     else:
+        df_audit['extraction_date_dt'] = pd.to_datetime(df_audit['extraction_date'])
         df_audit['datetime'] = pd.to_datetime(df_audit['extraction_date'] + ' ' + df_audit['extraction_time'])
         df_audit = df_audit.sort_values('datetime')
         df_audit['is_critical_error'] = df_audit['status'].str.contains("CRITICAL ERROR", na=False)
@@ -800,38 +817,22 @@ with tab_system:
             st.plotly_chart(fig_speed, use_container_width=True)
 
         with s2:
-            st.subheader("Mathematical Hallucination Drift")
-            df_variance = df_audit[df_audit['variance'] != 0.0].copy()
-            if not df_variance.empty:
-                df_variance['Absolute_Variance'] = df_variance['variance'].abs()
-                fig_var = px.scatter(df_variance, x='datetime', y='Absolute_Variance', color='Absolute_Variance', size='Absolute_Variance', title='Magnitude of Math Errors Over Time')
-                fig_var.update_layout(xaxis_title="Time", yaxis_title="Variance Magnitude ($)")
-                st.plotly_chart(fig_var, use_container_width=True)
-            else:
-                st.success("No mathematical drift detected. Model math is perfect.")
+            st.subheader("Processing Volume by Day of Week")
+            df_audit['day_of_week'] = df_audit['extraction_date_dt'].dt.day_name()
+            day_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+            dow_counts = df_audit['day_of_week'].value_counts().reindex(day_order).reset_index()
+            dow_counts.columns = ['Day', 'Volume']
+            fig_dow = px.bar(dow_counts, x='Day', y='Volume', color='Volume', color_continuous_scale='Teals')
+            st.plotly_chart(fig_dow, use_container_width=True)
                 
         st.divider()
-
-        c3, c4 = st.columns(2)
-        with c3:
-            st.subheader("⚠️ Top Reasons for LLM Review")
-            df_fails = df_audit[df_audit['Clean_Status'] == 'FAIL']
-            if not df_fails.empty:
-                reasons_series = df_fails['reason_for_review'].str.split(" | ").explode()
-                reason_counts = reasons_series.value_counts().reset_index().head(10)
-                reason_counts.columns = ['Reason', 'Frequency']
-                fig_err = px.bar(reason_counts, x='Reason', y='Frequency', color='Frequency', color_continuous_scale='Oranges')
-                st.plotly_chart(fig_err, use_container_width=True)
-            else:
-                st.success("No failures to analyze.")
-
-        with c4:
-            st.subheader("💸 Absolute Variance Magnitude by Vendor")
-            var_vendor = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])].groupby('vendor_name')['variance'].apply(lambda x: x.abs().sum()).reset_index()
-            var_vendor = var_vendor[var_vendor['variance'] > 0].sort_values(by='variance', ascending=False).head(10)
-            if not var_vendor.empty:
-                fig_var_vendor = px.bar(var_vendor, x='variance', y='vendor_name', orientation='h', color='variance', color_continuous_scale='Reds')
-                fig_var_vendor.update_layout(yaxis={'categoryorder':'total ascending'})
-                st.plotly_chart(fig_var_vendor, use_container_width=True)
-            else:
-                st.success("No variance detected across any vendors.")
+            
+        st.subheader("⚙️ Database Management")
+        st.write("Use these controls to maintain system health and clear test data.")
+        col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 2])
+        with col_btn1:
+            if st.button("🗑️ Remove Duplicates", use_container_width=True):
+                dialog_remove_duplicates()
+        with col_btn2:
+            if st.button("⚠️ Wipe Database", type="secondary", use_container_width=True):
+                dialog_wipe_db()
