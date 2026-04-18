@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 # ==============================================================
-# 1. Define Data Schema 
+# 1. Define Data Schema (UPDATED FOR INLINE ORIGIN/DESTINATION)
 # ==============================================================
 
 class LineItem(BaseModel):
@@ -25,6 +25,10 @@ class LineItem(BaseModel):
     uom_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
     unit_price: Optional[float] = Field(None, description="Price of a single unit")
     line_total: Optional[float] = Field(None, description="Total cost for this specific line item. Look for 'Amount', 'Total', 'Extended Price', or 'Extd Price'. STRICT RULE: If the column is blank (e.g., due to a backordered item), leave this null or 0.0. Do not guess.")
+    
+    # ---> THE FIX: Line-Level Origin & Destination <---
+    line_origin: Optional[str] = Field(None, description="ONLY extract if the Origin/Ship-From address is explicitly listed per-item INSIDE the table row.")
+    line_destination: Optional[str] = Field(None, description="ONLY extract if the Destination/Ship-To address is explicitly listed per-item INSIDE the table row.")
 
 class TaxItem(BaseModel):
     tax_name: str = Field(description="The exact printed name of the tax (e.g., 'GST/HST', 'TPS/TVH', 'QST').")
@@ -40,10 +44,10 @@ class InvoiceData(BaseModel):
     bill_to: Optional[str] = Field(None, description="The FULL complete 'Bill To' or 'Sold To' address including street, city, state/province, and postal code.")
     remit_to: Optional[str] = Field(None, description="The FULL complete 'Remit To' address including street, city, state/province, and postal code.")
     
-    origin: Optional[str] = Field(None, description="The FULL origin physical address. STRICT GUARDRAIL: ONLY extract this if it is explicitly labeled with tags like 'Ship From', 'Origin', 'From', or 'Pickup'. If these specific tags are missing, or if it is just a random secondary address, you MUST return null. Do NOT extract short alphanumeric codes or tank numbers.")
+    origin: Optional[str] = Field(None, description="The FULL origin physical address for the overall invoice. STRICT GUARDRAIL: ONLY extract this if it is explicitly labeled with tags like 'Ship From', 'Origin', 'From', or 'Pickup'. Do NOT extract short alphanumeric codes or tank numbers.")
     origin_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
     
-    destination: Optional[str] = Field(None, description="The FULL destination physical address ('Ship To', 'To', 'Deliver To', 'Consignee'). STRICT RULE: Do NOT extract short alphanumeric facility codes or building numbers. If a full physical address is not present, leave null.")
+    destination: Optional[str] = Field(None, description="The FULL destination physical address for the overall invoice ('Ship To', 'To', 'Deliver To', 'Consignee'). STRICT RULE: Do NOT extract short alphanumeric facility codes or building numbers.")
     destination_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
     
     invoice_number: Optional[str] = Field(None, description="Unique invoice number. STRICT RULE: Only extract values explicitly labeled as 'Invoice Number' or 'Invoice #'. Do NOT extract Ticket No, Reference, Order ID, or Statement numbers.")
@@ -62,7 +66,7 @@ class InvoiceData(BaseModel):
     
     total_amount: float = Field(description="Final total amount charged on the invoice")
     total_amount_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
-    line_items: List[LineItem] = Field(description="List of all individual items purchased")
+    line_items: List[LineItem] = Field(description="List of all individual items purchased. CRITICAL GUARDRAIL: You must extract EVERY SINGLE ROW from the invoice table. Do NOT skip, summarize, or abbreviate rows. You must capture 100% of the items to ensure accounting math is perfectly accurate.")
 
 class InvoiceDocument(BaseModel):
     invoices: List[InvoiceData] = Field(description="List of distinct invoices. STRICT PAGING RULE: 1) If an invoice table extends across multiple pages but shares the SAME Invoice Number, MERGE all line items into ONE invoice record. 2) If the Invoice Number CHANGES on a new page, split it into a NEW separate invoice record in this list.")
@@ -96,7 +100,7 @@ def pdf_to_base64_images(pdf_path: str, max_pages: int = 15) -> List[str]:
     
     for page_num in range(pages_to_process):
         page = doc[page_num]
-        pix = page.get_pixmap(dpi=150) # LOWER DPI FOR FASTER PROCESSING
+        pix = page.get_pixmap(dpi=150) 
         base64_images.append(base64.b64encode(pix.tobytes("jpeg")).decode('utf-8'))
     return base64_images
 
@@ -107,7 +111,7 @@ def extract_invoice_data(pdf_path: str) -> InvoiceDocument:
     for img_base64 in base64_images:
         content_array.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"}})
 
-    system_prompt = "You are an expert accountant processing a document that may contain multiple distinct invoices. STRICT PAGING RULES: 1) If the same invoice number continues across multiple pages, combine all line items, taxes, and totals into a SINGLE invoice record. 2) If you see a NEW invoice number, start a NEW invoice record. CRITICAL RULE AGAINST DUPLICATES: Never extract the same tax or fee twice. Your extracted total for EACH invoice must mathematically equal the calculated sum of unique items for that invoice."
+    system_prompt = "You are an expert accountant processing a document that may contain multiple distinct invoices. STRICT PAGING RULES: 1) If the same invoice number continues across multiple pages, combine all line items, taxes, and totals into a SINGLE invoice record. 2) If you see a NEW invoice number, start a NEW invoice record. CRITICAL RULE AGAINST DUPLICATES: Never extract the same tax or fee twice. ANTI-LAZINESS RULE: DO NOT BE LAZY. You must extract every single line item row by row. Skipping the middle of a table, abbreviating, or summarizing items is a CRITICAL FAILURE. Your extracted total for EACH invoice must mathematically equal the calculated sum of unique items for that invoice."
 
     return client.chat.completions.create(
         model=azure_deployment, 
@@ -178,11 +182,9 @@ if __name__ == "__main__":
     success_count = 0
     error_count = 0
     
-    # ---> THE PROGRESS TRACKER UPDATE <---
     for current_index, filename in enumerate(pdf_files, start=1):
         pdf_path = os.path.join(input_folder, filename)
         
-        # This will print: "[1/10] Processing File: invoice.pdf..."
         print(f"\n[{current_index}/{total_pdfs}] Processing File: {filename}...")
         
         try:
@@ -232,11 +234,16 @@ if __name__ == "__main__":
                 status = "FAIL - NEEDS REVIEW" if needs_review else "PASS"
                 reasons_string = " | ".join(review_reasons) if needs_review else "N/A"
                 
-                def create_row(page_num, material, desc, qty, uom, uom_conf, price, line_total):
+                # ---> THE FIX: Fallback Logic added to the row creator <---
+                def create_row(page_num, material, desc, qty, uom, uom_conf, price, line_total, line_orig, line_dest):
+                    # Check line item first. If blank, fallback to the global invoice address.
+                    final_origin = line_orig if line_orig else extracted_data.origin
+                    final_dest = line_dest if line_dest else extracted_data.destination
+                    
                     return [
                         filename, page_num, extracted_data.vendor_name, extracted_data.vendor_address,
                         extracted_data.bill_to, extracted_data.remit_to, 
-                        extracted_data.origin, extracted_data.destination, extracted_data.invoice_number,
+                        final_origin, final_dest, extracted_data.invoice_number,
                         extracted_data.date, extracted_data.currency, 
                         material, desc, qty, uom, price, line_total, extracted_data.subtotal, extracted_data.total_amount,
                         extracted_data.invoice_number_confidence, extracted_data.origin_confidence, 
@@ -245,25 +252,26 @@ if __name__ == "__main__":
                     ]
 
                 if len(extracted_data.line_items) == 0:
-                    ws_details.append(create_row(None, None, None, None, None, None, None, 0.0))
+                    ws_details.append(create_row(None, None, None, None, None, None, None, 0.0, None, None))
                 else:
                     for item in extracted_data.line_items:
                         ws_details.append(create_row(
                             item.page_number, item.material, item.description, item.quantity, 
-                            item.uom, item.uom_confidence, item.unit_price, item.line_total
+                            item.uom, item.uom_confidence, item.unit_price, item.line_total,
+                            item.line_origin, item.line_destination # Pass the line-level addresses here
                         ))
                     
                 if safe_ship > 0:
                     ship_label = extracted_data.shipping_name if extracted_data.shipping_name else "Shipping/Handling"
-                    ws_details.append(create_row(None, None, ship_label, None, None, None, None, safe_ship))
+                    ws_details.append(create_row(None, None, ship_label, None, None, None, None, safe_ship, None, None))
                     
                 for tax in extracted_data.taxes:
                     if tax.tax_amount is not None and tax.tax_amount > 0:
-                        ws_details.append(create_row(None, None, tax.tax_name, None, None, None, None, tax.tax_amount))
+                        ws_details.append(create_row(None, None, tax.tax_name, None, None, None, None, tax.tax_amount, None, None))
                         
                 for fee in extracted_data.additional_fees:
                     if fee.fee_amount is not None and fee.fee_amount > 0:
-                        ws_details.append(create_row(None, None, fee.fee_name, None, None, None, None, fee.fee_amount))
+                        ws_details.append(create_row(None, None, fee.fee_name, None, None, None, None, fee.fee_amount, None, None))
 
                 ws_qc.append([
                     filename, extracted_data.vendor_name, extracted_data.invoice_number, 
