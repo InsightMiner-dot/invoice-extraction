@@ -91,18 +91,22 @@ def init_db():
     conn.commit()
     conn.close()
 
+# ---> UPDATED: Clean, simplified CSV Loader with Unicode fix <---
 def load_master_suppliers() -> pd.DataFrame:
     if os.path.exists(MASTER_CSV_PATH):
         try:
-            df = pd.read_csv(MASTER_CSV_PATH)
+            # utf-8-sig safely handles both standard UTF-8 and Windows Excel BOM
+            df = pd.read_csv(MASTER_CSV_PATH, encoding='utf-8-sig')
             if 'Original_Supplier_Name' in df.columns:
-                return df
-        except Exception:
-            pass 
+                return df[['Original_Supplier_Name']].dropna()
+        except Exception as e:
+            st.error(f"Error loading Master CSV: {e}")
+    
     return pd.DataFrame(columns=["Original_Supplier_Name"])
 
 def save_master_suppliers(df: pd.DataFrame):
-    df.to_csv(MASTER_CSV_PATH, index=False)
+    # Also save as utf-8-sig to keep it consistent
+    df.to_csv(MASTER_CSV_PATH, index=False, encoding='utf-8-sig')
 
 def append_to_master(new_supplier: str):
     df = load_master_suppliers()
@@ -529,7 +533,6 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
     status_text.empty()
     st.success(f"🎉 {prefix} Batch Processing Complete! Invoices Extracted: {success_count} | Errors: {error_count}")
 
-
 # --- DB & UI Dialogs ---
 @st.dialog("⚠️ Duplicate Files Detected")
 def confirm_duplicates_dialog(duplicate_files, unique_files):
@@ -916,7 +919,6 @@ with tab_batch:
 
         st.divider()
         
-        # ---> UPDATED: Simplified Data Editor without extra buttons/inputs <---
         with st.expander("📂 Master Supplier Database (CSV)", expanded=False):
             st.write("View, edit, or add official Supplier names directly in the table below. These act as the fuzzy match targets for future runs. Scroll to the bottom to add a new row.")
             
@@ -1183,7 +1185,7 @@ with tab_analytics:
             st.dataframe(vendor_routes, use_container_width=True, hide_index=True)
 
 # ---------------------------------------------------------
-# TAB 5: SYSTEM & DRIFT ANALYSIS
+# TAB 5: SYSTEM & Drift Analysis
 # ---------------------------------------------------------
 with tab_system:
     st.header("🤖 System & Model Drift Analysis")
