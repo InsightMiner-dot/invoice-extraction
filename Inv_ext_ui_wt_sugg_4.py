@@ -30,13 +30,12 @@ AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
 
 # ==============================================================
-# 0. Database & Excel Setup Functions
+# 0. Database & CSV Setup Functions
 # ==============================================================
 
 AUDIT_FOLDER = "audit"
 DB_PATH = os.path.join(AUDIT_FOLDER, "qc_master_database.sqlite")
-# ---> FIX: Strictly using Excel now <---
-MASTER_EXCEL_PATH = os.path.join(AUDIT_FOLDER, "master_suppliers.xlsx")
+MASTER_CSV_PATH = os.path.join(AUDIT_FOLDER, "master_suppliers.csv")
 
 def init_db():
     os.makedirs(AUDIT_FOLDER, exist_ok=True)
@@ -92,20 +91,19 @@ def init_db():
     conn.commit()
     conn.close()
 
-# ---> FIX: Reading and writing only via openpyxl <---
 def load_master_suppliers() -> pd.DataFrame:
-    if os.path.exists(MASTER_EXCEL_PATH):
+    if os.path.exists(MASTER_CSV_PATH):
         try:
-            df = pd.read_excel(MASTER_EXCEL_PATH, engine='openpyxl')
+            df = pd.read_csv(MASTER_CSV_PATH, encoding='utf-8-sig')
             if 'Original_Supplier_Name' in df.columns:
                 return df[['Original_Supplier_Name']].dropna()
         except Exception as e:
-            st.error(f"Error loading Master Excel: {e}")
+            st.error(f"Error loading Master CSV: {e}")
     
     return pd.DataFrame(columns=["Original_Supplier_Name"])
 
 def save_master_suppliers(df: pd.DataFrame):
-    df.to_excel(MASTER_EXCEL_PATH, index=False, engine='openpyxl')
+    df.to_csv(MASTER_CSV_PATH, index=False, encoding='utf-8-sig')
 
 def append_to_master(new_supplier: str):
     df = load_master_suppliers()
@@ -390,15 +388,14 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                 raw_vendor = extracted_data.vendor_name
                 orig_supp = None
                 
-                # Threshold at 85 for high confidence
+                # Threshold manually raised to 95% for near-perfect matches only
                 if master_suppliers_list and raw_vendor and raw_vendor not in ['N/A', 'ERROR', '']:
                     match_result = process.extractOne(raw_vendor, master_suppliers_list)
                     if match_result:
                         best_match, score = match_result
-                        if score >= 85: 
+                        if score >= 95: 
                             orig_supp = best_match
                 
-                # Fallback: if not mapped perfectly, standardizes raw vendor name
                 if not orig_supp:
                     orig_supp = standardize_vendor(raw_vendor)
 
@@ -651,7 +648,7 @@ with st.sidebar:
     st.divider()
     
     st.header("📄 Batch Upload")
-    st.write("Upload your mixed batch of invoices here. The system will auto-map vendors via the Master Database.")
+    st.write("Upload your mixed batch of invoices here. The system will auto-map vendors via the Master CSV.")
     uploaded_files = st.file_uploader("Upload PDF Documents", type=["pdf"], accept_multiple_files=True)
 
 # Tabs
@@ -660,7 +657,7 @@ tab_extract, tab_viewer, tab_batch, tab_analytics, tab_system = st.tabs([
 ])
 
 # ---------------------------------------------------------
-# TAB 1: EXTRACTION Suite
+# TAB 1: EXTRACTION SUITE
 # ---------------------------------------------------------
 with tab_extract:
     st.write("Upload invoices via the sidebar and click below to process them. Results will appear here instantly.")
@@ -794,29 +791,6 @@ with tab_batch:
         bc4.metric("Duplicates Found", f"{batch_dup_count:,}", delta_color="inverse")
         bc5.metric("Batch Execution Time", f"{mins}m {secs}s")
 
-        st.divider()
-        
-        st.subheader("📥 Download Batch DB Data")
-        st.write("Download the raw QC database table specifically for this batch.")
-        
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            cols = batch_df.columns.tolist()
-            if 'original_supplier_name' in cols and 'vendor_name' in cols:
-                cols.insert(cols.index('vendor_name') + 1, cols.pop(cols.index('original_supplier_name')))
-            
-            export_df = batch_df[cols]
-            export_df.to_excel(writer, index=False, sheet_name='Batch_Raw_QC_Data')
-        output.seek(0)
-        
-        st.download_button(
-            label="📥 Download Current Batch QC (Excel)",
-            data=output,
-            file_name=f"Batch_QC_{latest_batch or latest_date}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="secondary"
-        )
-        
         st.divider()
         
         st.subheader("📄 Status Overview (Pass/Fail)")
@@ -964,7 +938,7 @@ with tab_batch:
 
         st.divider()
         
-        with st.expander("📂 Master Supplier Database (Excel)", expanded=False):
+        with st.expander("📂 Master Supplier Database (CSV)", expanded=False):
             st.write("View, edit, or add official Supplier names directly in the table below. These act as the fuzzy match targets for future runs. Scroll to the bottom to add a new row.")
             
             master_df = load_master_suppliers()
@@ -973,14 +947,14 @@ with tab_batch:
                 master_df, 
                 num_rows="dynamic", 
                 use_container_width=True,
-                key="master_excel_editor"
+                key="master_csv_editor"
             )
             
-            if st.button("💾 Save Changes to Master Excel Directly", type="primary"):
+            if st.button("💾 Save Changes to Master CSV", type="primary"):
                 edited_master = edited_master.dropna(subset=['Original_Supplier_Name'])
                 edited_master = edited_master[edited_master['Original_Supplier_Name'].astype(str).str.strip() != '']
                 save_master_suppliers(edited_master)
-                st.success("Master Excel Rules Updated Successfully!")
+                st.success("Master CSV Rules Updated Successfully!")
                 time.sleep(1)
                 st.rerun()
 
