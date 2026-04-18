@@ -35,6 +35,7 @@ def init_db():
     os.makedirs(AUDIT_FOLDER, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+    # Main Extraction Table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS qc_audit (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,6 +53,17 @@ def init_db():
             variance REAL,
             processing_time REAL,
             page_count INTEGER
+        )
+    ''')
+    
+    # ---> NEW: Audit Log for Database Deletions <---
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS deletion_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            user_name TEXT,
+            action_type TEXT,
+            details TEXT
         )
     ''')
     
@@ -86,10 +98,54 @@ def fetch_audit_data() -> pd.DataFrame:
     conn.close()
     return df
 
+def remove_duplicates_db(user_name: str):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Count how many will be deleted
+    cursor.execute('''
+        SELECT COUNT(*) FROM qc_audit 
+        WHERE id NOT IN (SELECT MIN(id) FROM qc_audit GROUP BY vendor_name, invoice_number)
+        AND invoice_number NOT IN ('N/A', 'ERROR', '')
+    ''')
+    count = cursor.fetchone()[0]
+    
+    # Keep the lowest ID (oldest) for each Vendor+Invoice pair, delete the rest
+    cursor.execute('''
+        DELETE FROM qc_audit
+        WHERE id NOT IN (
+            SELECT MIN(id)
+            FROM qc_audit
+            GROUP BY vendor_name, invoice_number
+        ) AND invoice_number NOT IN ('N/A', 'ERROR', '')
+    ''')
+    
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute("INSERT INTO deletion_logs (timestamp, user_name, action_type, details) VALUES (?, ?, ?, ?)", 
+                   (now, user_name, "REMOVE_DUPLICATES", f"Deleted {count} duplicate records based on Vendor+Invoice match."))
+    conn.commit()
+    conn.close()
+    fetch_audit_data.clear()
+
+def wipe_master_db(user_name: str):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM qc_audit")
+    count = cursor.fetchone()[0]
+    
+    cursor.execute("DELETE FROM qc_audit")
+    
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute("INSERT INTO deletion_logs (timestamp, user_name, action_type, details) VALUES (?, ?, ?, ?)", 
+                   (now, user_name, "WIPE_DATABASE", f"Wiped entire Master Database ({count} records deleted)."))
+    conn.commit()
+    conn.close()
+    fetch_audit_data.clear()
+
 init_db()
 
 # ==============================================================
-# 1. Define Data Schema (UPDATED FOR INLINE ORIGIN/DESTINATION)
+# 1. Define Data Schema (CORE LOGIC UNTOUCHED)
 # ==============================================================
 
 class LineItem(BaseModel):
@@ -102,9 +158,9 @@ class LineItem(BaseModel):
     unit_price: Optional[float] = Field(None, description="Price of a single unit")
     line_total: Optional[float] = Field(None, description="Total cost for this specific line item. Look for 'Amount', 'Total', 'Extended Price', or 'Extd Price'. STRICT RULE: If the column is blank (e.g., due to a backordered item), leave this null or 0.0. Do not guess.")
     
-    # ---> THE FIX: Line-Level Origin & Destination <---
-    line_origin: Optional[str] = Field(None, description="ONLY extract if the Origin/Ship-From address is explicitly listed per-item INSIDE the table row.")
-    line_destination: Optional[str] = Field(None, description="ONLY extract if the Destination/Ship-To address is explicitly listed per-item INSIDE the table row.")
+    line_origin: Optional[str] = Field(None, description="CRITICAL ANTI-LAZINESS RULE: You MUST read the exact Origin/Ship-From address printed for THIS specific row. DO NOT copy or repeat the value from the row above. Every single row is unique. Look closely at the image for this exact line. If it is blank for this specific row, you MUST leave it null.")
+    line_destination: Optional[str] = Field(None, description="CRITICAL ANTI-LAZINESS RULE: You MUST read the exact Destination/Ship-To address printed for THIS specific row. DO NOT copy or repeat the value from the row above. Every single row is unique. Look closely at the image for this exact line. If it is blank for this specific row, you MUST leave it null.")
+    line_routing_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'. STRICT RULE: Rate as 'Low' if you suspect hallucination, or if you are guessing/copying the Origin or Destination from previous rows without explicit printed evidence on this exact line.")
 
 class TaxItem(BaseModel):
     tax_name: str = Field(description="The exact printed name of the tax (e.g., 'GST/HST', 'TPS/TVH', 'QST').")
@@ -196,11 +252,11 @@ def setup_excel_workbook(custom_cols: List[str]):
     wb = openpyxl.Workbook()
     ws_details = wb.active
     ws_details.title = "Invoice Details"
-    # Unchanged Headers as requested
     details_headers = [
         "File Name", "Page #", "Vendor Name", "Vendor Address", "Bill To", "Remit To",
         "Origin", "Destination", "Invoice Number", "Date", "Currency", 
-        "Material", "Description", "Quantity", "UOM", "Unit Price", "Line Total", "Subtotal", "Invoice Total",
+        "Material", "Description", "Line Origin", "Line Destination", "Line Routing Conf",
+        "Quantity", "UOM", "Unit Price", "Line Total", "Subtotal", "Invoice Total",
         "Inv# Conf", "Origin Conf", "Dest Conf", "UOM Conf", "Total Conf", "Status", "Reason for Review"
     ]
     if custom_cols: details_headers.extend(custom_cols)
@@ -294,44 +350,30 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                     if item.uom_confidence == "Low":
                         short_desc = item.description[:15] + "..." if item.description and len(item.description) > 15 else item.description
                         review_reasons.append(f"Low Conf: UOM on '{short_desc}'")
+                    if item.line_routing_confidence == "Low":
+                        short_desc = item.description[:15] + "..." if item.description and len(item.description) > 15 else item.description
+                        review_reasons.append(f"Hallucination Risk: Routing on '{short_desc}'")
                 
                 needs_review = len(review_reasons) > 0
                 status = "FAIL - NEEDS REVIEW" if needs_review else "PASS"
                 reasons_string = " | ".join(review_reasons) if needs_review else "N/A"
                 
-                # ---> THE FIX: Fallback Logic injected directly into the row generator <---
-                def create_row_dict(page_num, material, desc, qty, uom, uom_conf, price, line_total, line_orig=None, line_dest=None):
-                    # Check line item first. If blank, fallback to the global invoice address.
+                def create_row_dict(page_num, material, desc, qty, uom, uom_conf, price, line_total, line_orig=None, line_dest=None, route_conf=None):
                     final_origin = line_orig if line_orig else extracted_data.origin
                     final_dest = line_dest if line_dest else extracted_data.destination
                     
                     row_data = {
-                        "File Name": filename,
-                        "Page #": page_num,
-                        "Vendor Name": extracted_data.vendor_name,
-                        "Vendor Address": extracted_data.vendor_address,
-                        "Bill To": extracted_data.bill_to,
-                        "Remit To": extracted_data.remit_to,
-                        "Origin": final_origin,        # Uses fallback logic
-                        "Destination": final_dest,     # Uses fallback logic
-                        "Invoice Number": extracted_data.invoice_number,
-                        "Date": extracted_data.date,
-                        "Currency": extracted_data.currency,
-                        "Material": material,
-                        "Description": desc,
-                        "Quantity": qty,
-                        "UOM": uom,
-                        "Unit Price": price,
-                        "Line Total": line_total,
-                        "Subtotal": extracted_data.subtotal,
-                        "Invoice Total": extracted_data.total_amount,
-                        "Inv# Conf": extracted_data.invoice_number_confidence,
-                        "Origin Conf": extracted_data.origin_confidence,
-                        "Dest Conf": extracted_data.destination_confidence,
-                        "UOM Conf": uom_conf,
-                        "Total Conf": extracted_data.total_amount_confidence,
-                        "Status": status,
-                        "Reason for Review": reasons_string
+                        "File Name": filename, "Page #": page_num,
+                        "Vendor Name": extracted_data.vendor_name, "Vendor Address": extracted_data.vendor_address,
+                        "Bill To": extracted_data.bill_to, "Remit To": extracted_data.remit_to,
+                        "Origin": final_origin, "Destination": final_dest, 
+                        "Invoice Number": extracted_data.invoice_number, "Date": extracted_data.date, "Currency": extracted_data.currency,
+                        "Material": material, "Description": desc, "Line Origin": line_orig, "Line Destination": line_dest,
+                        "Line Routing Conf": route_conf, "Quantity": qty, "UOM": uom, "Unit Price": price, "Line Total": line_total,
+                        "Subtotal": extracted_data.subtotal, "Invoice Total": extracted_data.total_amount,
+                        "Inv# Conf": extracted_data.invoice_number_confidence, "Origin Conf": extracted_data.origin_confidence,
+                        "Dest Conf": extracted_data.destination_confidence, "UOM Conf": uom_conf, "Total Conf": extracted_data.total_amount_confidence,
+                        "Status": status, "Reason for Review": reasons_string
                     }
                     for col in custom_col_keys:
                         row_data[col] = extracted_data.custom_fields.get(col, "Not Found")
@@ -343,8 +385,11 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                     current_run_details.append(row_dict)
                 else:
                     for item in extracted_data.line_items:
-                        # Passing the new line_orig and line_dest to the builder
-                        row_dict = create_row_dict(item.page_number, item.material, item.description, item.quantity, item.uom, item.uom_confidence, item.unit_price, item.line_total, line_orig=item.line_origin, line_dest=item.line_destination)
+                        row_dict = create_row_dict(
+                            item.page_number, item.material, item.description, item.quantity, 
+                            item.uom, item.uom_confidence, item.unit_price, item.line_total, 
+                            line_orig=item.line_origin, line_dest=item.line_destination, route_conf=item.line_routing_confidence
+                        )
                         ws_details.append(list(row_dict.values()))
                         current_run_details.append(row_dict)
                         
@@ -416,6 +461,29 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
     st.success(f"🎉 {prefix} Batch Processing Complete! Invoices Extracted: {success_count} | Errors: {error_count}")
 
 
+# --- DB Management Dialogs ---
+@st.dialog("🗑️ Remove Duplicate Invoices")
+def dialog_remove_duplicates():
+    st.warning("This will permanently delete all duplicate records (keeping the oldest one) based on Vendor Name + Invoice Number.")
+    user_name = st.text_input("Enter your name to authorize deletion:")
+    if st.button("Confirm Deletion", type="primary"):
+        if not user_name.strip():
+            st.error("Name is required for the audit log.")
+        else:
+            remove_duplicates_db(user_name.strip())
+            st.rerun()
+
+@st.dialog("⚠️ Wipe Master Database")
+def dialog_wipe_db():
+    st.error("CRITICAL WARNING: This will permanently delete ALL extracted invoice data from the system.")
+    user_name = st.text_input("Enter your name to authorize complete wipe:")
+    if st.button("Confirm Complete Wipe", type="primary"):
+        if not user_name.strip():
+            st.error("Name is required for the audit log.")
+        else:
+            wipe_master_db(user_name.strip())
+            st.rerun()
+
 @st.dialog("⚠️ Duplicate Files Detected")
 def confirm_duplicates_dialog(duplicate_files, unique_files):
     st.warning(f"Found {len(duplicate_files)} file(s) that have already been processed and exist in the master database.")
@@ -463,10 +531,10 @@ with st.sidebar:
                 "invoice_number", "date", "vendor_name", "vendor_address", 
                 "bill_to", "remit_to", "origin", "destination", "currency", 
                 "subtotal", "shipping_name", "shipping_handling", "total_amount",
-                "material", "description", "quantity", "uom", "unit_price", "line_total",
+                "material", "description", "line_origin", "line_destination", "quantity", "uom", "unit_price", "line_total",
                 "tax_name", "tax_amount", "fee_name", "fee_amount"
             ],
-            "Aliases": [""] * 23
+            "Aliases": [""] * 25
         })
         standard_df = st.data_editor(default_standard, disabled=["Standard Field"], use_container_width=True, hide_index=True)
         
@@ -500,7 +568,7 @@ tab_extract, tab_viewer, tab_analytics, tab_system = st.tabs([
 ])
 
 # ---------------------------------------------------------
-# TAB 1: EXTRACTION Suite
+# TAB 1: EXTRACTION SUITE
 # ---------------------------------------------------------
 with tab_extract:
     st.write("Upload invoices via the sidebar and click below to process them. Results will appear here instantly.")
@@ -594,7 +662,14 @@ with tab_analytics:
         df_audit['is_dest_missing'] = df_audit['destination'].isin(missing_flags) | df_audit['destination'].isna()
 
         st.subheader("Invoice & Vendor Overview")
-        col1, col2, col3 = st.columns(3)
+        
+        # Calculate Duplicates (Vendor Name + Invoice Number)
+        valid_df = df_audit[~df_audit['invoice_number'].isin(['N/A', 'ERROR', '', None]) & ~df_audit['vendor_name'].isin(['N/A', 'ERROR'])]
+        duplicates_df = valid_df[valid_df.duplicated(subset=['vendor_name', 'invoice_number'], keep='first')]
+        dup_count = len(duplicates_df)
+        dup_spend = duplicates_df['extracted_total'].sum()
+
+        col1, col2, col3, col4, col5 = st.columns(5)
         total_invoices = len(df_audit)
         total_vendors = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])]['vendor_name'].nunique()
         total_spend = df_audit['extracted_total'].sum()
@@ -602,6 +677,8 @@ with tab_analytics:
         col1.metric("Total Invoices", f"{total_invoices:,}")
         col2.metric("Total Unique Vendors", f"{total_vendors:,}")
         col3.metric("Total Spend Processed", f"${total_spend:,.2f}")
+        col4.metric("⚠️ Duplicates Found", f"{dup_count:,}", delta_color="inverse")
+        col5.metric("⚠️ Duplicate Value", f"${dup_spend:,.2f}", delta_color="inverse")
 
         st.divider()
 
@@ -648,6 +725,24 @@ with tab_analytics:
         }).sort_values(by='Invoice Count', ascending=False)
         
         st.dataframe(vendor_routes, use_container_width=True, hide_index=True)
+        
+        st.divider()
+        
+        # ---> NEW: Duplicate Table and DB Management <---
+        st.subheader("📑 Duplicate Invoices Detected")
+        if not duplicates_df.empty:
+            st.dataframe(duplicates_df[['vendor_name', 'invoice_number', 'file_name', 'extracted_total']], use_container_width=True, hide_index=True)
+        else:
+            st.success("No duplicate invoices detected in the master database.")
+            
+        st.subheader("⚙️ Database Management")
+        col_btn1, col_btn2 = st.columns(2)
+        with col_btn1:
+            if st.button("🗑️ Remove Duplicates", use_container_width=True):
+                dialog_remove_duplicates()
+        with col_btn2:
+            if st.button("⚠️ Clean Master Database", type="secondary", use_container_width=True):
+                dialog_wipe_db()
 
 # ---------------------------------------------------------
 # TAB 4: SYSTEM & DRIFT ANALYSIS
