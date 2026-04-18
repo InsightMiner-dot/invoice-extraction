@@ -143,7 +143,7 @@ def wipe_master_db(user_name: str):
 init_db()
 
 # ==============================================================
-# 1. Define Data Schema 
+# 1. Define Data Schema
 # ==============================================================
 
 class LineItem(BaseModel):
@@ -255,12 +255,10 @@ def setup_excel_workbook(custom_cols: List[str]):
     wb = openpyxl.Workbook()
     ws_details = wb.active
     ws_details.title = "Invoice Details"
-    
-    # ---> MERGED HEADERS: Line Origin & Line Dest Removed <---
     details_headers = [
         "File Name", "Page #", "Vendor Name", "Vendor Address", "Bill To", "Remit To",
         "Origin", "Destination", "Invoice Number", "Date", "Currency", 
-        "Material", "Description", "Quantity", "UOM", "Unit Price", "Line Total", "Subtotal", "Invoice Total",
+        "Material", "Description", "Line Origin", "Line Destination", "Quantity", "UOM", "Unit Price", "Line Total", "Subtotal", "Invoice Total",
         "Inv# Conf", "Origin Conf", "Dest Conf", "UOM Conf", "Total Conf", "Status", "Reason for Review"
     ]
     if custom_cols: details_headers.extend(custom_cols)
@@ -330,7 +328,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
             if not extracted_document.invoices:
                 ws_qc.append([filename, "N/A", "N/A", "N/A", "N/A", "FAIL - NO DATA", "0 Invoices Found in PDF", "", "", ""])
                 insert_audit_record((current_date, current_time, filename, "N/A", "N/A", "N/A", "N/A", "FAIL - NO DATA", "0 Invoices Found", 0.0, 0.0, 0.0, file_proc_time, total_pages))
-                current_run_summary.append({"File Name": filename, "Vendor Name": "N/A", "Invoice #": "N/A", "Origin": "N/A", "Destination": "N/A", "Total Amount": 0.0, "Variance": "$0.00", "Status": "FAIL", "Reason": "No Invoices Found in PDF", "Proc Time": f"{file_proc_time}s"})
+                current_run_summary.append({"File Name": filename, "Vendor Name": "N/A", "Invoice #": "N/A", "Origin": "N/A", "Destination": "N/A", "Status": "FAIL", "Reason": "No Invoices Found in PDF"})
                 continue
             
             for extracted_data in extracted_document.invoices:
@@ -360,7 +358,6 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                 reasons_string = " | ".join(review_reasons) if needs_review else "N/A"
                 
                 def create_row_dict(page_num, material, desc, qty, uom, uom_conf, price, line_total, line_orig=None, line_dest=None):
-                    # Smart Fallback Logic: Uses Line routing if found, otherwise invoice routing
                     final_origin = line_orig if line_orig else extracted_data.origin
                     final_dest = line_dest if line_dest else extracted_data.destination
                     
@@ -368,13 +365,9 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                         "File Name": filename, "Page #": page_num,
                         "Vendor Name": extracted_data.vendor_name, "Vendor Address": extracted_data.vendor_address,
                         "Bill To": extracted_data.bill_to, "Remit To": extracted_data.remit_to,
-                        
-                        # ---> DATA MERGED DIRECTLY INTO MAIN COLUMNS <---
-                        "Origin": final_origin, 
-                        "Destination": final_dest, 
-                        
+                        "Origin": final_origin, "Destination": final_dest, 
                         "Invoice Number": extracted_data.invoice_number, "Date": extracted_data.date, "Currency": extracted_data.currency,
-                        "Material": material, "Description": desc,
+                        "Material": material, "Description": desc, "Line Origin": line_orig, "Line Destination": line_dest,
                         "Quantity": qty, "UOM": uom, "Unit Price": price, "Line Total": line_total,
                         "Subtotal": extracted_data.subtotal, "Invoice Total": extracted_data.total_amount,
                         "Inv# Conf": extracted_data.invoice_number_confidence, "Origin Conf": extracted_data.origin_confidence,
@@ -416,12 +409,12 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                         ws_details.append(list(row_dict.values()))
                         current_run_details.append(row_dict)
                 
-                # We save the FIRST line item's routing to the QC audit table so the maps still work
+                # Use first line origin for QC Summary table if available
                 first_line_orig = extracted_data.line_items[0].line_origin if len(extracted_data.line_items) > 0 else None
                 first_line_dest = extracted_data.line_items[0].line_destination if len(extracted_data.line_items) > 0 else None
                 qc_origin = first_line_orig if first_line_orig else extracted_data.origin
                 qc_dest = first_line_dest if first_line_dest else extracted_data.destination
-                
+
                 ws_qc.append([
                     filename, extracted_data.vendor_name, extracted_data.invoice_number, 
                     qc_origin, qc_dest,
@@ -437,8 +430,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                 current_run_summary.append({
                     "File Name": filename, "Vendor Name": extracted_data.vendor_name, "Invoice #": extracted_data.invoice_number,
                     "Origin": qc_origin or "Missing", "Destination": qc_dest or "Missing",
-                    "Total Amount": extracted_data.total_amount, "Variance": f"${variance:,.2f}", 
-                    "Status": "✅ PASS" if status == "PASS" else "⚠️ FAIL",
+                    "Variance": f"${variance:,.2f}", "Status": "✅ PASS" if status == "PASS" else "⚠️ FAIL",
                     "Proc Time": f"{file_proc_time}s"
                 })
                 success_count += 1
@@ -446,7 +438,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
         except Exception as e:
             file_proc_time = round(time.time() - file_start_time, 2)
             insert_audit_record((current_date, current_time, filename, "N/A", "N/A", "N/A", "N/A", "FAIL - CRITICAL ERROR", str(e), 0.0, 0.0, 0.0, file_proc_time, 0))
-            current_run_summary.append({"File Name": filename, "Vendor Name": "ERROR", "Invoice #": "ERROR", "Origin": "ERROR", "Destination": "ERROR", "Total Amount": 0.0, "Variance": "$0.00", "Status": "❌ ERROR", "Reason": "API/System Crash", "Proc Time": f"{file_proc_time}s"})
+            current_run_summary.append({"File Name": filename, "Vendor Name": "ERROR", "Invoice #": "ERROR", "Origin": "ERROR", "Destination": "ERROR", "Status": "❌ ERROR", "Reason": "API/System Crash", "Proc Time": f"{file_proc_time}s"})
             error_count += 1
         
         if idx < total_files - 1: time.sleep(sleep_time) 
@@ -473,7 +465,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
     status_text.empty()
     st.success(f"🎉 {prefix} Batch Processing Complete! Invoices Extracted: {success_count} | Errors: {error_count}")
 
-
+# --- DB & UI Dialogs ---
 @st.dialog("⚠️ Duplicate Files Detected")
 def confirm_duplicates_dialog(duplicate_files, unique_files):
     st.warning(f"Found {len(duplicate_files)} file(s) that have already been processed and exist in the master database.")
@@ -496,7 +488,6 @@ def confirm_duplicates_dialog(duplicate_files, unique_files):
             time.sleep(2)
             st.rerun()
 
-# --- DB Management Dialogs (Moved to System Tab) ---
 @st.dialog("🗑️ Remove Duplicate Invoices")
 def dialog_remove_duplicates():
     st.warning("This will permanently delete all duplicate records (keeping the oldest one) based on Vendor Name + Invoice Number.")
@@ -518,6 +509,22 @@ def dialog_wipe_db():
         else:
             wipe_master_db(user_name.strip())
             st.rerun()
+
+@st.dialog("📄 Fullscreen Document Viewer", width="large")
+def view_fullscreen_pdf(file_bytes, file_name):
+    st.markdown(f"### {file_name}")
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    
+    html_content = '<div style="height: 75vh; overflow-y: scroll; border: 1px solid #ddd; padding: 20px; background-color: #525659; text-align: center;">'
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        pix = page.get_pixmap(dpi=150)
+        img_b64 = base64.b64encode(pix.tobytes("jpeg")).decode('utf-8')
+        html_content += f'<img src="data:image/jpeg;base64,{img_b64}" style="width: 95%; max-width: 900px; margin-bottom: 20px; box-shadow: 0px 4px 10px rgba(0,0,0,0.5);"><br>'
+    html_content += '</div>'
+    
+    st.markdown(html_content, unsafe_allow_html=True)
+
 
 # ==============================================================
 # 4. Streamlit App Layout
@@ -639,7 +646,7 @@ with tab_viewer:
     st.header("📄 Document Viewer")
     
     if uploaded_files:
-        st.write("Use your browser's built-in controls to zoom or search (Ctrl+F).")
+        st.write("Search and click '🔍 View Full Screen' to examine a document in detail.")
         
         search_query = st.text_input("🔍 Search by File Name", "").lower()
         filtered_files = [f for f in uploaded_files if search_query in f.name.lower()]
@@ -651,20 +658,19 @@ with tab_viewer:
             for idx, file in enumerate(filtered_files):
                 col = cols[idx % 4]
                 with col:
-                    st.subheader(file.name)
+                    st.markdown(f"<div style='white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 14px; margin-bottom: 5px;' title='{file.name}'><b>{file.name}</b></div>", unsafe_allow_html=True)
+                    
                     file.seek(0)
                     doc = fitz.open(stream=file.read(), filetype="pdf")
-                    html_content = '<div style="height: 500px; overflow-y: scroll; border: 1px solid #ddd; padding: 10px; background-color: #f9f9f9;">'
-                    
-                    for page_num in range(len(doc)):
-                        page = doc[page_num]
-                        pix = page.get_pixmap(dpi=150) 
+                    if len(doc) > 0:
+                        page = doc[0]
+                        pix = page.get_pixmap(dpi=72)
                         img_b64 = base64.b64encode(pix.tobytes("jpeg")).decode('utf-8')
-                        html_content += f'<img src="data:image/jpeg;base64,{img_b64}" style="width: 100%; margin-bottom: 10px; border: 1px solid #ccc; box-shadow: 2px 2px 5px rgba(0,0,0,0.1);">'
-                        
-                    html_content += '</div>'
-                    st.markdown(html_content, unsafe_allow_html=True)
+                        st.markdown(f'<img src="data:image/jpeg;base64,{img_b64}" style="width: 100%; border: 1px solid #ccc; box-shadow: 2px 2px 5px rgba(0,0,0,0.1); margin-bottom: 10px;">', unsafe_allow_html=True)
+                    
                     file.seek(0)
+                    if st.button("🔍 View Full Screen", key=f"view_{idx}", use_container_width=True):
+                        view_fullscreen_pdf(file.read(), file.name)
     else:
         st.info("Upload PDF documents in the sidebar to view them here.")
 
@@ -698,19 +704,16 @@ with tab_analytics:
         col4.metric("⚠️ Duplicates Found", f"{dup_count:,}", delta_color="inverse")
         col5.metric("⚠️ Duplicate Value", f"${dup_spend / 1_000_000:,.2f}M", delta_color="inverse")
 
+        st.divider()
+        
         df_audit['extraction_date_dt'] = pd.to_datetime(df_audit['extraction_date'])
         spend_time = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])].groupby('extraction_date')['extracted_total'].sum().reset_index()
         spend_time['extracted_total_M'] = spend_time['extracted_total'] / 1_000_000 
-        
-        if len(spend_time) > 1:
-            fig_spark = px.area(spend_time, x='extraction_date', y='extracted_total_M', color_discrete_sequence=['#00CC96'])
-            fig_spark.update_layout(
-                xaxis=dict(visible=False), yaxis=dict(visible=False),
-                margin=dict(l=0, r=0, t=0, b=0), height=80,
-                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-                showlegend=False, hovermode="x unified"
-            )
-            st.plotly_chart(fig_spark, use_container_width=True)
+
+        st.subheader("📈 Financial Spend Over Time ($M)")
+        fig_spend = px.line(spend_time, x='extraction_date', y='extracted_total_M', markers=True)
+        fig_spend.update_layout(xaxis_title="Date", yaxis_title="Total Extracted (Millions)")
+        st.plotly_chart(fig_spend, use_container_width=True)
 
         st.divider()
 
@@ -755,6 +758,29 @@ with tab_analytics:
 
         c1, c2 = st.columns(2)
         with c1:
+            st.subheader("Top Vendors by Invoice Volume")
+            vendor_counts = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])]['vendor_name'].value_counts().reset_index().head(10)
+            vendor_counts.columns = ['Vendor', 'Invoice Count']
+            # Removed color arguments, added text_auto for simple readability
+            fig_bar = px.bar(vendor_counts, x='Invoice Count', y='Vendor', orientation='h', text_auto=True)
+            fig_bar.update_layout(yaxis={'categoryorder':'total ascending'})
+            st.plotly_chart(fig_bar, use_container_width=True)
+
+        with c2:
+            st.subheader("Top Vendors by Financial Value ($M)")
+            vendor_value = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])].groupby('vendor_name')['extracted_total'].sum().reset_index()
+            vendor_value['extracted_total_M'] = vendor_value['extracted_total'] / 1_000_000
+            vendor_value = vendor_value.sort_values(by='extracted_total_M', ascending=False).head(10)
+            vendor_value.columns = ['Vendor', 'Total Value ($)', 'Total Value (Millions)']
+            # Removed color arguments, added text_auto for simple readability
+            fig_val = px.bar(vendor_value, x='Total Value (Millions)', y='Vendor', orientation='h', text_auto='.2s')
+            fig_val.update_layout(yaxis={'categoryorder':'total ascending'})
+            st.plotly_chart(fig_val, use_container_width=True)
+
+        st.divider()
+
+        c3, c4 = st.columns(2)
+        with c3:
             st.subheader("Pareto Analysis (Vendor Spend)")
             vendor_spend = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])].groupby('vendor_name')['extracted_total'].sum().sort_values(ascending=False).reset_index()
             vendor_spend['extracted_total_M'] = vendor_spend['extracted_total'] / 1_000_000
@@ -765,13 +791,13 @@ with tab_analytics:
             fig_pareto.update_layout(yaxis2=dict(overlaying='y', side='right', range=[0, 100], title='Cumulative Percentage (%)'), xaxis_title="Vendor", yaxis_title="Total Spend (Millions)")
             st.plotly_chart(fig_pareto, use_container_width=True)
 
-        with c2:
+        with c4:
             st.subheader("Invoice Value Distribution ($M)")
             valid_spend = df_audit[df_audit['extracted_total'] > 0].copy()
             valid_spend['extracted_total_M'] = valid_spend['extracted_total'] / 1_000_000
             
             if not valid_spend.empty:
-                fig_hist = px.histogram(valid_spend, x='extracted_total_M', nbins=20, title='Distribution of Invoice Amounts', color_discrete_sequence=['#2ecc71'])
+                fig_hist = px.histogram(valid_spend, x='extracted_total_M', nbins=20, title='Distribution of Invoice Amounts')
                 fig_hist.update_layout(xaxis_title="Invoice Amount (Millions)", yaxis_title="Count")
                 st.plotly_chart(fig_hist, use_container_width=True)
             else:
@@ -786,7 +812,8 @@ with tab_analytics:
             df_valid_routes['Corridor'] = df_valid_routes['origin'].astype(str) + " ➡️ " + df_valid_routes['destination'].astype(str)
             corridor_counts = df_valid_routes['Corridor'].value_counts().reset_index().head(10)
             corridor_counts.columns = ['Shipping Corridor', 'Volume']
-            fig_corridor = px.bar(corridor_counts, x='Volume', y='Shipping Corridor', orientation='h', color='Volume', color_continuous_scale='Purples')
+            # Removed color argument, added text_auto
+            fig_corridor = px.bar(corridor_counts, x='Volume', y='Shipping Corridor', orientation='h', text_auto=True)
             fig_corridor.update_layout(yaxis={'categoryorder':'total ascending'})
             st.plotly_chart(fig_corridor, use_container_width=True)
         else:
@@ -853,8 +880,37 @@ with tab_system:
             day_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
             dow_counts = df_audit['day_of_week'].value_counts().reindex(day_order).reset_index()
             dow_counts.columns = ['Day', 'Volume']
-            fig_dow = px.bar(dow_counts, x='Day', y='Volume', color='Volume', color_continuous_scale='Teals')
+            # Removed color mapping, added text_auto
+            fig_dow = px.bar(dow_counts, x='Day', y='Volume', text_auto=True)
             st.plotly_chart(fig_dow, use_container_width=True)
+                
+        st.divider()
+
+        c3, c4 = st.columns(2)
+        with c3:
+            st.subheader("⚠️ Top Reasons for LLM Review")
+            df_fails = df_audit[df_audit['Clean_Status'] == 'FAIL']
+            if not df_fails.empty:
+                reasons_series = df_fails['reason_for_review'].str.split(" | ").explode()
+                reason_counts = reasons_series.value_counts().reset_index().head(10)
+                reason_counts.columns = ['Reason', 'Frequency']
+                # Removed color argument
+                fig_err = px.bar(reason_counts, x='Reason', y='Frequency', text_auto=True)
+                st.plotly_chart(fig_err, use_container_width=True)
+            else:
+                st.success("No failures to analyze.")
+
+        with c4:
+            st.subheader("💸 Absolute Variance Magnitude by Vendor")
+            var_vendor = df_audit[~df_audit['vendor_name'].isin(['N/A', 'ERROR'])].groupby('vendor_name')['variance'].apply(lambda x: x.abs().sum()).reset_index()
+            var_vendor = var_vendor[var_vendor['variance'] > 0].sort_values(by='variance', ascending=False).head(10)
+            if not var_vendor.empty:
+                # Removed color mapping
+                fig_var_vendor = px.bar(var_vendor, x='variance', y='vendor_name', orientation='h', text_auto=True)
+                fig_var_vendor.update_layout(yaxis={'categoryorder':'total ascending'})
+                st.plotly_chart(fig_var_vendor, use_container_width=True)
+            else:
+                st.success("No variance detected across any vendors.")
                 
         st.divider()
             
