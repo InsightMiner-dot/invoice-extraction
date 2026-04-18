@@ -69,7 +69,6 @@ def init_db():
         )
     ''')
     
-    # Safe auto-healing schema updates, now including batch_id
     new_columns = [
         ("processing_time", "REAL"),
         ("page_count", "INTEGER"),
@@ -85,11 +84,12 @@ def init_db():
         try:
             cursor.execute(f"ALTER TABLE qc_audit ADD COLUMN {col_name} {col_type}")
         except sqlite3.OperationalError:
-            pass # Column already exists, safe to ignore
+            pass 
         
     conn.commit()
     conn.close()
 
+# ---> UPDATED: Now safely inserts the pre-selected clean_supplier <---
 def insert_audit_record(record: tuple):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -97,8 +97,8 @@ def insert_audit_record(record: tuple):
         INSERT INTO qc_audit (
             extraction_date, extraction_time, file_name, vendor_name, 
             invoice_number, origin, destination, status, reason_for_review, 
-            extracted_total, calculated_sum, variance, processing_time, page_count, batch_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            extracted_total, calculated_sum, variance, processing_time, page_count, batch_id, clean_supplier
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', record)
     conn.commit()
     conn.close()
@@ -340,7 +340,8 @@ if 'start_processing' not in st.session_state:
 if 'files_to_process' not in st.session_state:
     st.session_state.files_to_process = []
 
-def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict, max_pages, dpi, sleep_time, prefix=""):
+# ---> UPDATED: Now receives the pre_selected_vendor parameter <---
+def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict, max_pages, dpi, sleep_time, pre_selected_vendor=None, prefix=""):
     client = instructor.from_openai(AzureOpenAI(azure_endpoint=AZURE_ENDPOINT, api_key=AZURE_API_KEY, api_version=AZURE_API_VERSION))
     
     custom_col_keys = list(custom_fields_dict.keys())
@@ -356,8 +357,6 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
 
     start_time_batch = time.time()
     total_files = len(files_list)
-    
-    # NEW: Generate a unique ID for this entire batch run
     current_batch_id = datetime.now().strftime("BATCH_%Y%m%d_%H%M%S")
 
     for idx, file in enumerate(files_list):
@@ -376,7 +375,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
             
             if not extracted_document.invoices:
                 ws_qc.append([filename, "N/A", "N/A", "N/A", "N/A", "FAIL - NO DATA", "0 Invoices Found in PDF", "", "", ""])
-                insert_audit_record((current_date, current_time, filename, "N/A", "N/A", "N/A", "N/A", "FAIL - NO DATA", "0 Invoices Found", 0.0, 0.0, 0.0, file_proc_time, total_pages, current_batch_id))
+                insert_audit_record((current_date, current_time, filename, "N/A", "N/A", "N/A", "N/A", "FAIL - NO DATA", "0 Invoices Found", 0.0, 0.0, 0.0, file_proc_time, total_pages, current_batch_id, pre_selected_vendor))
                 current_run_summary.append({"File Name": filename, "Vendor Name": "N/A", "Invoice #": "N/A", "Origin": "N/A", "Destination": "N/A", "Status": "FAIL", "Reason": "No Invoices Found in PDF"})
                 continue
             
@@ -469,10 +468,11 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                     status, reasons_string, extracted_data.total_amount, total_calculated, variance
                 ])
                 
+                # Passes the clean_supplier variable into the database
                 insert_audit_record((
                     current_date, current_time, filename, extracted_data.vendor_name, extracted_data.invoice_number, 
                     str(qc_origin), str(qc_dest), status, reasons_string, 
-                    extracted_data.total_amount, total_calculated, variance, file_proc_time, total_pages, current_batch_id
+                    extracted_data.total_amount, total_calculated, variance, file_proc_time, total_pages, current_batch_id, pre_selected_vendor
                 ))
 
                 current_run_summary.append({
@@ -485,7 +485,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                 
         except Exception as e:
             file_proc_time = round(time.time() - file_start_time, 2)
-            insert_audit_record((current_date, current_time, filename, "N/A", "N/A", "N/A", "N/A", "FAIL - CRITICAL ERROR", str(e), 0.0, 0.0, 0.0, file_proc_time, 0, current_batch_id))
+            insert_audit_record((current_date, current_time, filename, "N/A", "N/A", "N/A", "N/A", "FAIL - CRITICAL ERROR", str(e), 0.0, 0.0, 0.0, file_proc_time, 0, current_batch_id, pre_selected_vendor))
             current_run_summary.append({"File Name": filename, "Vendor Name": "ERROR", "Invoice #": "ERROR", "Origin": "ERROR", "Destination": "ERROR", "Status": "❌ ERROR", "Reason": "API/System Crash", "Proc Time": f"{file_proc_time}s"})
             error_count += 1
         
@@ -584,17 +584,36 @@ st.title("🧾 AI Invoice Intelligence Platform")
 
 # Sidebar
 with st.sidebar:
+    st.header("📄 Batch Upload & Processing")
+    
+    # ---> NEW: Processing Mode Toggle <---
+    processing_mode = st.radio(
+        "Select Processing Mode:", 
+        ["Mixed Vendors (Auto-Detect)", "Single Vendor Batch"],
+        help="Use Single Vendor if all uploaded PDFs belong to the same supplier. This improves AI matching."
+    )
+    
+    pre_selected_supplier = None
+    if processing_mode == "Single Vendor Batch":
+        pre_selected_supplier = st.text_input("Enter Clean Supplier Name for this batch:", placeholder="e.g. Tata Steel")
+        st.info("📌 All PDFs uploaded below will be mapped to this supplier in the Master Database.")
+        
+    st.write("")
+    uploaded_files = st.file_uploader(
+        "Upload PDF Documents (Select multiple files or use Ctrl+A in folder)", 
+        type=["pdf"], 
+        accept_multiple_files=True
+    )
+    
+    st.divider()
+
     with st.expander("⚙️ Processing Configuration", expanded=False):
         config_max_pages = st.number_input("Max Pages per PDF", min_value=1, max_value=100, value=15)
         config_dpi = st.slider("Render Resolution (DPI)", min_value=72, max_value=600, value=300, step=72)
         config_sleep_time = st.number_input("API Sleep Time (seconds)", min_value=0, max_value=60, value=3)
 
-    st.divider()
-    
-    st.header("🎯 Extraction Rules")
-    with st.expander("1. Standard Field Aliases", expanded=False):
+    with st.expander("🎯 Standard Field Aliases", expanded=False):
         st.write("Add alternative names (comma-separated) for built-in fields to help the AI find them.")
-        
         default_standard = pd.DataFrame({
             "Standard Field": [
                 "invoice_number", "date", "vendor_name", "vendor_address", 
@@ -612,7 +631,7 @@ with st.sidebar:
             if str(row["Aliases"]).strip() and str(row["Aliases"]) != "None":
                 standard_aliases_dict[row["Standard Field"]] = str(row["Aliases"]).strip()
                 
-    with st.expander("2. New Custom Fields", expanded=False):
+    with st.expander("🎯 New Custom Fields", expanded=False):
         st.write("Add entirely new columns to extract.")
         default_custom = pd.DataFrame({
             "Field Name": [""],
@@ -626,10 +645,6 @@ with st.sidebar:
             desc = str(row["Description & Aliases"]).strip()
             if name and name != "None":
                 custom_fields_dict[name] = desc
-    
-    st.divider()
-    st.header("📄 Upload Files")
-    uploaded_files = st.file_uploader("Upload PDF Documents", type=["pdf"], accept_multiple_files=True)
 
 # Tabs
 tab_extract, tab_viewer, tab_batch, tab_analytics, tab_system = st.tabs([
@@ -645,6 +660,8 @@ with tab_extract:
     if st.button("🚀 Start Extraction", type="primary"):
         if not uploaded_files:
             st.error("Please upload at least one PDF file from the sidebar.")
+        elif processing_mode == "Single Vendor Batch" and not pre_selected_supplier:
+            st.error("⚠️ Please enter a Supplier Name in the sidebar before extracting a Single Vendor Batch.")
         elif not all([AZURE_ENDPOINT, AZURE_API_KEY, AZURE_DEPLOYMENT]):
             st.error("⚠️ Azure credentials missing. Check your `.env` file.")
         else:
@@ -653,6 +670,10 @@ with tab_extract:
             
             unique_files = [f for f in uploaded_files if f.name not in existing_filenames]
             duplicate_files = [f for f in uploaded_files if f.name in existing_filenames]
+            
+            # Pass the pre-selected vendor if chosen, otherwise pass None
+            vendor_to_pass = pre_selected_supplier if processing_mode == "Single Vendor Batch" else None
+            st.session_state.current_pre_selected_vendor = vendor_to_pass
             
             if duplicate_files:
                 confirm_duplicates_dialog(duplicate_files, unique_files)
@@ -667,7 +688,8 @@ with tab_extract:
             standard_aliases_dict, 
             config_max_pages, 
             config_dpi,
-            config_sleep_time
+            config_sleep_time,
+            pre_selected_vendor=st.session_state.get('current_pre_selected_vendor', None)
         )
         st.session_state.start_processing = False
         st.rerun()
@@ -735,13 +757,11 @@ with tab_batch:
     if df_audit.empty:
         st.info("Process a batch of invoices to view current metrics.")
     else:
-        # ---> THE FIX: Safely retrieve the latest batch ID to perfectly isolate the run <---
         if 'batch_id' in df_audit.columns and not df_audit['batch_id'].isna().all():
             latest_batch = df_audit['batch_id'].dropna().iloc[-1]
             batch_df = df_audit[df_audit['batch_id'] == latest_batch].copy()
             st.markdown(f"**Latest Batch ID:** `{latest_batch}` | **Total Invoices in Batch:** `{len(batch_df)}`")
         else:
-            # Fallback for old database rows that don't have a batch_id yet
             latest_date = df_audit['extraction_date'].max()
             batch_df = df_audit[df_audit['extraction_date'] == latest_date].copy()
             st.markdown(f"**Latest Batch Date:** `{latest_date}` | **Total Invoices in Batch:** `{len(batch_df)}`")
@@ -753,7 +773,6 @@ with tab_batch:
         ]
         batch_mismatches = batch_df[batch_df['variance'] != 0.0]
         
-        # Batch specific KPIs
         bc1, bc2, bc3, bc4 = st.columns(4)
         bc1.metric("Batch Processing Volume", f"{len(batch_df)}")
         bc2.metric("Batch Math Mismatches", f"{len(batch_mismatches)}", delta_color="inverse")
@@ -768,6 +787,7 @@ with tab_batch:
         
         if 'clean_supplier' in batch_df.columns:
             mapping_df = batch_df[['id', 'file_name', 'vendor_name', 'clean_supplier']].copy()
+            # If the user pre-selected a vendor, it's already in the DB. If not, we auto-standardize it for them to review.
             mapping_df['clean_supplier'] = mapping_df['clean_supplier'].fillna(mapping_df['vendor_name'].apply(standardize_vendor))
             
             edited_mapping = st.data_editor(
@@ -794,7 +814,6 @@ with tab_batch:
             st.write("Scan the Master Database to suggest the Top 5 most frequent historical routes for invoices missing data.")
             
             if st.button("⚙️ Generate Top 5 Historical Suggestions"):
-                # Use the ENTIRE database history for learning
                 valid_origins = df_audit[~df_audit['origin'].isin(missing_flags) & df_audit['origin'].notna()]
                 valid_dests = df_audit[~df_audit['destination'].isin(missing_flags) & df_audit['destination'].notna()]
                 
@@ -816,7 +835,6 @@ with tab_batch:
                     suggs = [f"{idx+1}. {row['destination']} (x{row['count']})" for idx, row in enumerate(group.to_dict('records'))]
                     dest_dict[supp] = " | ".join(suggs)
                 
-                # Apply the historical learning ONLY to the current batch's missing data
                 for idx, row in batch_routing_issues.iterrows():
                     supp = row['clean_supplier'] if pd.notna(row['clean_supplier']) else standardize_vendor(row['vendor_name'])
                     sug_orig = orig_dict.get(supp, "No historical data")
@@ -828,7 +846,6 @@ with tab_batch:
                 
             st.write("Review the Top 5 historical suggestions below and type your final choice into the Approved column.")
             
-            # Fetch fresh data to populate the UI grid
             current_db = fetch_audit_data()
             if 'batch_id' in current_db.columns and not current_db['batch_id'].isna().all():
                 c_latest_batch = current_db['batch_id'].dropna().iloc[-1]
