@@ -56,7 +56,7 @@ def init_db():
         )
     ''')
     
-    # ---> NEW: Audit Log for Database Deletions <---
+    # Audit Log for Database Deletions
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS deletion_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -145,7 +145,7 @@ def wipe_master_db(user_name: str):
 init_db()
 
 # ==============================================================
-# 1. Define Data Schema (CORE LOGIC UNTOUCHED)
+# 1. Define Data Schema (ROLLED BACK TO HYPER-AGGRESSIVE ANTI-LAZINESS)
 # ==============================================================
 
 class LineItem(BaseModel):
@@ -158,9 +158,15 @@ class LineItem(BaseModel):
     unit_price: Optional[float] = Field(None, description="Price of a single unit")
     line_total: Optional[float] = Field(None, description="Total cost for this specific line item. Look for 'Amount', 'Total', 'Extended Price', or 'Extd Price'. STRICT RULE: If the column is blank (e.g., due to a backordered item), leave this null or 0.0. Do not guess.")
     
-    line_origin: Optional[str] = Field(None, description="CRITICAL ANTI-LAZINESS RULE: You MUST read the exact Origin/Ship-From address printed for THIS specific row. DO NOT copy or repeat the value from the row above. Every single row is unique. Look closely at the image for this exact line. If it is blank for this specific row, you MUST leave it null.")
-    line_destination: Optional[str] = Field(None, description="CRITICAL ANTI-LAZINESS RULE: You MUST read the exact Destination/Ship-To address printed for THIS specific row. DO NOT copy or repeat the value from the row above. Every single row is unique. Look closely at the image for this exact line. If it is blank for this specific row, you MUST leave it null.")
-    line_routing_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'. STRICT RULE: Rate as 'Low' if you suspect hallucination, or if you are guessing/copying the Origin or Destination from previous rows without explicit printed evidence on this exact line.")
+    # ---> THE FIX: Hyper-Aggressive Anti-Laziness Prompts <---
+    line_origin: Optional[str] = Field(
+        None, 
+        description="CRITICAL ANTI-LAZINESS RULE: You MUST read the exact Origin/Ship-From address printed for THIS specific row. DO NOT copy or repeat the value from the row above. Every single row is unique. Look closely at the image for this exact line. If it is blank for this specific row, you MUST leave it null."
+    )
+    line_destination: Optional[str] = Field(
+        None, 
+        description="CRITICAL ANTI-LAZINESS RULE: You MUST read the exact Destination/Ship-To address printed for THIS specific row. DO NOT copy or repeat the value from the row above. Every single row is unique. Look closely at the image for this exact line. If it is blank for this specific row, you MUST leave it null."
+    )
 
 class TaxItem(BaseModel):
     tax_name: str = Field(description="The exact printed name of the tax (e.g., 'GST/HST', 'TPS/TVH', 'QST').")
@@ -255,7 +261,7 @@ def setup_excel_workbook(custom_cols: List[str]):
     details_headers = [
         "File Name", "Page #", "Vendor Name", "Vendor Address", "Bill To", "Remit To",
         "Origin", "Destination", "Invoice Number", "Date", "Currency", 
-        "Material", "Description", "Line Origin", "Line Destination", "Line Routing Conf",
+        "Material", "Description", "Line Origin", "Line Destination",
         "Quantity", "UOM", "Unit Price", "Line Total", "Subtotal", "Invoice Total",
         "Inv# Conf", "Origin Conf", "Dest Conf", "UOM Conf", "Total Conf", "Status", "Reason for Review"
     ]
@@ -350,15 +356,12 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                     if item.uom_confidence == "Low":
                         short_desc = item.description[:15] + "..." if item.description and len(item.description) > 15 else item.description
                         review_reasons.append(f"Low Conf: UOM on '{short_desc}'")
-                    if item.line_routing_confidence == "Low":
-                        short_desc = item.description[:15] + "..." if item.description and len(item.description) > 15 else item.description
-                        review_reasons.append(f"Hallucination Risk: Routing on '{short_desc}'")
                 
                 needs_review = len(review_reasons) > 0
                 status = "FAIL - NEEDS REVIEW" if needs_review else "PASS"
                 reasons_string = " | ".join(review_reasons) if needs_review else "N/A"
                 
-                def create_row_dict(page_num, material, desc, qty, uom, uom_conf, price, line_total, line_orig=None, line_dest=None, route_conf=None):
+                def create_row_dict(page_num, material, desc, qty, uom, uom_conf, price, line_total, line_orig=None, line_dest=None):
                     final_origin = line_orig if line_orig else extracted_data.origin
                     final_dest = line_dest if line_dest else extracted_data.destination
                     
@@ -369,7 +372,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                         "Origin": final_origin, "Destination": final_dest, 
                         "Invoice Number": extracted_data.invoice_number, "Date": extracted_data.date, "Currency": extracted_data.currency,
                         "Material": material, "Description": desc, "Line Origin": line_orig, "Line Destination": line_dest,
-                        "Line Routing Conf": route_conf, "Quantity": qty, "UOM": uom, "Unit Price": price, "Line Total": line_total,
+                        "Quantity": qty, "UOM": uom, "Unit Price": price, "Line Total": line_total,
                         "Subtotal": extracted_data.subtotal, "Invoice Total": extracted_data.total_amount,
                         "Inv# Conf": extracted_data.invoice_number_confidence, "Origin Conf": extracted_data.origin_confidence,
                         "Dest Conf": extracted_data.destination_confidence, "UOM Conf": uom_conf, "Total Conf": extracted_data.total_amount_confidence,
@@ -388,7 +391,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                         row_dict = create_row_dict(
                             item.page_number, item.material, item.description, item.quantity, 
                             item.uom, item.uom_confidence, item.unit_price, item.line_total, 
-                            line_orig=item.line_origin, line_dest=item.line_destination, route_conf=item.line_routing_confidence
+                            line_orig=item.line_origin, line_dest=item.line_destination
                         )
                         ws_details.append(list(row_dict.values()))
                         current_run_details.append(row_dict)
@@ -461,6 +464,28 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
     st.success(f"🎉 {prefix} Batch Processing Complete! Invoices Extracted: {success_count} | Errors: {error_count}")
 
 
+@st.dialog("⚠️ Duplicate Files Detected")
+def confirm_duplicates_dialog(duplicate_files, unique_files):
+    st.warning(f"Found {len(duplicate_files)} file(s) that have already been processed and exist in the master database.")
+    for f in duplicate_files:
+        st.write(f"- `{f.name}`")
+    st.write("Do you want to extract these again? (This will add duplicate entries to your audit logs).")
+    
+    col1, col2 = st.columns(2)
+    if col1.button("Yes, Process All", type="primary"):
+        st.session_state.files_to_process = unique_files + duplicate_files
+        st.session_state.start_processing = True
+        st.rerun()
+    if col2.button("No, Unique Only"):
+        if unique_files:
+            st.session_state.files_to_process = unique_files
+            st.session_state.start_processing = True
+            st.rerun()
+        else:
+            st.warning("No unique files to process.")
+            time.sleep(2)
+            st.rerun()
+
 # --- DB Management Dialogs ---
 @st.dialog("🗑️ Remove Duplicate Invoices")
 def dialog_remove_duplicates():
@@ -482,28 +507,6 @@ def dialog_wipe_db():
             st.error("Name is required for the audit log.")
         else:
             wipe_master_db(user_name.strip())
-            st.rerun()
-
-@st.dialog("⚠️ Duplicate Files Detected")
-def confirm_duplicates_dialog(duplicate_files, unique_files):
-    st.warning(f"Found {len(duplicate_files)} file(s) that have already been processed and exist in the master database.")
-    for f in duplicate_files:
-        st.write(f"- `{f.name}`")
-    st.write("Do you want to extract these again? (This will add duplicate entries to your audit logs).")
-    
-    col1, col2 = st.columns(2)
-    if col1.button("Yes, Process All", type="primary"):
-        st.session_state.files_to_process = unique_files + duplicate_files
-        st.session_state.start_processing = True
-        st.rerun()
-    if col2.button("No, Unique Only"):
-        if unique_files:
-            st.session_state.files_to_process = unique_files
-            st.session_state.start_processing = True
-            st.rerun()
-        else:
-            st.warning("No unique files to process.")
-            time.sleep(2)
             st.rerun()
 
 # ==============================================================
@@ -640,9 +643,17 @@ with tab_viewer:
                 with col:
                     st.subheader(file.name)
                     file.seek(0)
-                    base64_pdf = base64.b64encode(file.read()).decode('utf-8')
-                    pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="500" type="application/pdf"></iframe>'
-                    st.markdown(pdf_display, unsafe_allow_html=True)
+                    doc = fitz.open(stream=file.read(), filetype="pdf")
+                    html_content = '<div style="height: 500px; overflow-y: scroll; border: 1px solid #ddd; padding: 10px; background-color: #f9f9f9;">'
+                    
+                    for page_num in range(len(doc)):
+                        page = doc[page_num]
+                        pix = page.get_pixmap(dpi=150) 
+                        img_b64 = base64.b64encode(pix.tobytes("jpeg")).decode('utf-8')
+                        html_content += f'<img src="data:image/jpeg;base64,{img_b64}" style="width: 100%; margin-bottom: 10px; border: 1px solid #ccc; box-shadow: 2px 2px 5px rgba(0,0,0,0.1);">'
+                        
+                    html_content += '</div>'
+                    st.markdown(html_content, unsafe_allow_html=True)
                     file.seek(0)
     else:
         st.info("Upload PDF documents in the sidebar to view them here.")
@@ -728,7 +739,6 @@ with tab_analytics:
         
         st.divider()
         
-        # ---> NEW: Duplicate Table and DB Management <---
         st.subheader("📑 Duplicate Invoices Detected")
         if not duplicates_df.empty:
             st.dataframe(duplicates_df[['vendor_name', 'invoice_number', 'file_name', 'extracted_total']], use_container_width=True, hide_index=True)
