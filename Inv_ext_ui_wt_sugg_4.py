@@ -276,7 +276,7 @@ def pdf_to_base64_images(file_bytes: bytes, max_pages: int, dpi: int) -> Tuple[L
         base64_images.append(base64.b64encode(pix.tobytes("jpeg")).decode('utf-8'))
     return base64_images, total_pages
 
-def extract_invoice_data(client, deployment: str, file_bytes: bytes, custom_fields_dict: Dict[str, str], standard_aliases_dict: Dict[str, str], max_pages: int, dpi: int) -> Tuple[InvoiceDocument, int]:
+def extract_invoice_data(client, deployment: str, file_bytes: bytes, custom_fields_dict: Dict[str, str], standard_aliases_dict: Dict[str, max_pages: int, dpi: int) -> Tuple[InvoiceDocument, int]:
     base64_images, total_pages = pdf_to_base64_images(file_bytes, max_pages, dpi)
     
     system_prompt = "You are an expert accountant processing a document that may contain multiple distinct invoices. STRICT PAGING RULES: 1) If the same invoice number continues across multiple pages, combine all line items, taxes, and totals into a SINGLE invoice record. 2) If you see a NEW invoice number, start a NEW invoice record. CRITICAL RULE AGAINST DUPLICATES: Never extract the same tax or fee twice. ANTI-LAZINESS RULE: DO NOT BE LAZY. You must extract every single line item row by row. Skipping the middle of a table, abbreviating, or summarizing items is a CRITICAL FAILURE. Your extracted total for EACH invoice must mathematically equal the calculated sum of unique items for that invoice."
@@ -698,7 +698,6 @@ with tab_extract:
         st.subheader("🛡️ QC Summary")
         st.dataframe(pd.DataFrame(st.session_state.extraction_summary), use_container_width=True, hide_index=True)
 
-        # Legacy Download (Full Session State)
         st.download_button(
             label="📥 Download Excel Report (Legacy View)",
             data=st.session_state.extraction_excel,
@@ -753,7 +752,6 @@ with tab_batch:
     if df_audit.empty:
         st.info("Process a batch of invoices to view current metrics.")
     else:
-        # Determine current batch scope
         if 'batch_id' in df_audit.columns and not df_audit['batch_id'].isna().all():
             latest_batch = df_audit['batch_id'].dropna().iloc[-1]
             batch_df = df_audit[df_audit['batch_id'] == latest_batch].copy()
@@ -768,7 +766,6 @@ with tab_batch:
         if vendor_col == 'original_supplier_name':
             batch_df['original_supplier_name'] = batch_df['original_supplier_name'].fillna(batch_df['vendor_name'].apply(standardize_vendor))
 
-        # KPI Calculations
         batch_invoices = len(batch_df)
         batch_vendors = batch_df[vendor_col].nunique()
         batch_spend_k = batch_df['extracted_total'].sum() / 1000.0
@@ -780,11 +777,9 @@ with tab_batch:
             batch_dups = all_duplicates[all_duplicates['batch_id'] == latest_batch]
             batch_dup_count = len(batch_dups)
             
-        # ---> NEW: Calculate Total Execution Time for the batch <---
         total_time_sec = batch_df['processing_time'].sum() if 'processing_time' in batch_df.columns else 0.0
         mins, secs = divmod(int(total_time_sec), 60)
         
-        # Display 5 KPIs instead of 4
         bc1, bc2, bc3, bc4, bc5 = st.columns(5)
         bc1.metric("Current Invoices Processed", f"{batch_invoices:,}")
         bc2.metric("Total Unique Vendors", f"{batch_vendors:,}")
@@ -794,14 +789,12 @@ with tab_batch:
 
         st.divider()
         
-        # ---> NEW: Dynamic Excel Download for Current Batch <---
         st.subheader("📥 Download Batch Data")
         st.write("Download the raw QC database table specifically for this batch, including your clean supplier mappings.")
         
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             cols = batch_df.columns.tolist()
-            # Bring original_supplier_name next to vendor_name for easier readability in Excel
             if 'original_supplier_name' in cols and 'vendor_name' in cols:
                 cols.insert(cols.index('vendor_name') + 1, cols.pop(cols.index('original_supplier_name')))
             
@@ -819,12 +812,10 @@ with tab_batch:
         
         st.divider()
         
-        # ---> NEW: Pass/Fail Status Overview Table <---
         st.subheader("📄 Status Overview (Pass/Fail)")
         st.write("Quickly identify which files passed and which need manual review.")
         
         status_df = batch_df[['file_name', 'invoice_number', 'vendor_name', 'original_supplier_name', 'status', 'reason_for_review']].copy()
-        # Add some color to make it easy to scan
         def color_status(val):
             color = '#2ecc71' if val == 'PASS' else '#e74c3c'
             return f'color: {color}; font-weight: bold;'
@@ -1229,6 +1220,11 @@ with tab_analytics:
             }).sort_values(by='Invoice Count', ascending=False)
             
             st.dataframe(vendor_routes, use_container_width=True, hide_index=True)
+
+        with st.expander("🗄️ Full Master Database View", expanded=False):
+            st.write("View the complete, raw QC Master Database table containing all historical extractions.")
+            raw_sql_df = fetch_audit_data()
+            st.dataframe(raw_sql_df, use_container_width=True, hide_index=True)
 
 # ---------------------------------------------------------
 # TAB 5: SYSTEM & DRIFT ANALYSIS
