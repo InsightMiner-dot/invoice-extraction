@@ -16,7 +16,7 @@ import re
 from dotenv import load_dotenv
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go  # <--- FIXED: Added missing import here
+import plotly.graph_objects as go
 from wordcloud import WordCloud
 import matplotlib.pyplot as plt
 
@@ -69,16 +69,22 @@ def init_db():
         )
     ''')
     
-    try:
-        cursor.execute("ALTER TABLE qc_audit ADD COLUMN processing_time REAL")
-        cursor.execute("ALTER TABLE qc_audit ADD COLUMN page_count INTEGER")
-        cursor.execute("ALTER TABLE qc_audit ADD COLUMN clean_supplier TEXT")
-        cursor.execute("ALTER TABLE qc_audit ADD COLUMN suggested_origin TEXT")
-        cursor.execute("ALTER TABLE qc_audit ADD COLUMN final_origin TEXT")
-        cursor.execute("ALTER TABLE qc_audit ADD COLUMN suggested_destination TEXT")
-        cursor.execute("ALTER TABLE qc_audit ADD COLUMN final_destination TEXT")
-    except sqlite3.OperationalError:
-        pass 
+    # ---> THE FIX: Individual column checks so the DB always updates correctly <---
+    new_columns = [
+        ("processing_time", "REAL"),
+        ("page_count", "INTEGER"),
+        ("clean_supplier", "TEXT"),
+        ("suggested_origin", "TEXT"),
+        ("final_origin", "TEXT"),
+        ("suggested_destination", "TEXT"),
+        ("final_destination", "TEXT")
+    ]
+    
+    for col_name, col_type in new_columns:
+        try:
+            cursor.execute(f"ALTER TABLE qc_audit ADD COLUMN {col_name} {col_type}")
+        except sqlite3.OperationalError:
+            pass # Column already exists, safe to ignore
         
     conn.commit()
     conn.close()
@@ -527,6 +533,28 @@ def confirm_duplicates_dialog(duplicate_files, unique_files):
             time.sleep(2)
             st.rerun()
 
+@st.dialog("🗑️ Remove Duplicate Invoices")
+def dialog_remove_duplicates():
+    st.warning("This will permanently delete all duplicate records (keeping the oldest one) based on Vendor Name + Invoice Number.")
+    user_name = st.text_input("Enter your name to authorize deletion:")
+    if st.button("Confirm Deletion", type="primary"):
+        if not user_name.strip():
+            st.error("Name is required for the audit log.")
+        else:
+            remove_duplicates_db(user_name.strip())
+            st.rerun()
+
+@st.dialog("⚠️ Wipe Master Database")
+def dialog_wipe_db():
+    st.error("CRITICAL WARNING: This will permanently delete ALL extracted invoice data from the system.")
+    user_name = st.text_input("Enter your name to authorize complete wipe:")
+    if st.button("Confirm Complete Wipe", type="primary"):
+        if not user_name.strip():
+            st.error("Name is required for the audit log.")
+        else:
+            wipe_master_db(user_name.strip())
+            st.rerun()
+
 @st.dialog("📄 Fullscreen Document Viewer", width="large")
 def view_fullscreen_pdf(file_bytes, file_name):
     st.markdown(f"### {file_name}")
@@ -599,9 +627,9 @@ with st.sidebar:
     st.header("📄 Upload Files")
     uploaded_files = st.file_uploader("Upload PDF Documents", type=["pdf"], accept_multiple_files=True)
 
-# Tabs
-tab_extract, tab_viewer, tab_analytics, tab_system, tab_batch = st.tabs([
-    "⚙️ Extraction Suite", "📄 Document Viewer", "📊 Business Analytics", "🤖 System & Drift Analysis", "✅ Current Batch QA"
+# ---> TAB REARRANGEMENT: Current Batch QA moved here <---
+tab_extract, tab_viewer, tab_batch, tab_analytics, tab_system = st.tabs([
+    "⚙️ Extraction Suite", "📄 Document Viewer", "✅ Current Batch QA", "📊 Business Analytics", "🤖 System & Drift Analysis"
 ])
 
 # ---------------------------------------------------------
@@ -692,7 +720,144 @@ with tab_viewer:
         st.info("Upload PDF documents in the sidebar to view them here.")
 
 # ---------------------------------------------------------
-# TAB 3: BUSINESS ANALYTICS
+# TAB 3: CURRENT BATCH QA & SUPPLIER MAPPING (Moved here)
+# ---------------------------------------------------------
+with tab_batch:
+    st.header("✅ Current Batch QA & Master Data Preparation")
+    st.write("Review the quality of the most recent extraction batch, map messy vendor names to Clean Suppliers, and execute AI Routing Suggestions.")
+    
+    df_audit = fetch_audit_data()
+    
+    if df_audit.empty:
+        st.info("Process a batch of invoices to view current metrics.")
+    else:
+        # Isolate the latest extraction date to represent the "Current Batch"
+        latest_date = df_audit['extraction_date'].max()
+        batch_df = df_audit[df_audit['extraction_date'] == latest_date].copy()
+        
+        st.markdown(f"**Latest Batch Date:** `{latest_date}` | **Total Invoices in Batch:** `{len(batch_df)}`")
+        
+        missing_flags = ['N/A', 'None', '', 'null', 'None']
+        batch_routing_issues = batch_df[
+            batch_df['origin'].isin(missing_flags) | batch_df['origin'].isna() |
+            batch_df['destination'].isin(missing_flags) | batch_df['destination'].isna()
+        ]
+        batch_mismatches = batch_df[batch_df['variance'] != 0.0]
+        
+        bc1, bc2, bc3, bc4 = st.columns(4)
+        bc1.metric("Batch Processing Volume", f"{len(batch_df)}")
+        bc2.metric("Batch Math Mismatches", f"{len(batch_mismatches)}", delta_color="inverse")
+        bc3.metric("Batch Routing Issues", f"{len(batch_routing_issues)}", delta_color="inverse")
+        batch_acc = ((len(batch_df) - len(batch_mismatches)) / len(batch_df)) * 100 if len(batch_df) > 0 else 0
+        bc4.metric("Batch Math Accuracy", f"{batch_acc:.1f}%")
+
+        st.divider()
+
+        st.subheader("1. Clean Supplier Mapping")
+        st.write("Map raw extracted vendor names to standard 'Clean Suppliers' to prepare the database for historical AI lookups.")
+        
+        # Make sure the column exists in the dataframe before manipulating it
+        if 'clean_supplier' in batch_df.columns:
+            mapping_df = batch_df[['id', 'file_name', 'vendor_name', 'clean_supplier']].copy()
+            mapping_df['clean_supplier'] = mapping_df['clean_supplier'].fillna(mapping_df['vendor_name'].apply(standardize_vendor))
+            
+            edited_mapping = st.data_editor(
+                mapping_df, 
+                use_container_width=True, 
+                hide_index=True,
+                column_config={
+                    "id": st.column_config.NumberColumn("DB ID", disabled=True),
+                    "file_name": st.column_config.TextColumn("File Name", disabled=True),
+                    "vendor_name": st.column_config.TextColumn("Extracted Raw Vendor", disabled=True),
+                    "clean_supplier": st.column_config.TextColumn("✏️ Edit Clean Supplier Name")
+                }
+            )
+            
+            if st.button("💾 Save Supplier Mappings to Master DB", type="primary"):
+                for index, row in edited_mapping.iterrows():
+                    update_audit_record_supplier(row['id'], row['clean_supplier'])
+                st.success("Successfully updated supplier mappings!")
+                st.rerun()
+
+            st.divider()
+            
+            st.subheader("2. AI Routing Suggestions (HitL Framework)")
+            st.write("Scan the Master Database to suggest the Top 5 most frequent historical routes for invoices missing data.")
+            
+            if st.button("⚙️ Generate Top 5 Historical Suggestions"):
+                valid_origins = df_audit[~df_audit['origin'].isin(missing_flags) & df_audit['origin'].notna()]
+                valid_dests = df_audit[~df_audit['destination'].isin(missing_flags) & df_audit['destination'].notna()]
+                
+                # Top Origins calculation
+                orig_counts = valid_origins.groupby(['clean_supplier', 'origin']).size().reset_index(name='count')
+                orig_counts = orig_counts.sort_values(['clean_supplier', 'count'], ascending=[True, False])
+                top_origins = orig_counts.groupby('clean_supplier').head(5)
+                
+                orig_dict = {}
+                for supp, group in top_origins.groupby('clean_supplier'):
+                    suggs = [f"{idx+1}. {row['origin']} (x{row['count']})" for idx, row in enumerate(group.to_dict('records'))]
+                    orig_dict[supp] = " | ".join(suggs)
+                    
+                # Top Destinations calculation
+                dest_counts = valid_dests.groupby(['clean_supplier', 'destination']).size().reset_index(name='count')
+                dest_counts = dest_counts.sort_values(['clean_supplier', 'count'], ascending=[True, False])
+                top_dests = dest_counts.groupby('clean_supplier').head(5)
+                
+                dest_dict = {}
+                for supp, group in top_dests.groupby('clean_supplier'):
+                    suggs = [f"{idx+1}. {row['destination']} (x{row['count']})" for idx, row in enumerate(group.to_dict('records'))]
+                    dest_dict[supp] = " | ".join(suggs)
+                
+                for idx, row in batch_routing_issues.iterrows():
+                    supp = row['clean_supplier'] if pd.notna(row['clean_supplier']) else standardize_vendor(row['vendor_name'])
+                    sug_orig = orig_dict.get(supp, "No historical data")
+                    sug_dest = dest_dict.get(supp, "No historical data")
+                    update_audit_suggestions(row['id'], sug_orig, sug_dest)
+                    
+                st.success("Historical suggestions generated successfully!")
+                st.rerun()
+                
+            st.write("Review the Top 5 historical suggestions below and type your final choice into the Approved column.")
+            
+            current_db = fetch_audit_data()
+            current_batch_issues = current_db[(current_db['extraction_date'] == latest_date) & (
+                current_db['origin'].isin(missing_flags) | current_db['origin'].isna() |
+                current_db['destination'].isin(missing_flags) | current_db['destination'].isna()
+            )].copy()
+            
+            if not current_batch_issues.empty:
+                review_df = current_batch_issues[['id', 'file_name', 'clean_supplier', 'origin', 'suggested_origin', 'final_origin', 'destination', 'suggested_destination', 'final_destination']]
+                
+                edited_routes = st.data_editor(
+                    review_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "id": st.column_config.NumberColumn("DB ID", disabled=True),
+                        "file_name": st.column_config.TextColumn("File", disabled=True),
+                        "clean_supplier": st.column_config.TextColumn("Supplier", disabled=True),
+                        "origin": st.column_config.TextColumn("Raw Origin", disabled=True),
+                        "suggested_origin": st.column_config.TextColumn("🤖 Suggested Origins (Top 5)", disabled=True),
+                        "final_origin": st.column_config.TextColumn("✅ Approved Origin"),
+                        "destination": st.column_config.TextColumn("Raw Dest", disabled=True),
+                        "suggested_destination": st.column_config.TextColumn("🤖 Suggested Dests (Top 5)", disabled=True),
+                        "final_destination": st.column_config.TextColumn("✅ Approved Dest")
+                    }
+                )
+                
+                if st.button("💾 Save Approved Routes to DB", type="primary"):
+                    for index, row in edited_routes.iterrows():
+                        if pd.notna(row['final_origin']) or pd.notna(row['final_destination']):
+                            f_orig = row['final_origin'] if pd.notna(row['final_origin']) else None
+                            f_dest = row['final_destination'] if pd.notna(row['final_destination']) else None
+                            update_audit_final_routes(row['id'], f_orig, f_dest)
+                    st.success("Final routes locked into the Master Database.")
+                    st.rerun()
+            else:
+                st.info("No routing issues found in the current batch!")
+
+# ---------------------------------------------------------
+# TAB 4: BUSINESS ANALYTICS
 # ---------------------------------------------------------
 with tab_analytics:
     st.header("📊 Business Analytics - Extraction Quality")
@@ -787,10 +952,8 @@ with tab_analytics:
         
         vendor_df['missing_origin'] = vendor_df['origin'].isin(missing_flags) | vendor_df['origin'].isna()
         vendor_df['valid_origin'] = ~vendor_df['missing_origin']
-        
         vendor_df['missing_dest'] = vendor_df['destination'].isin(missing_flags) | vendor_df['destination'].isna()
         vendor_df['valid_dest'] = ~vendor_df['missing_dest']
-        
         vendor_df['amount_mismatch'] = vendor_df['variance'] != 0.0
 
         vendor_summary = vendor_df.groupby('vendor_name').agg(
@@ -883,7 +1046,23 @@ with tab_analytics:
 
         st.divider()
 
-        # 7. Hidden Expanders
+        # 7. Top Corridors
+        st.subheader("📍 Top Shipping Corridors")
+        df_valid_routes = df_audit[~df_audit['origin'].isin(missing_flags) & ~df_audit['destination'].isin(missing_flags)].copy()
+        
+        if not df_valid_routes.empty:
+            df_valid_routes['Corridor'] = df_valid_routes['origin'].astype(str) + " ➡️ " + df_valid_routes['destination'].astype(str)
+            corridor_counts = df_valid_routes['Corridor'].value_counts().reset_index().head(10)
+            corridor_counts.columns = ['Shipping Corridor', 'Volume']
+            fig_corridor = px.bar(corridor_counts, x='Volume', y='Shipping Corridor', orientation='h', text_auto=True, color_discrete_sequence=['#34495e'])
+            fig_corridor.update_layout(yaxis={'categoryorder':'total ascending'})
+            st.plotly_chart(fig_corridor, use_container_width=True)
+        else:
+            st.info("Not enough valid Origin & Destination pairs to map corridors.")
+
+        st.divider()
+
+        # 8. Hidden Expanders
         st.subheader("📋 Raw Data & Exception Tables")
         
         with st.expander("🚨 Routing Exception Report (Missing Data)", expanded=False):
@@ -918,7 +1097,7 @@ with tab_analytics:
             st.dataframe(vendor_routes, use_container_width=True, hide_index=True)
 
 # ---------------------------------------------------------
-# TAB 4: SYSTEM & DRIFT ANALYSIS
+# TAB 5: SYSTEM & DRIFT ANALYSIS
 # ---------------------------------------------------------
 with tab_system:
     st.header("🤖 System & Model Drift Analysis")
@@ -1040,135 +1219,3 @@ with tab_system:
         with col_btn2:
             if st.button("⚠️ Wipe Database", type="secondary", use_container_width=True):
                 dialog_wipe_db()
-
-# ---------------------------------------------------------
-# TAB 5: CURRENT BATCH QA & SUPPLIER MAPPING
-# ---------------------------------------------------------
-with tab_batch:
-    st.header("✅ Current Batch QA & Master Data Preparation")
-    st.write("Review the quality of the most recent extraction batch, map messy vendor names to Clean Suppliers, and execute AI Routing Suggestions.")
-    
-    df_audit = fetch_audit_data()
-    
-    if df_audit.empty:
-        st.info("Process a batch of invoices to view current metrics.")
-    else:
-        latest_date = df_audit['extraction_date'].max()
-        batch_df = df_audit[df_audit['extraction_date'] == latest_date].copy()
-        
-        st.markdown(f"**Latest Batch Date:** `{latest_date}` | **Total Invoices in Batch:** `{len(batch_df)}`")
-        
-        missing_flags = ['N/A', 'None', '', 'null', 'None']
-        batch_routing_issues = batch_df[
-            batch_df['origin'].isin(missing_flags) | batch_df['origin'].isna() |
-            batch_df['destination'].isin(missing_flags) | batch_df['destination'].isna()
-        ]
-        batch_mismatches = batch_df[batch_df['variance'] != 0.0]
-        
-        bc1, bc2, bc3, bc4 = st.columns(4)
-        bc1.metric("Batch Processing Volume", f"{len(batch_df)}")
-        bc2.metric("Batch Math Mismatches", f"{len(batch_mismatches)}", delta_color="inverse")
-        bc3.metric("Batch Routing Issues", f"{len(batch_routing_issues)}", delta_color="inverse")
-        batch_acc = ((len(batch_df) - len(batch_mismatches)) / len(batch_df)) * 100 if len(batch_df) > 0 else 0
-        bc4.metric("Batch Math Accuracy", f"{batch_acc:.1f}%")
-
-        st.divider()
-
-        st.subheader("1. Clean Supplier Mapping")
-        st.write("Map raw extracted vendor names to standard 'Clean Suppliers' to prepare the database for historical AI lookups.")
-        
-        mapping_df = batch_df[['id', 'file_name', 'vendor_name', 'clean_supplier']].copy()
-        mapping_df['clean_supplier'] = mapping_df['clean_supplier'].fillna(mapping_df['vendor_name'].apply(standardize_vendor))
-        
-        edited_mapping = st.data_editor(
-            mapping_df, 
-            use_container_width=True, 
-            hide_index=True,
-            column_config={
-                "id": st.column_config.NumberColumn("DB ID", disabled=True),
-                "file_name": st.column_config.TextColumn("File Name", disabled=True),
-                "vendor_name": st.column_config.TextColumn("Extracted Raw Vendor", disabled=True),
-                "clean_supplier": st.column_config.TextColumn("✏️ Edit Clean Supplier Name")
-            }
-        )
-        
-        if st.button("💾 Save Supplier Mappings to Master DB", type="primary"):
-            for index, row in edited_mapping.iterrows():
-                update_audit_record_supplier(row['id'], row['clean_supplier'])
-            st.success("Successfully updated supplier mappings!")
-            st.rerun()
-
-        st.divider()
-        
-        st.subheader("2. AI Routing Suggestions (HitL Framework)")
-        st.write("Scan the Master Database to suggest the Top 5 most frequent historical routes for invoices missing data.")
-        
-        if st.button("⚙️ Generate Top 5 Historical Suggestions"):
-            valid_origins = df_audit[~df_audit['origin'].isin(missing_flags) & df_audit['origin'].notna()]
-            valid_dests = df_audit[~df_audit['destination'].isin(missing_flags) & df_audit['destination'].notna()]
-            
-            orig_counts = valid_origins.groupby(['clean_supplier', 'origin']).size().reset_index(name='count')
-            orig_counts = orig_counts.sort_values(['clean_supplier', 'count'], ascending=[True, False])
-            top_origins = orig_counts.groupby('clean_supplier').head(5)
-            
-            orig_dict = {}
-            for supp, group in top_origins.groupby('clean_supplier'):
-                suggs = [f"{idx+1}. {row['origin']} (x{row['count']})" for idx, row in enumerate(group.to_dict('records'))]
-                orig_dict[supp] = " | ".join(suggs)
-                
-            dest_counts = valid_dests.groupby(['clean_supplier', 'destination']).size().reset_index(name='count')
-            dest_counts = dest_counts.sort_values(['clean_supplier', 'count'], ascending=[True, False])
-            top_dests = dest_counts.groupby('clean_supplier').head(5)
-            
-            dest_dict = {}
-            for supp, group in top_dests.groupby('clean_supplier'):
-                suggs = [f"{idx+1}. {row['destination']} (x{row['count']})" for idx, row in enumerate(group.to_dict('records'))]
-                dest_dict[supp] = " | ".join(suggs)
-            
-            for idx, row in batch_routing_issues.iterrows():
-                supp = row['clean_supplier'] if pd.notna(row['clean_supplier']) else standardize_vendor(row['vendor_name'])
-                sug_orig = orig_dict.get(supp, "No historical data")
-                sug_dest = dest_dict.get(supp, "No historical data")
-                update_audit_suggestions(row['id'], sug_orig, sug_dest)
-                
-            st.success("Historical suggestions generated successfully!")
-            st.rerun()
-            
-        st.write("Review the Top 5 historical suggestions below and type your final choice into the Approved column.")
-        
-        current_db = fetch_audit_data()
-        current_batch_issues = current_db[(current_db['extraction_date'] == latest_date) & (
-            current_db['origin'].isin(missing_flags) | current_db['origin'].isna() |
-            current_db['destination'].isin(missing_flags) | current_db['destination'].isna()
-        )].copy()
-        
-        if not current_batch_issues.empty:
-            review_df = current_batch_issues[['id', 'file_name', 'clean_supplier', 'origin', 'suggested_origin', 'final_origin', 'destination', 'suggested_destination', 'final_destination']]
-            
-            edited_routes = st.data_editor(
-                review_df,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "id": st.column_config.NumberColumn("DB ID", disabled=True),
-                    "file_name": st.column_config.TextColumn("File", disabled=True),
-                    "clean_supplier": st.column_config.TextColumn("Supplier", disabled=True),
-                    "origin": st.column_config.TextColumn("Raw Origin", disabled=True),
-                    "suggested_origin": st.column_config.TextColumn("🤖 Suggested Origins (Top 5)", disabled=True),
-                    "final_origin": st.column_config.TextColumn("✅ Approved Origin"),
-                    "destination": st.column_config.TextColumn("Raw Dest", disabled=True),
-                    "suggested_destination": st.column_config.TextColumn("🤖 Suggested Dests (Top 5)", disabled=True),
-                    "final_destination": st.column_config.TextColumn("✅ Approved Dest")
-                }
-            )
-            
-            if st.button("💾 Save Approved Routes to DB", type="primary"):
-                for index, row in edited_routes.iterrows():
-                    if pd.notna(row['final_origin']) or pd.notna(row['final_destination']):
-                        f_orig = row['final_origin'] if pd.notna(row['final_origin']) else None
-                        f_dest = row['final_destination'] if pd.notna(row['final_destination']) else None
-                        update_audit_final_routes(row['id'], f_orig, f_dest)
-                st.success("Final routes locked into the Master Database.")
-                st.rerun()
-        else:
-            st.info("No routing issues found in the current batch!")
