@@ -1,246 +1,970 @@
-import json
+import streamlit as st
+import fitz  # PyMuPDF
+import base64
+import instructor
 import os
+import sqlite3
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment
+from openai import AzureOpenAI
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Tuple
+import time
+import io
+from datetime import datetime
+import re
+from dotenv import load_dotenv
 import pandas as pd
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
-from azure.ai.documentintelligence import DocumentIntelligenceClient
-from azure.ai.documentintelligence.models import AnalyzeResult
-from azure.ai.documentintelligence.models import AnalyzeDocumentRequest
-from azure.core.credentials import AzureKeyCredential
+import plotly.express as px
+import plotly.graph_objects as go
+from wordcloud import WordCloud
+import matplotlib.pyplot as plt
+from fuzzywuzzy import process
 
+# Load environment variables from the backend
+load_dotenv(override=True)
 
-# ── Config ─────────────────────────────────────────────────────────────────────
-ENDPOINT  = "<your-endpoint>"
-KEY       = "<your-key>"
-MODEL_ID  = "prebuilt-invoice"
-OUTPUT_XL = "invoices_structured.xlsx"
+AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
+AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
 
-# List of PDF files to process (can be multiple invoices)
-PDF_FILES = [
-    "invoice1.pdf",
-    "invoice2.pdf",
-    # add more...
-]
+# ==============================================================
+# 0. Database & CSV Setup Functions
+# ==============================================================
 
+AUDIT_FOLDER = "audit"
+DB_PATH = os.path.join(AUDIT_FOLDER, "qc_master_database.sqlite")
+MASTER_CSV_PATH = os.path.join(AUDIT_FOLDER, "master_suppliers.csv")
 
-# ── Azure Analysis ─────────────────────────────────────────────────────────────
-
-def run_analysis(pdf_path: str) -> AnalyzeResult:
-    with open(pdf_path, "rb") as f:
-        pdf_bytes = f.read()
-    client = DocumentIntelligenceClient(endpoint=ENDPOINT, credential=AzureKeyCredential(KEY))
-    poller = client.begin_analyze_document(
-        MODEL_ID,
-        AnalyzeDocumentRequest(bytes_source=pdf_bytes),
-        content_type="application/json",
-    )
-    return poller.result()
-
-
-# ── Row Builder ────────────────────────────────────────────────────────────────
-
-def extract_row(filename: str, result: AnalyzeResult) -> list[dict]:
-    """
-    Returns a list of rows — one per detected document/invoice in the result.
-    Each row is a flat dict with:
-      - Filename, Page(s), DocType, OverallConfidence
-      - One column per detected field  (e.g. VendorName, InvoiceTotal ...)
-      - One column per field confidence (e.g. VendorName_Conf%)
-      - Line items serialized as JSON string in a single cell (Items_JSON)
-      - Raw content in last column
-    """
-    rows = []
-
-    if not result.documents:
-        # No structured docs — still capture raw content row
-        rows.append({
-            "Filename":           filename,
-            "Page(s)":            len(result.pages) if result.pages else "",
-            "DocType":            "",
-            "Overall Confidence": "",
-            "Raw Content":        (result.content or "").strip(),
-        })
-        return rows
-
-    for doc in result.documents:
-        row = {}
-
-        # ── Fixed meta columns ──
-        row["Filename"]           = filename
-        row["Page(s)"]            = len(result.pages) if result.pages else ""
-        row["DocType"]            = doc.doc_type or ""
-        row["Overall Confidence"] = round(doc.confidence * 100, 1) if doc.confidence else ""
-
-        if not doc.fields:
-            row["Raw Content"] = (result.content or "").strip()
-            rows.append(row)
-            continue
-
-        # ── Dynamic field columns ──
-        items_data = []
-
-        for field_name, field in doc.fields.items():
-
-            # Line Items — serialize as JSON in one cell, handled separately below
-            if field_name == "Items":
-                items_array = field.get("valueArray") or []
-                for item in items_array:
-                    obj = item.get("valueObject") or {}
-                    item_row = {}
-                    for col in ["Description", "Quantity", "Unit", "UnitPrice",
-                                "ProductCode", "Date", "Tax", "Amount"]:
-                        f = obj.get(col)
-                        item_row[col] = f.get("content", "") if f else ""
-                    items_data.append(item_row)
-                row["Items (JSON)"] = json.dumps(items_data, ensure_ascii=False)
-                continue
-
-            content    = field.get("content")
-            confidence = field.get("confidence")
-
-            # Value column
-            row[field_name] = content or ""
-
-            # Confidence column right after value
-            row[f"{field_name}_Conf%"] = round(confidence * 100, 1) if confidence else ""
-
-        # ── Raw content last ──
-        row["Raw Content"] = (result.content or "").strip()
-
-        rows.append(row)
-
-    return rows
-
-
-# ── Collect all rows across all PDFs ──────────────────────────────────────────
-
-def collect_all_rows(pdf_files: list[str]) -> pd.DataFrame:
-    all_rows = []
-
-    for pdf_path in pdf_files:
-        print(f"  Analyzing: {pdf_path} ...")
+def init_db():
+    os.makedirs(AUDIT_FOLDER, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS qc_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            extraction_date TEXT,
+            extraction_time TEXT,
+            file_name TEXT,
+            vendor_name TEXT,
+            invoice_number TEXT,
+            origin TEXT,
+            destination TEXT,
+            status TEXT,
+            reason_for_review TEXT,
+            extracted_total REAL,
+            calculated_sum REAL,
+            variance REAL,
+            processing_time REAL,
+            page_count INTEGER
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS deletion_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            user_name TEXT,
+            action_type TEXT,
+            details TEXT
+        )
+    ''')
+    
+    new_columns = [
+        ("processing_time", "REAL"),
+        ("page_count", "INTEGER"),
+        ("original_supplier_name", "TEXT"),
+        ("suggested_origin", "TEXT"),
+        ("final_origin", "TEXT"),
+        ("suggested_destination", "TEXT"),
+        ("final_destination", "TEXT"),
+        ("batch_id", "TEXT")
+    ]
+    
+    for col_name, col_type in new_columns:
         try:
-            result = run_analysis(pdf_path)
-            rows   = extract_row(os.path.basename(pdf_path), result)
-            all_rows.extend(rows)
-            print(f"    → {len(rows)} invoice(s) found")
+            cursor.execute(f"ALTER TABLE qc_audit ADD COLUMN {col_name} {col_type}")
+        except sqlite3.OperationalError:
+            pass 
+        
+    conn.commit()
+    conn.close()
+
+def load_master_suppliers() -> pd.DataFrame:
+    if os.path.exists(MASTER_CSV_PATH):
+        try:
+            df = pd.read_csv(MASTER_CSV_PATH, encoding='utf-8-sig')
+            if 'Original_Supplier_Name' in df.columns:
+                return df[['Original_Supplier_Name']].dropna()
         except Exception as e:
-            print(f"    ✗ Error: {e}")
-            all_rows.append({"Filename": os.path.basename(pdf_path), "Error": str(e)})
+            st.error(f"Error loading Master CSV: {e}")
+    
+    return pd.DataFrame(columns=["Original_Supplier_Name"])
 
-    if not all_rows:
+def save_master_suppliers(df: pd.DataFrame):
+    df.to_csv(MASTER_CSV_PATH, index=False, encoding='utf-8-sig')
+
+def append_to_master(new_supplier: str):
+    df = load_master_suppliers()
+    if new_supplier not in df['Original_Supplier_Name'].values:
+        new_row = pd.DataFrame([{"Original_Supplier_Name": new_supplier}])
+        df = pd.concat([df, new_row], ignore_index=True)
+        save_master_suppliers(df)
+
+def insert_audit_record(record: tuple):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO qc_audit (
+            extraction_date, extraction_time, file_name, vendor_name, 
+            invoice_number, origin, destination, status, reason_for_review, 
+            extracted_total, calculated_sum, variance, processing_time, page_count, batch_id, original_supplier_name
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', record)
+    conn.commit()
+    conn.close()
+
+def update_audit_suggestions(record_id: int, sug_orig: str, sug_dest: str):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE qc_audit SET suggested_origin = ?, suggested_destination = ? WHERE id = ?", (sug_orig, sug_dest, record_id))
+    conn.commit()
+    conn.close()
+    fetch_audit_data.clear()
+
+def update_audit_final_routes(record_id: int, final_orig: str, final_dest: str):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE qc_audit SET final_origin = ?, final_destination = ? WHERE id = ?", (final_orig, final_dest, record_id))
+    conn.commit()
+    conn.close()
+    fetch_audit_data.clear()
+
+@st.cache_data(ttl=3600)
+def fetch_audit_data() -> pd.DataFrame:
+    if not os.path.exists(DB_PATH):
         return pd.DataFrame()
-
-    # Union all keys — different invoices may have different fields
-    all_keys = []
-    seen     = set()
-    for row in all_rows:
-        for k in row.keys():
-            if k not in seen:
-                all_keys.append(k)
-                seen.add(k)
-
-    # Reorder: fixed meta cols first, then dynamic fields, then Items+Raw at end
-    META_COLS  = ["Filename", "Page(s)", "DocType", "Overall Confidence"]
-    END_COLS   = ["Items (JSON)", "Raw Content", "Error"]
-    mid_cols   = [k for k in all_keys if k not in META_COLS and k not in END_COLS]
-    final_cols = META_COLS + mid_cols + [c for c in END_COLS if c in seen]
-
-    df = pd.DataFrame(all_rows, columns=final_cols)
-    df = df.fillna("")
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query("SELECT * FROM qc_audit", conn)
+    conn.close()
     return df
 
+def remove_duplicates_db(user_name: str):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT COUNT(*) FROM qc_audit 
+        WHERE id NOT IN (SELECT MIN(id) FROM qc_audit GROUP BY vendor_name, invoice_number)
+        AND invoice_number NOT IN ('N/A', 'ERROR', '')
+    ''')
+    count = cursor.fetchone()[0]
+    cursor.execute('''
+        DELETE FROM qc_audit
+        WHERE id NOT IN (
+            SELECT MIN(id)
+            FROM qc_audit
+            GROUP BY vendor_name, invoice_number
+        ) AND invoice_number NOT IN ('N/A', 'ERROR', '')
+    ''')
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute("INSERT INTO deletion_logs (timestamp, user_name, action_type, details) VALUES (?, ?, ?, ?)", 
+                   (now, user_name, "REMOVE_DUPLICATES", f"Deleted {count} duplicate records based on Vendor+Invoice match."))
+    conn.commit()
+    conn.close()
+    fetch_audit_data.clear()
 
-# ── Excel Styling ──────────────────────────────────────────────────────────────
+def wipe_master_db(user_name: str):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM qc_audit")
+    count = cursor.fetchone()[0]
+    cursor.execute("DELETE FROM qc_audit")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute("INSERT INTO deletion_logs (timestamp, user_name, action_type, details) VALUES (?, ?, ?, ?)", 
+                   (now, user_name, "WIPE_DATABASE", f"Wiped entire Master Database ({count} records deleted)."))
+    conn.commit()
+    conn.close()
+    fetch_audit_data.clear()
 
-THIN   = Side(style="thin", color="D0D0D0")
-BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+def standardize_vendor(name):
+    if not isinstance(name, str) or name in ['N/A', 'ERROR', '']:
+        return name
+    name = name.upper()
+    name = re.sub(r'[.,]', '', name)
+    name = re.sub(r'\b(LLC|INC|LTD|CORP|CORPORATION|CO|COMPANY)\b', '', name)
+    return re.sub(r'\s+', ' ', name).strip()
 
-META_COLOR  = "1E3A5F"   # dark blue  — fixed meta columns
-FIELD_COLOR = "1A5276"   # medium blue — field value columns
-CONF_COLOR  = "117A65"   # green       — confidence columns
-ITEM_COLOR  = "6E2F7A"   # purple      — items / raw
-ALT_ROW     = "EBF5FB"   # light blue  — alternating rows
+init_db()
+
+# ==============================================================
+# 1. Define Data Schema
+# ==============================================================
+
+class LineItem(BaseModel):
+    page_number: Optional[int] = Field(None, description="Page number (starting at 1)")
+    material: Optional[str] = Field(None, description="Material code, part number, or SKU")
+    description: str = Field(description="Name or description of the item. If a tax or fee (e.g., 'Federal Excise Tax', 'Franchise Tax') is printed as a row INSIDE the main table, extract it here as a regular line item.")
+    quantity: Optional[float] = Field(None, description="Number of items SHIPPED. STRICT RULE: If you see 'QTY B/O' (Backordered) alongside 'QTY SHP', ONLY extract the Shipped amount. Do not extract backordered quantities here.")
+    uom: Optional[str] = Field(None, description="Unit of Measure (e.g., EA, LBS, KG). Look for headers like 'UOM' or 'Bin'.")
+    uom_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
+    unit_price: Optional[float] = Field(None, description="Price of a single unit")
+    line_total: Optional[float] = Field(None, description="Total cost for this specific line item. Look for 'Amount', 'Total', 'Extended Price', or 'Extd Price'. STRICT RULE: If the column is blank (e.g., due to a backordered item), leave this null or 0.0. Do not guess.")
+    
+    line_origin: Optional[str] = Field(None, description="CRITICAL ANTI-LAZINESS RULE: You MUST read the exact Origin/Ship-From address printed for THIS specific row. DO NOT copy or repeat the value from the row above. Every single row is unique. Look closely at the image for this exact line. If it is blank for this specific row, you MUST leave it null.")
+    line_destination: Optional[str] = Field(None, description="CRITICAL ANTI-LAZINESS RULE: You MUST read the exact Destination/Ship-To address printed for THIS specific row. DO NOT copy or repeat the value from the row above. Every single row is unique. Look closely at the image for this exact line. If it is blank for this specific row, you MUST leave it null.")
+
+class TaxItem(BaseModel):
+    tax_name: str = Field(description="The exact printed name of the tax (e.g., 'GST/HST', 'TPS/TVH', 'QST').")
+    tax_amount: float = Field(description="The amount for this specific tax.")
+
+class FeeItem(BaseModel):
+    fee_name: str = Field(description="The exact printed name of the fee (e.g., 'SHOP Supplies', 'Environmental Fee', 'Pallet Charge').")
+    fee_amount: float = Field(description="The amount for this specific fee.")
+
+class InvoiceData(BaseModel):
+    vendor_name: str = Field(description="Name of the company issuing the invoice")
+    vendor_address: Optional[str] = Field(None, description="The FULL complete address of the vendor including street, city, state/province, and postal code. Do not extract partial addresses.")
+    bill_to: Optional[str] = Field(None, description="The FULL complete 'Bill To' or 'Sold To' address including street, city, state/province, and postal code.")
+    remit_to: Optional[str] = Field(None, description="The FULL complete 'Remit To' address including street, city, state/province, and postal code.")
+    
+    origin: Optional[str] = Field(None, description="The FULL origin physical address for the overall invoice. STRICT GUARDRAIL: ONLY extract this if it is explicitly labeled with tags like 'Ship From', 'Origin', 'From', or 'Pickup'. Do NOT extract short alphanumeric codes or tank numbers.")
+    origin_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
+    
+    destination: Optional[str] = Field(None, description="The FULL destination physical address for the overall invoice ('Ship To', 'To', 'Deliver To', 'Consignee'). STRICT RULE: Do NOT extract short alphanumeric facility codes or building numbers.")
+    destination_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
+    
+    invoice_number: Optional[str] = Field(None, description="Unique invoice number. STRICT RULE: Only extract values explicitly labeled as 'Invoice Number' or 'Invoice #'. Do NOT extract Ticket No, Reference, Order ID, or Statement numbers.")
+    invoice_number_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
+    
+    date: Optional[str] = Field(None, description="Date the invoice was issued")
+    currency: Optional[str] = Field(None, description="3-letter currency code")
+    
+    subtotal: Optional[float] = Field(None, description="The subtotal amount before taxes and shipping are added.")
+    
+    taxes: List[TaxItem] = Field(default_factory=list, description="STRICT RULE: Extract individual taxes ONLY from the summary block at the bottom of the invoice. CRITICAL GUARDRAIL: Before adding a tax here, verify you did not already extract it in `line_items`. No duplicates allowed. If a tax is already a line item, skip it here.")
+    
+    additional_fees: List[FeeItem] = Field(default_factory=list, description="STRICT RULE: ONLY extract fees from the summary block at the bottom. CRITICAL GUARDRAIL: Before adding a fee here, verify you did not already extract it in `line_items`. No duplicates allowed.")
+    
+    shipping_name: Optional[str] = Field(None, description="The exact printed name of the shipping charge (e.g., 'Freight', 'Handling', 'Delivery Fee').")
+    shipping_handling: Optional[float] = Field(0.0, description="STRICT RULE: ONLY extract this if it appears in the final summary block at the bottom of the invoice, AFTER the main line items and subtotal.")
+    
+    total_amount: float = Field(description="Final total amount charged on the invoice")
+    total_amount_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
+    
+    custom_fields: Dict[str, Optional[str]] = Field(default_factory=dict, description="Extract any custom fields requested by the user. The keys MUST match exactly.")
+    
+    line_items: List[LineItem] = Field(description="List of all individual items purchased. CRITICAL GUARDRAIL: You must extract EVERY SINGLE ROW from the invoice table. Do NOT skip, summarize, or abbreviate rows. You must capture 100% of the items to ensure accounting math is perfectly accurate.")
+
+class InvoiceDocument(BaseModel):
+    invoices: List[InvoiceData] = Field(description="List of distinct invoices. STRICT PAGING RULE: 1) If an invoice table extends across multiple pages but shares the SAME Invoice Number, MERGE all line items into ONE invoice record. 2) If the Invoice Number CHANGES on a new page, split it into a NEW separate invoice record in this list.")
+
+# ==============================================================
+# 2. PDF to Image Conversion & Extraction
+# ==============================================================
+
+def pdf_to_base64_images(file_bytes: bytes, max_pages: int, dpi: int) -> Tuple[List[str], int]:
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    base64_images = []
+    total_pages = len(doc)
+    if total_pages > max_pages:
+        st.warning(f"PDF is {total_pages} pages long. Truncating to first {max_pages} pages based on configuration.")
+    pages_to_process = min(total_pages, max_pages)
+    for page_num in range(pages_to_process):
+        page = doc[page_num]
+        pix = page.get_pixmap(dpi=dpi) 
+        base64_images.append(base64.b64encode(pix.tobytes("jpeg")).decode('utf-8'))
+    return base64_images, total_pages
+
+def extract_invoice_data(client, deployment: str, file_bytes: bytes, custom_fields_dict: Dict[str, str], standard_aliases_dict: Dict[str, str], max_pages: int, dpi: int) -> Tuple[InvoiceDocument, int]:
+    base64_images, total_pages = pdf_to_base64_images(file_bytes, max_pages, dpi)
+    
+    system_prompt = "You are an expert accountant processing a document that may contain multiple distinct invoices. STRICT PAGING RULES: 1) If the same invoice number continues across multiple pages, combine all line items, taxes, and totals into a SINGLE invoice record. 2) If you see a NEW invoice number, start a NEW invoice record. CRITICAL RULE AGAINST DUPLICATES: Never extract the same tax or fee twice. ANTI-LAZINESS RULE: DO NOT BE LAZY. You must extract every single line item row by row. Skipping the middle of a table, abbreviating, or summarizing items is a CRITICAL FAILURE. Your extracted total for EACH invoice must mathematically equal the calculated sum of unique items for that invoice."
+    
+    if standard_aliases_dict:
+        alias_str = "\n".join([f"- {k}: Also look for '{v}'" for k, v in standard_aliases_dict.items()])
+        system_prompt += f"\n\nSTANDARD FIELD ALIASES:\nThe user has provided common aliases for standard schema fields. Use these to help locate the data:\n{alias_str}"
+    
+    if custom_fields_dict:
+        rules_str = "\n".join([f"- Field Key: '{k}' | Definition & Aliases: {v}" for k, v in custom_fields_dict.items()])
+        system_prompt += f"\n\nSTRICT RULE: The user has requested custom data extraction based on specific definitions and alias mappings. You MUST search the invoice for the following logic and place the results in the 'custom_fields' dictionary using the EXACT 'Field Key' provided:\n{rules_str}\nIf a field or its aliases are not found, leave its value as null."
+
+    content_array = [{"type": "text", "text": "Extract data from this multi-page document. Pay close attention to invoice numbers. Evaluate confidence ('High', 'Medium', 'Low'). Note page numbers."}]
+    for img_base64 in base64_images:
+        content_array.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"}})
+
+    response = client.chat.completions.create(
+        model=deployment, 
+        response_model=InvoiceDocument, 
+        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": content_array}]
+    )
+    return response, total_pages
+
+def setup_excel_workbook(custom_cols: List[str]):
+    wb = openpyxl.Workbook()
+    ws_details = wb.active
+    ws_details.title = "Invoice Details"
+    details_headers = [
+        "File Name", "Page #", "Vendor Name", "Original Supplier Name", "Vendor Address", "Bill To", "Remit To",
+        "Origin", "Destination", "Invoice Number", "Date", "Currency", 
+        "Material", "Description", "Quantity", "UOM", "Unit Price", "Line Total", "Subtotal", "Invoice Total",
+        "Inv# Conf", "Origin Conf", "Dest Conf", "UOM Conf", "Total Conf", "Status", "Reason for Review"
+    ]
+    if custom_cols: details_headers.extend(custom_cols)
+    ws_details.append(details_headers)
+    
+    ws_qc = wb.create_sheet(title="QC Summary")
+    qc_headers = [
+        "File Name", "Vendor Name", "Original Supplier Name", "Invoice Number", "Origin", "Destination", "Status", "Reason for Review", 
+        "Extracted Total", "Calculated Sum", "Variance"
+    ]
+    ws_qc.append(qc_headers)
+    
+    header_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True)
+    for sheet in [ws_details, ws_qc]:
+        sheet.freeze_panes = "A2"
+        for cell in sheet[1]:
+            cell.fill = header_fill; cell.font = header_font; cell.alignment = Alignment(horizontal="center", vertical="center")
+    return wb, ws_details, ws_qc
+
+# ==============================================================
+# 3. Streamlit UI & Core Logic Orchestrator
+# ==============================================================
+
+if 'extraction_details' not in st.session_state:
+    st.session_state.extraction_details = None
+if 'extraction_summary' not in st.session_state:
+    st.session_state.extraction_summary = None
+if 'extraction_excel' not in st.session_state:
+    st.session_state.extraction_excel = None
+if 'start_processing' not in st.session_state:
+    st.session_state.start_processing = False
+if 'files_to_process' not in st.session_state:
+    st.session_state.files_to_process = []
+
+def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict, max_pages, dpi, sleep_time, prefix=""):
+    client = instructor.from_openai(AzureOpenAI(azure_endpoint=AZURE_ENDPOINT, api_key=AZURE_API_KEY, api_version=AZURE_API_VERSION))
+    
+    custom_col_keys = list(custom_fields_dict.keys())
+    wb, ws_details, ws_qc = setup_excel_workbook(custom_col_keys)
+    
+    master_supp_df = load_master_suppliers()
+    master_suppliers_list = master_supp_df['Original_Supplier_Name'].dropna().tolist() if not master_supp_df.empty else []
+    
+    success_count, error_count = 0, 0
+    progress_bar = st.progress(0, text=f"Initializing {prefix} processing sequence...")
+    status_text = st.empty()
+    
+    current_run_summary = []
+    current_run_details = []
+
+    start_time_batch = time.time()
+    total_files = len(files_list)
+    current_batch_id = datetime.now().strftime("BATCH_%Y%m%d_%H%M%S")
+
+    for idx, file in enumerate(files_list):
+        filename = file.name
+        now = datetime.now()
+        current_date, current_time = now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S")
+
+        status_text.markdown(f"**Extracting ({idx+1}/{total_files}):** `{filename}`...")
+        file_start_time = time.time()
+        
+        try:
+            file.seek(0)
+            file_bytes = file.read()
+            extracted_document, total_pages = extract_invoice_data(client, AZURE_DEPLOYMENT, file_bytes, custom_fields_dict, standard_aliases_dict, max_pages, dpi)
+            file_proc_time = round(time.time() - file_start_time, 2)
+            
+            if not extracted_document.invoices:
+                ws_qc.append([filename, "N/A", "N/A", "N/A", "N/A", "N/A", "FAIL - NO DATA", "0 Invoices Found in PDF", "", "", ""])
+                insert_audit_record((current_date, current_time, filename, "N/A", "N/A", "N/A", "N/A", "FAIL - NO DATA", "0 Invoices Found", 0.0, 0.0, 0.0, file_proc_time, total_pages, current_batch_id, "N/A"))
+                current_run_summary.append({"File Name": filename, "Vendor Name": "N/A", "Invoice #": "N/A", "Origin": "N/A", "Destination": "N/A", "Status": "FAIL", "Reason": "No Invoices Found in PDF"})
+                continue
+            
+            for extracted_data in extracted_document.invoices:
+                
+                raw_vendor = extracted_data.vendor_name
+                orig_supp = None
+                
+                # Threshold manually raised to 95% for near-perfect matches only
+                if master_suppliers_list and raw_vendor and raw_vendor not in ['N/A', 'ERROR', '']:
+                    match_result = process.extractOne(raw_vendor, master_suppliers_list)
+                    if match_result:
+                        best_match, score = match_result
+                        if score >= 95: 
+                            orig_supp = best_match
+                
+                if not orig_supp:
+                    orig_supp = standardize_vendor(raw_vendor)
+
+                calculated_line_sum = sum(item.line_total for item in extracted_data.line_items if item.line_total is not None)
+                safe_ship = extracted_data.shipping_handling or 0.0
+                safe_total_tax = sum(tax.tax_amount for tax in extracted_data.taxes if tax.tax_amount is not None)
+                safe_fees = sum(fee.fee_amount for fee in extracted_data.additional_fees if fee.fee_amount is not None)
+                
+                total_calculated = calculated_line_sum + safe_total_tax + safe_ship + safe_fees
+                variance = round(extracted_data.total_amount - total_calculated, 2)
+                
+                review_reasons = []
+                if variance != 0.0: review_reasons.append(f"Math Variance of {variance}")
+                if extracted_data.invoice_number_confidence == "Low": review_reasons.append("Low Conf: Invoice #")
+                if extracted_data.origin_confidence == "Low": review_reasons.append("Low Conf: Origin")
+                if extracted_data.destination_confidence == "Low": review_reasons.append("Low Conf: Destination")
+                if extracted_data.total_amount_confidence == "Low": review_reasons.append("Low Conf: Total Amount")
+                if len(extracted_data.line_items) == 0: review_reasons.append("Missing: 0 Line Items Found")
+                
+                for item in extracted_data.line_items:
+                    if item.uom_confidence == "Low":
+                        short_desc = item.description[:15] + "..." if item.description and len(item.description) > 15 else item.description
+                        review_reasons.append(f"Low Conf: UOM on '{short_desc}'")
+                
+                needs_review = len(review_reasons) > 0
+                status = "FAIL - NEEDS REVIEW" if needs_review else "PASS"
+                reasons_string = " | ".join(review_reasons) if needs_review else "N/A"
+                
+                def create_row_dict(page_num, material, desc, qty, uom, uom_conf, price, line_total, line_orig=None, line_dest=None):
+                    final_origin = line_orig if line_orig else extracted_data.origin
+                    final_dest = line_dest if line_dest else extracted_data.destination
+                    
+                    row_data = {
+                        "File Name": filename, "Page #": page_num,
+                        "Vendor Name": extracted_data.vendor_name,
+                        "Original Supplier Name": orig_supp,  
+                        "Vendor Address": extracted_data.vendor_address,
+                        "Bill To": extracted_data.bill_to, "Remit To": extracted_data.remit_to,
+                        "Origin": final_origin, "Destination": final_dest, 
+                        "Invoice Number": extracted_data.invoice_number, "Date": extracted_data.date, "Currency": extracted_data.currency,
+                        "Material": material, "Description": desc, 
+                        "Quantity": qty, "UOM": uom, "Unit Price": price, "Line Total": line_total,
+                        "Subtotal": extracted_data.subtotal, "Invoice Total": extracted_data.total_amount,
+                        "Inv# Conf": extracted_data.invoice_number_confidence, "Origin Conf": extracted_data.origin_confidence,
+                        "Dest Conf": extracted_data.destination_confidence, "UOM Conf": uom_conf, "Total Conf": extracted_data.total_amount_confidence,
+                        "Status": status, "Reason for Review": reasons_string
+                    }
+                    for col in custom_col_keys:
+                        row_data[col] = extracted_data.custom_fields.get(col, "Not Found")
+                    return row_data
+
+                if len(extracted_data.line_items) == 0:
+                    row_dict = create_row_dict(None, None, "NO ITEMS FOUND", None, None, None, None, 0.0)
+                    ws_details.append(list(row_dict.values()))
+                    current_run_details.append(row_dict)
+                else:
+                    for item in extracted_data.line_items:
+                        row_dict = create_row_dict(
+                            item.page_number, item.material, item.description, item.quantity, 
+                            item.uom, item.uom_confidence, item.unit_price, item.line_total, 
+                            line_orig=item.line_origin, line_dest=item.line_destination
+                        )
+                        ws_details.append(list(row_dict.values()))
+                        current_run_details.append(row_dict)
+                        
+                if safe_ship > 0: 
+                    row_dict = create_row_dict(None, "SHIPPING", extracted_data.shipping_name or "Shipping", None, None, None, None, safe_ship)
+                    ws_details.append(list(row_dict.values()))
+                    current_run_details.append(row_dict)
+                    
+                for tax in extracted_data.taxes:
+                    if tax.tax_amount is not None and tax.tax_amount > 0: 
+                        row_dict = create_row_dict(None, "TAX", tax.tax_name, None, None, None, None, tax.tax_amount)
+                        ws_details.append(list(row_dict.values()))
+                        current_run_details.append(row_dict)
+                        
+                for fee in extracted_data.additional_fees:
+                    if fee.fee_amount is not None and fee.fee_amount > 0: 
+                        row_dict = create_row_dict(None, "FEE", fee.fee_name, None, None, None, None, fee.fee_amount)
+                        ws_details.append(list(row_dict.values()))
+                        current_run_details.append(row_dict)
+                
+                first_line_orig = extracted_data.line_items[0].line_origin if len(extracted_data.line_items) > 0 else None
+                first_line_dest = extracted_data.line_items[0].line_destination if len(extracted_data.line_items) > 0 else None
+                qc_origin = first_line_orig if first_line_orig else extracted_data.origin
+                qc_dest = first_line_dest if first_line_dest else extracted_data.destination
+
+                ws_qc.append([
+                    filename, extracted_data.vendor_name, orig_supp, extracted_data.invoice_number, 
+                    qc_origin, qc_dest,
+                    status, reasons_string, extracted_data.total_amount, total_calculated, variance
+                ])
+                
+                insert_audit_record((
+                    current_date, current_time, filename, extracted_data.vendor_name, extracted_data.invoice_number, 
+                    str(qc_origin), str(qc_dest), status, reasons_string, 
+                    extracted_data.total_amount, total_calculated, variance, file_proc_time, total_pages, current_batch_id, orig_supp
+                ))
+
+                current_run_summary.append({
+                    "File Name": filename, "Vendor Name": extracted_data.vendor_name, "Invoice #": extracted_data.invoice_number,
+                    "Origin": qc_origin or "Missing", "Destination": qc_dest or "Missing",
+                    "Variance": f"${variance:,.2f}", "Status": "✅ PASS" if status == "PASS" else "⚠️ FAIL",
+                    "Proc Time": f"{file_proc_time}s"
+                })
+                success_count += 1
+                
+        except Exception as e:
+            file_proc_time = round(time.time() - file_start_time, 2)
+            insert_audit_record((current_date, current_time, filename, "N/A", "N/A", "N/A", "N/A", "FAIL - CRITICAL ERROR", str(e), 0.0, 0.0, 0.0, file_proc_time, 0, current_batch_id, "ERROR"))
+            current_run_summary.append({"File Name": filename, "Vendor Name": "ERROR", "Invoice #": "ERROR", "Origin": "ERROR", "Destination": "ERROR", "Status": "❌ ERROR", "Reason": "API/System Crash", "Proc Time": f"{file_proc_time}s"})
+            error_count += 1
+        
+        if idx < total_files - 1: time.sleep(sleep_time) 
+        
+        files_processed = idx + 1
+        elapsed_time = time.time() - start_time_batch
+        avg_time_per_file = elapsed_time / files_processed
+        remaining_files = total_files - files_processed
+        mins, secs = divmod(int(avg_time_per_file * remaining_files), 60)
+        eta_string = f" | ETA: {mins}m {secs}s" if (avg_time_per_file * remaining_files) > 0 else ""
+        progress_bar.progress(files_processed / total_files, text=f"Processing {files_processed}/{total_files} documents{eta_string}")
+
+    fetch_audit_data.clear()
+
+    excel_buffer = io.BytesIO()
+    wb.save(excel_buffer)
+    excel_buffer.seek(0)
+    
+    st.session_state.extraction_details = current_run_details
+    st.session_state.extraction_summary = current_run_summary
+    st.session_state.extraction_excel = excel_buffer
+    
+    progress_bar.empty()
+    status_text.empty()
+    st.success(f"🎉 {prefix} Batch Processing Complete! Invoices Extracted: {success_count} | Errors: {error_count}")
 
 
-def header_cell(cell, text: str, hex_color: str):
-    cell.value     = text
-    cell.font      = Font(bold=True, color="FFFFFF", name="Arial", size=10)
-    cell.fill      = PatternFill("solid", start_color=hex_color)
-    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    cell.border    = BORDER
-
-
-def write_excel(df: pd.DataFrame, output_path: str):
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Invoices"
-
-    META_COLS = ["Filename", "Page(s)", "DocType", "Overall Confidence"]
-    END_COLS  = ["Items (JSON)", "Raw Content", "Error"]
-
-    # ── Write headers with color coding ──
-    for col_idx, col_name in enumerate(df.columns, start=1):
-        cell = ws.cell(row=1, column=col_idx)
-        if col_name in META_COLS:
-            header_cell(cell, col_name, META_COLOR)
-        elif col_name in END_COLS:
-            header_cell(cell, col_name, ITEM_COLOR)
-        elif col_name.endswith("_Conf%"):
-            header_cell(cell, col_name.replace("_Conf%", " Conf%"), CONF_COLOR)
+# --- DB & UI Dialogs ---
+@st.dialog("⚠️ Duplicate Files Detected")
+def confirm_duplicates_dialog(duplicate_files, unique_files):
+    st.warning(f"Found {len(duplicate_files)} file(s) that have already been processed and exist in the master database.")
+    for f in duplicate_files:
+        st.write(f"- `{f.name}`")
+    st.write("Do you want to extract these again? (This will add duplicate entries to your audit logs).")
+    
+    col1, col2 = st.columns(2)
+    if col1.button("Yes, Process All", type="primary"):
+        st.session_state.files_to_process = unique_files + duplicate_files
+        st.session_state.start_processing = True
+        st.rerun()
+    if col2.button("No, Unique Only"):
+        if unique_files:
+            st.session_state.files_to_process = unique_files
+            st.session_state.start_processing = True
+            st.rerun()
         else:
-            header_cell(cell, col_name, FIELD_COLOR)
+            st.warning("No unique files to process.")
+            time.sleep(2)
+            st.rerun()
 
-    ws.row_dimensions[1].height = 35
-
-    # ── Write data rows ──
-    for row_idx, row in enumerate(df.itertuples(index=False), start=2):
-        alt = row_idx % 2 == 0
-        for col_idx, value in enumerate(row, start=1):
-            cell            = ws.cell(row=row_idx, column=col_idx, value=str(value) if value != "" else "")
-            cell.font       = Font(name="Arial", size=10)
-            cell.alignment  = Alignment(vertical="center", wrap_text=False)
-            cell.border     = BORDER
-            if alt:
-                cell.fill = PatternFill("solid", start_color=ALT_ROW)
-
-    # ── Column widths ──
-    for col_idx, col_name in enumerate(df.columns, start=1):
-        if col_name in ("Raw Content", "Items (JSON)"):
-            ws.column_dimensions[get_column_letter(col_idx)].width = 40
-        elif col_name.endswith("_Conf%"):
-            ws.column_dimensions[get_column_letter(col_idx)].width = 12
-        elif col_name == "Filename":
-            ws.column_dimensions[get_column_letter(col_idx)].width = 30
+@st.dialog("🗑️ Remove Duplicate Invoices")
+def dialog_remove_duplicates():
+    st.warning("This will permanently delete all duplicate records (keeping the oldest one) based on Vendor Name + Invoice Number.")
+    user_name = st.text_input("Enter your name to authorize deletion:")
+    if st.button("Confirm Deletion", type="primary"):
+        if not user_name.strip():
+            st.error("Name is required for the audit log.")
         else:
-            # Auto width based on content
-            col_vals = [str(col_name)] + [str(v) for v in df.iloc[:, col_idx - 1]]
-            max_len  = min(max(len(v) for v in col_vals), 45)
-            ws.column_dimensions[get_column_letter(col_idx)].width = max_len + 3
+            remove_duplicates_db(user_name.strip())
+            st.rerun()
 
-    # ── Freeze first row + first column ──
-    ws.freeze_panes = "B2"
+@st.dialog("⚠️ Wipe Master Database")
+def dialog_wipe_db():
+    st.error("CRITICAL WARNING: This will permanently delete ALL extracted invoice data from the system.")
+    user_name = st.text_input("Enter your name to authorize complete wipe:")
+    if st.button("Confirm Complete Wipe", type="primary"):
+        if not user_name.strip():
+            st.error("Name is required for the audit log.")
+        else:
+            wipe_master_db(user_name.strip())
+            st.rerun()
 
-    # ── Auto filter ──
-    ws.auto_filter.ref = ws.dimensions
+@st.dialog("📄 Fullscreen Document Viewer", width="large")
+def view_fullscreen_pdf(file_bytes, file_name):
+    st.markdown(f"### {file_name}")
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    
+    html_content = '<div style="height: 75vh; overflow-y: scroll; border: 1px solid #ddd; padding: 20px; background-color: #525659; text-align: center;">'
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        pix = page.get_pixmap(dpi=150)
+        img_b64 = base64.b64encode(pix.tobytes("jpeg")).decode('utf-8')
+        html_content += f'<img src="data:image/jpeg;base64,{img_b64}" style="width: 95%; max-width: 900px; margin-bottom: 20px; box-shadow: 0px 4px 10px rgba(0,0,0,0.5);"><br>'
+    html_content += '</div>'
+    
+    st.markdown(html_content, unsafe_allow_html=True)
 
-    wb.save(output_path)
-    print(f"\n✅ Saved → {output_path}")
-    print(f"   Rows    : {len(df)}")
-    print(f"   Columns : {len(df.columns)}")
-    print(f"   Fields  : {[c for c in df.columns if c not in ['Filename','Page(s)','DocType','Overall Confidence','Items (JSON)','Raw Content','Error']]}")
 
+# ==============================================================
+# 4. Streamlit App Layout
+# ==============================================================
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="AI Invoice Intelligence", page_icon="🧾", layout="wide")
+st.title("🧾 AI Invoice Intelligence Platform")
 
-if __name__ == "__main__":
-    print("Starting extraction...\n")
-    df = collect_all_rows(PDF_FILES)
+# Sidebar
+with st.sidebar:
+    st.header("⚙️ Settings & Rules")
+    
+    with st.expander("Processing Configuration", expanded=False):
+        config_max_pages = st.number_input("Max Pages per PDF", min_value=1, max_value=100, value=15)
+        config_dpi = st.slider("Render Resolution (DPI)", min_value=72, max_value=600, value=300, step=72)
+        config_sleep_time = st.number_input("API Sleep Time (seconds)", min_value=0, max_value=60, value=3)
 
-    if df.empty:
-        print("No data extracted.")
+    with st.expander("Standard Field Aliases", expanded=False):
+        st.write("Add alternative names (comma-separated) for built-in fields to help the AI find them.")
+        default_standard = pd.DataFrame({
+            "Standard Field": [
+                "invoice_number", "date", "vendor_name", "vendor_address", 
+                "bill_to", "remit_to", "origin", "destination", "currency", 
+                "subtotal", "shipping_name", "shipping_handling", "total_amount",
+                "material", "description", "line_origin", "line_destination", "quantity", "uom", "unit_price", "line_total",
+                "tax_name", "tax_amount", "fee_name", "fee_amount"
+            ],
+            "Aliases": [""] * 25
+        })
+        standard_df = st.data_editor(default_standard, disabled=["Standard Field"], use_container_width=True, hide_index=True)
+        
+        standard_aliases_dict = {}
+        for _, row in standard_df.iterrows():
+            if str(row["Aliases"]).strip() and str(row["Aliases"]) != "None":
+                standard_aliases_dict[row["Standard Field"]] = str(row["Aliases"]).strip()
+                
+    with st.expander("New Custom Fields", expanded=False):
+        st.write("Add entirely new columns to extract.")
+        default_custom = pd.DataFrame({
+            "Field Name": [""],
+            "Description & Aliases": [""]
+        })
+        custom_df = st.data_editor(default_custom, num_rows="dynamic", use_container_width=True, hide_index=True)
+        
+        custom_fields_dict = {}
+        for _, row in custom_df.iterrows():
+            name = str(row["Field Name"]).strip()
+            desc = str(row["Description & Aliases"]).strip()
+            if name and name != "None":
+                custom_fields_dict[name] = desc
+    
+    st.divider()
+    
+    st.header("📄 Batch Upload")
+    st.write("Upload your mixed batch of invoices here. The system will auto-map vendors via the Master CSV.")
+    uploaded_files = st.file_uploader("Upload PDF Documents", type=["pdf"], accept_multiple_files=True)
+
+# Tabs
+tab_extract_view, tab_batch_qa = st.tabs(["📄 Viewer & Extraction Suite", "✅ Current Batch QA"])
+
+# ---------------------------------------------------------
+# TAB 1: VIEWER & EXTRACTION SUITE (MERGED)
+# ---------------------------------------------------------
+with tab_extract_view:
+    st.header("📄 Document Viewer & Extraction")
+    
+    # 1. Document Viewer Section
+    if uploaded_files:
+        st.write("Review your uploaded documents below. Once ready, click 'Start Extraction' at the bottom.")
+        
+        search_query = st.text_input("🔍 Search by File Name", "").lower()
+        filtered_files = [f for f in uploaded_files if search_query in f.name.lower()]
+        
+        if not filtered_files:
+            st.warning("No files match your search query.")
+        else:
+            cols = st.columns(4)
+            for idx, file in enumerate(filtered_files):
+                col = cols[idx % 4]
+                with col:
+                    st.markdown(f"<div style='white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 14px; margin-bottom: 5px;' title='{file.name}'><b>{file.name}</b></div>", unsafe_allow_html=True)
+                    
+                    file.seek(0)
+                    doc = fitz.open(stream=file.read(), filetype="pdf")
+                    if len(doc) > 0:
+                        page = doc[0]
+                        pix = page.get_pixmap(dpi=72)
+                        img_b64 = base64.b64encode(pix.tobytes("jpeg")).decode('utf-8')
+                        st.markdown(f'<img src="data:image/jpeg;base64,{img_b64}" style="width: 100%; border: 1px solid #ccc; box-shadow: 2px 2px 5px rgba(0,0,0,0.1); margin-bottom: 10px;">', unsafe_allow_html=True)
+                    
+                    file.seek(0)
+                    if st.button("🔍 View Full Screen", key=f"view_{idx}", use_container_width=True):
+                        view_fullscreen_pdf(file.read(), file.name)
+        
+        st.divider()
+
+        # 2. Extraction Action Section
+        st.subheader("⚙️ Process Documents")
+        if st.button("🚀 Start Extraction", type="primary"):
+            if not all([AZURE_ENDPOINT, AZURE_API_KEY, AZURE_DEPLOYMENT]):
+                st.error("⚠️ Azure credentials missing. Check your `.env` file.")
+            else:
+                df_audit_existing = fetch_audit_data()
+                existing_filenames = df_audit_existing['file_name'].unique().tolist() if not df_audit_existing.empty else []
+                
+                unique_files = [f for f in uploaded_files if f.name not in existing_filenames]
+                duplicate_files = [f for f in uploaded_files if f.name in existing_filenames]
+                
+                if duplicate_files:
+                    confirm_duplicates_dialog(duplicate_files, unique_files)
+                else:
+                    st.session_state.files_to_process = unique_files
+                    st.session_state.start_processing = True
+
+        if st.session_state.start_processing:
+            run_extraction_process(
+                st.session_state.files_to_process, 
+                custom_fields_dict, 
+                standard_aliases_dict, 
+                config_max_pages, 
+                config_dpi,
+                config_sleep_time
+            )
+            st.session_state.start_processing = False
+            st.rerun()
+
+        # 3. Extraction Results Output
+        if st.session_state.extraction_details is not None:
+            st.success("Extraction Data is Ready!")
+            st.subheader("📝 Line Item Details (Full Extraction)")
+            st.dataframe(pd.DataFrame(st.session_state.extraction_details), use_container_width=True, hide_index=True)
+
+            st.divider()
+
+            st.subheader("🛡️ QC Summary")
+            st.dataframe(pd.DataFrame(st.session_state.extraction_summary), use_container_width=True, hide_index=True)
+
+            st.download_button(
+                label="📥 Download Full Extract Data (Excel)",
+                data=st.session_state.extraction_excel,
+                file_name=f"Full_Extraction_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary"
+            )
+
     else:
-        print(f"\nTotal invoices extracted : {len(df)}")
-        print(f"Total dynamic columns    : {len(df.columns)}")
-        write_excel(df, OUTPUT_XL)
+        st.info("Upload PDF documents in the sidebar to view and extract them here.")
+
+
+# ---------------------------------------------------------
+# TAB 2: CURRENT BATCH QA
+# ---------------------------------------------------------
+with tab_batch_qa:
+    st.header("✅ Current Batch QA")
+    st.write("Review the extraction quality specifically for the batch you just processed.")
+    
+    df_audit = fetch_audit_data()
+    
+    if df_audit.empty:
+        st.info("Process a batch of invoices to view current metrics.")
+    else:
+        if 'batch_id' in df_audit.columns and not df_audit['batch_id'].isna().all():
+            latest_batch = df_audit['batch_id'].dropna().iloc[-1]
+            batch_df = df_audit[df_audit['batch_id'] == latest_batch].copy()
+            st.markdown(f"**Latest Batch ID:** `{latest_batch}`")
+        else:
+            latest_date = df_audit['extraction_date'].max()
+            batch_df = df_audit[df_audit['extraction_date'] == latest_date].copy()
+            st.markdown(f"**Latest Batch Date:** `{latest_date}`")
+            latest_batch = None
+            
+        vendor_col = 'original_supplier_name' if 'original_supplier_name' in batch_df.columns else 'vendor_name'
+        if vendor_col == 'original_supplier_name':
+            batch_df['original_supplier_name'] = batch_df['original_supplier_name'].fillna(batch_df['vendor_name'].apply(standardize_vendor))
+
+        batch_invoices = len(batch_df)
+        batch_vendors = batch_df[vendor_col].nunique()
+        batch_spend_k = batch_df['extracted_total'].sum() / 1000.0
+        
+        batch_dup_count = 0
+        if 'batch_id' in df_audit.columns and latest_batch:
+            valid_df = df_audit[~df_audit['invoice_number'].isin(['N/A', 'ERROR', '', None]) & ~df_audit['vendor_name'].isin(['N/A', 'ERROR'])]
+            all_duplicates = valid_df[valid_df.duplicated(subset=['vendor_name', 'invoice_number'], keep=False)]
+            batch_dups = all_duplicates[all_duplicates['batch_id'] == latest_batch]
+            batch_dup_count = len(batch_dups)
+            
+        total_time_sec = batch_df['processing_time'].sum() if 'processing_time' in batch_df.columns else 0.0
+        mins, secs = divmod(int(total_time_sec), 60)
+        
+        bc1, bc2, bc3, bc4, bc5 = st.columns(5)
+        bc1.metric("Current Invoices Processed", f"{batch_invoices:,}")
+        bc2.metric("Total Unique Vendors", f"{batch_vendors:,}")
+        bc3.metric("Total Spend", f"${batch_spend_k:,.1f}K")
+        bc4.metric("Duplicates Found", f"{batch_dup_count:,}", delta_color="inverse")
+        bc5.metric("Batch Execution Time", f"{mins}m {secs}s")
+
+        st.divider()
+        
+        st.subheader("📄 Status Overview (Pass/Fail)")
+        st.write("Quickly identify which files passed and which need manual review.")
+        
+        status_df = batch_df[['file_name', 'invoice_number', 'vendor_name', 'original_supplier_name', 'status', 'reason_for_review']].copy()
+        def color_status(val):
+            color = '#2ecc71' if val == 'PASS' else '#e74c3c'
+            return f'color: {color}; font-weight: bold;'
+            
+        styled_status_df = status_df.style.applymap(color_status, subset=['status'])
+        st.dataframe(styled_status_df, use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        st.subheader("🔎 Batch Vendor Routing & Exception Breakdown")
+        st.write("Filter to see a detailed routing scorecard and math error count by vendor for the **current batch**.")
+        
+        batch_missing_flags = ['N/A', 'None', '', 'null', 'None']
+        
+        b_vendor_df = batch_df[~batch_df['vendor_name'].isin(['N/A', 'ERROR'])].copy()
+        b_vendor_df['missing_origin'] = b_vendor_df['origin'].isin(batch_missing_flags) | b_vendor_df['origin'].isna()
+        b_vendor_df['valid_origin'] = ~b_vendor_df['missing_origin']
+        b_vendor_df['missing_dest'] = b_vendor_df['destination'].isin(batch_missing_flags) | b_vendor_df['destination'].isna()
+        b_vendor_df['valid_dest'] = ~b_vendor_df['missing_dest']
+        b_vendor_df['amount_mismatch'] = b_vendor_df['variance'] != 0.0
+
+        b_vendor_summary = b_vendor_df.groupby(vendor_col).agg(
+            Total_Invoices=('id', 'count'),
+            Valid_Origin=('valid_origin', 'sum'),
+            Missing_Origin=('missing_origin', 'sum'),
+            Valid_Destination=('valid_dest', 'sum'),
+            Missing_Destination=('missing_dest', 'sum'),
+            Amount_Mismatch=('amount_mismatch', 'sum')
+        ).reset_index()
+        
+        b_vendor_summary.columns = [
+            'Vendor Name', 'Total Invoices', 
+            'Has Origin', 'Missing Origin', 
+            'Has Destination', 'Missing Destination', 
+            'Amount Mismatch'
+        ]
+        b_vendor_summary = b_vendor_summary.sort_values('Total Invoices', ascending=False)
+        
+        b_all_vendors = b_vendor_summary['Vendor Name'].tolist()
+        b_selected_vendors = st.multiselect("Filter Batch by Vendor(s):", options=b_all_vendors, default=[])
+        
+        if b_selected_vendors:
+            b_filtered_summary = b_vendor_summary[b_vendor_summary['Vendor Name'].isin(b_selected_vendors)]
+        else:
+            b_filtered_summary = b_vendor_summary
+            
+        st.dataframe(b_filtered_summary, use_container_width=True, hide_index=True)
+
+        st.divider()
+        
+        st.subheader("🤖 AI Routing Suggestions (HitL Framework)")
+        st.write("Scan the Master Database to suggest the Top 5 most frequent historical routes for invoices missing data.")
+        
+        if st.button("⚙️ Generate Top 5 Historical Suggestions"):
+            valid_origins = df_audit[~df_audit['origin'].isin(batch_missing_flags) & df_audit['origin'].notna()]
+            valid_dests = df_audit[~df_audit['destination'].isin(batch_missing_flags) & df_audit['destination'].notna()]
+            
+            hist_vendor_col = 'original_supplier_name' if 'original_supplier_name' in df_audit.columns else 'vendor_name'
+            
+            orig_counts = valid_origins.groupby([hist_vendor_col, 'origin']).size().reset_index(name='count')
+            orig_counts = orig_counts.sort_values([hist_vendor_col, 'count'], ascending=[True, False])
+            top_origins = orig_counts.groupby(hist_vendor_col).head(5)
+            
+            orig_dict = {}
+            for supp, group in top_origins.groupby(hist_vendor_col):
+                suggs = [f"{idx+1}. {row['origin']} (x{row['count']})" for idx, row in enumerate(group.to_dict('records'))]
+                orig_dict[supp] = " | ".join(suggs)
+                
+            dest_counts = valid_dests.groupby([hist_vendor_col, 'destination']).size().reset_index(name='count')
+            dest_counts = dest_counts.sort_values([hist_vendor_col, 'count'], ascending=[True, False])
+            top_dests = dest_counts.groupby(hist_vendor_col).head(5)
+            
+            dest_dict = {}
+            for supp, group in top_dests.groupby(hist_vendor_col):
+                suggs = [f"{idx+1}. {row['destination']} (x{row['count']})" for idx, row in enumerate(group.to_dict('records'))]
+                dest_dict[supp] = " | ".join(suggs)
+            
+            batch_routing_issues = batch_df[
+                batch_df['origin'].isin(batch_missing_flags) | batch_df['origin'].isna() |
+                batch_df['destination'].isin(batch_missing_flags) | batch_df['destination'].isna()
+            ]
+            
+            for idx, row in batch_routing_issues.iterrows():
+                supp = row['original_supplier_name'] if 'original_supplier_name' in row and pd.notna(row['original_supplier_name']) else standardize_vendor(row['vendor_name'])
+                sug_orig = orig_dict.get(supp, "No historical data")
+                sug_dest = dest_dict.get(supp, "No historical data")
+                update_audit_suggestions(row['id'], sug_orig, sug_dest)
+                
+            st.success("Historical suggestions generated successfully!")
+            st.rerun()
+            
+        st.write("Review the Top 5 historical suggestions below and type your final choice into the Approved column.")
+        
+        current_db = fetch_audit_data()
+        if 'batch_id' in current_db.columns and latest_batch:
+            current_batch_issues = current_db[(current_db['batch_id'] == latest_batch) & (
+                current_db['origin'].isin(batch_missing_flags) | current_db['origin'].isna() |
+                current_db['destination'].isin(batch_missing_flags) | current_db['destination'].isna()
+            )].copy()
+        else:
+            current_batch_issues = current_db[(current_db['extraction_date'] == latest_date) & (
+                current_db['origin'].isin(batch_missing_flags) | current_db['origin'].isna() |
+                current_db['destination'].isin(batch_missing_flags) | current_db['destination'].isna()
+            )].copy()
+
+        if not current_batch_issues.empty:
+            if 'original_supplier_name' not in current_batch_issues.columns:
+                current_batch_issues['original_supplier_name'] = current_batch_issues['vendor_name'].apply(standardize_vendor)
+                
+            review_df = current_batch_issues[['id', 'file_name', 'original_supplier_name', 'origin', 'suggested_origin', 'final_origin', 'destination', 'suggested_destination', 'final_destination']]
+            
+            edited_routes = st.data_editor(
+                review_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "id": st.column_config.NumberColumn("DB ID", disabled=True),
+                    "file_name": st.column_config.TextColumn("File", disabled=True),
+                    "original_supplier_name": st.column_config.TextColumn("Supplier", disabled=True),
+                    "origin": st.column_config.TextColumn("Raw Origin", disabled=True),
+                    "suggested_origin": st.column_config.TextColumn("🤖 Suggested Origins (Top 5)", disabled=True),
+                    "final_origin": st.column_config.TextColumn("✅ Approved Origin"),
+                    "destination": st.column_config.TextColumn("Raw Dest", disabled=True),
+                    "suggested_destination": st.column_config.TextColumn("🤖 Suggested Dests (Top 5)", disabled=True),
+                    "final_destination": st.column_config.TextColumn("✅ Approved Dest")
+                }
+            )
+            
+            if st.button("💾 Save Approved Routes to DB", type="primary"):
+                for index, row in edited_routes.iterrows():
+                    if pd.notna(row['final_origin']) or pd.notna(row['final_destination']):
+                        f_orig = row['final_origin'] if pd.notna(row['final_origin']) else None
+                        f_dest = row['final_destination'] if pd.notna(row['final_destination']) else None
+                        update_audit_final_routes(row['id'], f_orig, f_dest)
+                st.success("Final routes locked into the Master Database.")
+                st.rerun()
+        else:
+            st.info("No routing issues found in the current batch!")
+
+        st.divider()
+        
+        with st.expander("📂 Master Supplier Database (CSV)", expanded=False):
+            st.write("View, edit, or add official Supplier names directly in the table below. These act as the fuzzy match targets for future runs. Scroll to the bottom to add a new row.")
+            
+            master_df = load_master_suppliers()
+            
+            edited_master = st.data_editor(
+                master_df, 
+                num_rows="dynamic", 
+                use_container_width=True,
+                key="master_csv_editor"
+            )
+            
+            if st.button("💾 Save Changes to Master CSV", type="primary"):
+                edited_master = edited_master.dropna(subset=['Original_Supplier_Name'])
+                edited_master = edited_master[edited_master['Original_Supplier_Name'].astype(str).str.strip() != '']
+                save_master_suppliers(edited_master)
+                st.success("Master CSV Rules Updated Successfully!")
+                time.sleep(1)
+                st.rerun()
+                
+        st.divider()
+            
+        st.subheader("⚙️ Database Management")
+        st.write("Maintain system health and clear test data.")
+        col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 2])
+        with col_btn1:
+            if st.button("🗑️ Remove Duplicates", use_container_width=True):
+                dialog_remove_duplicates()
+        with col_btn2:
+            if st.button("⚠️ Wipe Database", type="secondary", use_container_width=True):
+                dialog_wipe_db()
