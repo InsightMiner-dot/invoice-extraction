@@ -1,0 +1,695 @@
+import streamlit as st
+import fitz  # PyMuPDF
+import base64
+import instructor
+import os
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment
+from openai import AzureOpenAI
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Tuple
+import time
+import io
+from datetime import datetime
+import re
+from dotenv import load_dotenv
+import pandas as pd
+
+# Load environment variables from the backend
+load_dotenv(override=True)
+
+AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
+AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+
+# ==============================================================
+# 0. Utility Functions
+# ==============================================================
+
+def standardize_vendor(name):
+    if not isinstance(name, str) or name in ['N/A', 'ERROR', '']:
+        return name
+    name = name.upper()
+    name = re.sub(r'[.,]', '', name)
+    name = re.sub(r'\b(LLC|INC|LTD|CORP|CORPORATION|CO|COMPANY)\b', '', name)
+    return re.sub(r'\s+', ' ', name).strip()
+
+def get_raw_pdf_text(file_bytes: bytes) -> str:
+    """Extracts raw text from PDF to cross-validate LLM hallucinations."""
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    text = ""
+    for page in doc:
+        text += page.get_text("text") + " "
+    return text
+
+# ==============================================================
+# 1. Define Data Schema 
+# ==============================================================
+
+class LineItem(BaseModel):
+    page_number: Optional[int] = Field(None, description="Page number (starting at 1)")
+    material: Optional[str] = Field(None, description="Material code, part number, or SKU")
+    description: str = Field(description="Name or description of the item.")
+    quantity: Optional[float] = Field(None, description="Number of items SHIPPED.")
+    uom: Optional[str] = Field(None, description="Unit of Measure (e.g., EA, LBS, KG).")
+    uom_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
+    unit_price: Optional[float] = Field(None, description="Price of a single unit")
+    line_total: Optional[float] = Field(None, description="Total cost for this specific line item.")
+    line_origin: Optional[str] = Field(None, description="Exact Origin/Ship-From address printed for THIS specific row.")
+    line_destination: Optional[str] = Field(None, description="Exact Destination/Ship-To address printed for THIS specific row.")
+
+class TaxItem(BaseModel):
+    tax_name: str = Field(description="The exact printed name of the tax.")
+    tax_amount: float = Field(description="The amount for this specific tax.")
+
+class FeeItem(BaseModel):
+    fee_name: str = Field(description="The exact printed name of the fee.")
+    fee_amount: float = Field(description="The amount for this specific fee.")
+
+class InvoiceData(BaseModel):
+    vendor_name: str = Field(description="Name of the company issuing the invoice")
+    vendor_address: Optional[str] = Field(None, description="FULL complete address of the vendor.")
+    bill_to: Optional[str] = Field(None, description="FULL complete 'Bill To' or 'Sold To' address.")
+    remit_to: Optional[str] = Field(None, description="FULL complete 'Remit To' address.")
+    origin: Optional[str] = Field(None, description="FULL origin physical address for the overall invoice.")
+    origin_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
+    destination: Optional[str] = Field(None, description="FULL destination physical address for the overall invoice.")
+    destination_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
+    invoice_number: Optional[str] = Field(None, description="Unique invoice number.")
+    invoice_number_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
+    date: Optional[str] = Field(None, description="Date the invoice was issued")
+    currency: Optional[str] = Field(None, description="3-letter currency code")
+    subtotal: Optional[float] = Field(None, description="Subtotal amount before taxes and shipping.")
+    taxes: List[TaxItem] = Field(default_factory=list, description="Extract individual taxes ONLY from the summary block.")
+    additional_fees: List[FeeItem] = Field(default_factory=list, description="ONLY extract fees from the summary block at the bottom.")
+    shipping_name: Optional[str] = Field(None, description="Exact printed name of the shipping charge.")
+    shipping_handling: Optional[float] = Field(0.0, description="ONLY extract this if it appears in the final summary block.")
+    total_amount: float = Field(description="Final total amount charged on the invoice")
+    total_amount_confidence: Optional[str] = Field(None, description="'High', 'Medium', or 'Low'")
+    custom_fields: Dict[str, Optional[str]] = Field(default_factory=dict, description="Extract custom fields requested.")
+    line_items: List[LineItem] = Field(description="List of all individual items purchased.")
+
+class InvoiceDocument(BaseModel):
+    invoices: List[InvoiceData] = Field(description="List of distinct invoices. Combine items if invoice spans pages.")
+
+# ==============================================================
+# 2. PDF to Image Conversion & Extraction 
+# ==============================================================
+
+def pdf_to_base64_images(file_bytes: bytes, max_pages: int, dpi: int) -> Tuple[List[str], int]:
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    base64_images = []
+    total_pages = len(doc)
+    if total_pages > max_pages:
+        st.warning(f"PDF is {total_pages} pages long. Truncating to first {max_pages} pages based on configuration.")
+    pages_to_process = min(total_pages, max_pages)
+    for page_num in range(pages_to_process):
+        page = doc[page_num]
+        pix = page.get_pixmap(dpi=dpi) 
+        base64_images.append(base64.b64encode(pix.tobytes("jpeg")).decode('utf-8'))
+    return base64_images, total_pages
+
+def extract_invoice_data(client, deployment: str, file_bytes: bytes, custom_fields_dict: Dict[str, str], standard_aliases_dict: Dict[str, str], max_pages: int, dpi: int) -> Tuple[InvoiceDocument, int]:
+    base64_images, total_pages = pdf_to_base64_images(file_bytes, max_pages, dpi)
+    
+    system_prompt = "You are an expert accountant processing a document that may contain multiple distinct invoices. STRICT PAGING RULES: 1) If the same invoice number continues across multiple pages, combine all line items, taxes, and totals into a SINGLE invoice record. 2) If you see a NEW invoice number, start a NEW invoice record. CRITICAL RULE AGAINST DUPLICATES: Never extract the same tax or fee twice. ANTI-LAZINESS RULE: DO NOT BE LAZY. You must extract every single line item row by row."
+    
+    if standard_aliases_dict:
+        alias_str = "\n".join([f"- {k}: Also look for '{v}'" for k, v in standard_aliases_dict.items()])
+        system_prompt += f"\n\nSTANDARD FIELD ALIASES:\nThe user has provided common aliases for standard schema fields. Use these to help locate the data:\n{alias_str}"
+    
+    if custom_fields_dict:
+        rules_str = "\n".join([f"- Field Key: '{k}' | Definition & Aliases: {v}" for k, v in custom_fields_dict.items()])
+        system_prompt += f"\n\nSTRICT RULE: The user has requested custom data extraction based on specific definitions and alias mappings. You MUST search the invoice for the following logic and place the results in the 'custom_fields' dictionary using the EXACT 'Field Key' provided:\n{rules_str}\nIf a field or its aliases are not found, leave its value as null."
+
+    content_array = [{"type": "text", "text": "Extract data from this multi-page document. Pay close attention to invoice numbers. Evaluate confidence ('High', 'Medium', 'Low'). Note page numbers."}]
+    for img_base64 in base64_images:
+        content_array.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"}})
+
+    response = client.chat.completions.create(
+        model=deployment, 
+        response_model=InvoiceDocument, 
+        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": content_array}]
+    )
+    return response, total_pages
+
+def setup_excel_workbook(custom_cols: List[str]):
+    wb = openpyxl.Workbook()
+    ws_details = wb.active
+    ws_details.title = "Invoice Details"
+    details_headers = [
+        "File Name", "Page #", "Vendor Name", "Vendor Address", "Bill To", "Remit To",
+        "Origin", "Destination", "Invoice Number", "Date", "Currency", 
+        "Material", "Description", "Quantity", "UOM", "Unit Price", "Line Total", "Subtotal", "Invoice Total",
+        "Inv# Conf", "Origin Conf", "Dest Conf", "UOM Conf", "Total Conf", "Status", "Reason for Review", "Item Warnings"
+    ]
+    if custom_cols: details_headers.extend(custom_cols)
+    ws_details.append(details_headers)
+    
+    ws_qc = wb.create_sheet(title="QC Summary")
+    qc_headers = [
+        "File Name", "Vendor Name", "Invoice Number", "Origin", "Destination", "Status", "Reason for Review", 
+        "Extracted Total", "Calculated Sum", "Variance", "Hallucination Alert", "Row Math Warnings"
+    ]
+    ws_qc.append(qc_headers)
+    
+    header_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True)
+    for sheet in [ws_details, ws_qc]:
+        sheet.freeze_panes = "A2"
+        for cell in sheet[1]:
+            cell.fill = header_fill; cell.font = header_font; cell.alignment = Alignment(horizontal="center", vertical="center")
+    return wb, ws_details, ws_qc
+
+# ==============================================================
+# 3. Streamlit UI & Core Logic Orchestrator
+# ==============================================================
+
+if 'extraction_details' not in st.session_state:
+    st.session_state.extraction_details = None
+if 'extraction_summary' not in st.session_state:
+    st.session_state.extraction_summary = None
+if 'extraction_excel' not in st.session_state:
+    st.session_state.extraction_excel = None
+if 'audit_df' not in st.session_state:
+    st.session_state.audit_df = pd.DataFrame()
+if 'start_processing' not in st.session_state:
+    st.session_state.start_processing = False
+if 'files_to_process' not in st.session_state:
+    st.session_state.files_to_process = []
+if 'uploaded_files_cache' not in st.session_state:
+    st.session_state.uploaded_files_cache = {}
+
+def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict, max_pages, dpi, sleep_time, prefix=""):
+    client = instructor.from_openai(AzureOpenAI(azure_endpoint=AZURE_ENDPOINT, api_key=AZURE_API_KEY, api_version=AZURE_API_VERSION))
+    
+    custom_col_keys = list(custom_fields_dict.keys())
+    wb, ws_details, ws_qc = setup_excel_workbook(custom_col_keys)
+    
+    success_count, error_count = 0, 0
+    progress_bar = st.progress(0, text=f"Initializing {prefix} processing sequence...")
+    status_text = st.empty()
+    
+    current_run_summary = []
+    current_run_details = []
+    current_run_audit = [] 
+
+    start_time_batch = time.time()
+    total_files = len(files_list)
+
+    for idx, file in enumerate(files_list):
+        filename = file.name
+        status_text.markdown(f"**Extracting ({idx+1}/{total_files}):** `{filename}`...")
+        file_start_time = time.time()
+        
+        try:
+            file.seek(0)
+            file_bytes = file.read()
+            st.session_state.uploaded_files_cache[filename] = file_bytes # Cache for audit viewer
+            
+            # Anti-Hallucination: Extract raw text from PDF
+            raw_pdf_text = get_raw_pdf_text(file_bytes)
+            clean_raw_text = re.sub(r'\s+', '', raw_pdf_text).lower()
+
+            extracted_document, total_pages = extract_invoice_data(client, AZURE_DEPLOYMENT, file_bytes, custom_fields_dict, standard_aliases_dict, max_pages, dpi)
+            file_proc_time = round(time.time() - file_start_time, 2)
+            
+            if not extracted_document.invoices:
+                ws_qc.append([filename, "N/A", "N/A", "N/A", "N/A", "FAIL - NO DATA", "0 Invoices Found in PDF", "", "", "", "False", ""])
+                current_run_summary.append({"File Name": filename, "Vendor Name": "N/A", "Invoice #": "N/A", "Origin": "N/A", "Destination": "N/A", "Status": "FAIL", "Reason": "No Invoices Found in PDF"})
+                continue
+            
+            for extracted_data in extracted_document.invoices:
+                clean_vendor = standardize_vendor(extracted_data.vendor_name)
+
+                # Cross-validate Invoice Number against raw text
+                hallucination_alert = False
+                if extracted_data.invoice_number:
+                    clean_inv = re.sub(r'\s+', '', extracted_data.invoice_number).lower()
+                    if clean_inv and clean_inv not in clean_raw_text:
+                        hallucination_alert = True
+
+                calculated_line_sum = sum(item.line_total for item in extracted_data.line_items if item.line_total is not None)
+                safe_ship = extracted_data.shipping_handling or 0.0
+                safe_total_tax = sum(tax.tax_amount for tax in extracted_data.taxes if tax.tax_amount is not None)
+                safe_fees = sum(fee.fee_amount for fee in extracted_data.additional_fees if fee.fee_amount is not None)
+                
+                total_calculated = calculated_line_sum + safe_total_tax + safe_ship + safe_fees
+                variance = round(extracted_data.total_amount - total_calculated, 2)
+                
+                review_reasons = []
+                row_warnings = [] # Optional warnings, won't trigger FAIL
+                
+                if variance != 0.0: review_reasons.append(f"Math Variance of {variance}")
+                if hallucination_alert: review_reasons.append("HALLUCINATION: Inv # not in doc")
+                if extracted_data.invoice_number_confidence == "Low": review_reasons.append("Low Conf: Invoice #")
+                if extracted_data.origin_confidence == "Low": review_reasons.append("Low Conf: Origin")
+                if extracted_data.destination_confidence == "Low": review_reasons.append("Low Conf: Destination")
+                if extracted_data.total_amount_confidence == "Low": review_reasons.append("Low Conf: Total Amount")
+                if len(extracted_data.line_items) == 0: review_reasons.append("Missing: 0 Line Items Found")
+                
+                for item in extracted_data.line_items:
+                    if item.uom_confidence == "Low":
+                        short_desc = item.description[:15] + "..." if item.description and len(item.description) > 15 else item.description
+                        review_reasons.append(f"Low Conf: UOM on '{short_desc}'")
+                    
+                    # Optional Flag: Item Math Check
+                    if item.quantity and item.unit_price and item.line_total:
+                        expected = item.quantity * item.unit_price
+                        if abs(expected - item.line_total) > 0.05: # Allow 5 cents tolerance for rounding/discounts
+                            row_warnings.append(f"Row Mismatch: Qty {item.quantity} * {item.unit_price} != {item.line_total}")
+
+                needs_review = len(review_reasons) > 0
+                status = "FAIL - NEEDS REVIEW" if needs_review else "PASS"
+                reasons_string = " | ".join(review_reasons) if needs_review else "N/A"
+                warnings_string = " | ".join(row_warnings) if row_warnings else "N/A"
+                
+                def create_row_dict(page_num, material, desc, qty, uom, uom_conf, price, line_total, line_orig=None, line_dest=None, opt_warn=""):
+                    final_origin = line_orig if line_orig else extracted_data.origin
+                    final_dest = line_dest if line_dest else extracted_data.destination
+                    
+                    row_data = {
+                        "File Name": filename, "Page #": page_num,
+                        "Vendor Name": clean_vendor,
+                        "Vendor Address": extracted_data.vendor_address,
+                        "Bill To": extracted_data.bill_to, "Remit To": extracted_data.remit_to,
+                        "Origin": final_origin, "Destination": final_dest, 
+                        "Invoice Number": extracted_data.invoice_number, "Date": extracted_data.date, "Currency": extracted_data.currency,
+                        "Material": material, "Description": desc, 
+                        "Quantity": qty, "UOM": uom, "Unit Price": price, "Line Total": line_total,
+                        "Subtotal": extracted_data.subtotal, "Invoice Total": extracted_data.total_amount,
+                        "Inv# Conf": extracted_data.invoice_number_confidence, "Origin Conf": extracted_data.origin_confidence,
+                        "Dest Conf": extracted_data.destination_confidence, "UOM Conf": uom_conf, "Total Conf": extracted_data.total_amount_confidence,
+                        "Status": status, "Reason for Review": reasons_string, "Item Warnings": opt_warn
+                    }
+                    for col in custom_col_keys:
+                        row_data[col] = extracted_data.custom_fields.get(col, "Not Found")
+                    return row_data
+
+                if len(extracted_data.line_items) == 0:
+                    row_dict = create_row_dict(None, None, "NO ITEMS FOUND", None, None, None, None, 0.0)
+                    ws_details.append(list(row_dict.values()))
+                    current_run_details.append(row_dict)
+                else:
+                    for item in extracted_data.line_items:
+                        opt_warn = ""
+                        if item.quantity and item.unit_price and item.line_total:
+                             if abs((item.quantity * item.unit_price) - item.line_total) > 0.05:
+                                 opt_warn = f"Flag: Math Issue"
+                        row_dict = create_row_dict(
+                            item.page_number, item.material, item.description, item.quantity, 
+                            item.uom, item.uom_confidence, item.unit_price, item.line_total, 
+                            line_orig=item.line_origin, line_dest=item.line_destination, opt_warn=opt_warn
+                        )
+                        ws_details.append(list(row_dict.values()))
+                        current_run_details.append(row_dict)
+                        
+                if safe_ship > 0: 
+                    row_dict = create_row_dict(None, "SHIPPING", extracted_data.shipping_name or "Shipping", None, None, None, None, safe_ship)
+                    ws_details.append(list(row_dict.values()))
+                    current_run_details.append(row_dict)
+                    
+                for tax in extracted_data.taxes:
+                    if tax.tax_amount is not None and tax.tax_amount > 0: 
+                        row_dict = create_row_dict(None, "TAX", tax.tax_name, None, None, None, None, tax.tax_amount)
+                        ws_details.append(list(row_dict.values()))
+                        current_run_details.append(row_dict)
+                        
+                for fee in extracted_data.additional_fees:
+                    if fee.fee_amount is not None and fee.fee_amount > 0: 
+                        row_dict = create_row_dict(None, "FEE", fee.fee_name, None, None, None, None, fee.fee_amount)
+                        ws_details.append(list(row_dict.values()))
+                        current_run_details.append(row_dict)
+
+                ws_qc.append([
+                    filename, clean_vendor, extracted_data.invoice_number, 
+                    extracted_data.origin, extracted_data.destination,
+                    status, reasons_string, extracted_data.total_amount, total_calculated, variance, 
+                    str(hallucination_alert), warnings_string
+                ])
+
+                current_run_audit.append({
+                    "file_name": filename,
+                    "vendor_name": clean_vendor,
+                    "invoice_number": extracted_data.invoice_number,
+                    "origin": extracted_data.origin,
+                    "destination": extracted_data.destination,
+                    "suggested_origin": "",
+                    "suggested_destination": "",
+                    "final_origin": "",
+                    "final_destination": "",
+                    "status": status,
+                    "reason_for_review": reasons_string,
+                    "hallucination_alert": hallucination_alert,
+                    "row_warnings": warnings_string,
+                    "extracted_total": extracted_data.total_amount,
+                    "calculated_sum": total_calculated,
+                    "variance": variance,
+                    "processing_time": file_proc_time,
+                    "page_count": total_pages
+                })
+
+                current_run_summary.append({
+                    "File Name": filename, "Vendor Name": clean_vendor, "Invoice #": extracted_data.invoice_number,
+                    "Origin": extracted_data.origin or "Missing", "Destination": extracted_data.destination or "Missing",
+                    "Variance": f"${variance:,.2f}", "Status": "✅ PASS" if status == "PASS" else "⚠️ FAIL",
+                    "Proc Time": f"{file_proc_time}s"
+                })
+                success_count += 1
+                
+        except Exception as e:
+            file_proc_time = round(time.time() - file_start_time, 2)
+            current_run_summary.append({"File Name": filename, "Vendor Name": "ERROR", "Invoice #": "ERROR", "Origin": "ERROR", "Destination": "ERROR", "Status": "❌ ERROR", "Reason": "API/System Crash", "Proc Time": f"{file_proc_time}s"})
+            error_count += 1
+        
+        if idx < total_files - 1: time.sleep(sleep_time) 
+        
+        files_processed = idx + 1
+        elapsed_time = time.time() - start_time_batch
+        avg_time_per_file = elapsed_time / files_processed
+        remaining_files = total_files - files_processed
+        mins, secs = divmod(int(avg_time_per_file * remaining_files), 60)
+        eta_string = f" | ETA: {mins}m {secs}s" if (avg_time_per_file * remaining_files) > 0 else ""
+        progress_bar.progress(files_processed / total_files, text=f"Processing {files_processed}/{total_files} documents{eta_string}")
+
+    excel_buffer = io.BytesIO()
+    wb.save(excel_buffer)
+    excel_buffer.seek(0)
+    
+    st.session_state.extraction_details = current_run_details
+    st.session_state.extraction_summary = current_run_summary
+    st.session_state.extraction_excel = excel_buffer
+    st.session_state.audit_df = pd.DataFrame(current_run_audit) 
+    
+    progress_bar.empty()
+    status_text.empty()
+    st.success(f"🎉 {prefix} Batch Processing Complete! Invoices Extracted: {success_count} | Errors: {error_count}")
+
+def display_pdf(file_bytes):
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    html_content = '<div style="height: 60vh; overflow-y: scroll; border: 1px solid #ddd; padding: 10px; background-color: #525659; text-align: center;">'
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        pix = page.get_pixmap(dpi=100)
+        img_b64 = base64.b64encode(pix.tobytes("jpeg")).decode('utf-8')
+        html_content += f'<img src="data:image/jpeg;base64,{img_b64}" style="width: 100%; max-width: 800px; margin-bottom: 10px; box-shadow: 0px 4px 10px rgba(0,0,0,0.5);"><br>'
+    html_content += '</div>'
+    st.markdown(html_content, unsafe_allow_html=True)
+
+
+# ==============================================================
+# 4. Streamlit App Layout
+# ==============================================================
+
+st.set_page_config(page_title="AI Invoice Intelligence", page_icon="🧾", layout="wide")
+st.title("🧾 AI Invoice Intelligence Platform")
+
+# Sidebar
+with st.sidebar:
+    st.header("⚙️ Settings & Rules")
+    
+    with st.expander("Processing Configuration", expanded=False):
+        config_max_pages = st.number_input("Max Pages per PDF", min_value=1, max_value=100, value=15)
+        config_dpi = st.slider("Render Resolution (DPI)", min_value=72, max_value=600, value=300, step=72)
+        config_sleep_time = st.number_input("API Sleep Time (seconds)", min_value=0, max_value=60, value=3)
+
+    with st.expander("Standard Field Aliases", expanded=False):
+        st.write("Add alternative names for built-in fields.")
+        default_standard = pd.DataFrame({
+            "Standard Field": [
+                "invoice_number", "date", "vendor_name", "vendor_address", 
+                "bill_to", "remit_to", "origin", "destination", "currency", 
+                "subtotal", "shipping_name", "shipping_handling", "total_amount",
+                "material", "description", "line_origin", "line_destination", "quantity", "uom", "unit_price", "line_total",
+                "tax_name", "tax_amount", "fee_name", "fee_amount"
+            ],
+            "Aliases": [""] * 25
+        })
+        standard_df = st.data_editor(default_standard, disabled=["Standard Field"], use_container_width=True, hide_index=True)
+        
+        standard_aliases_dict = {}
+        for _, row in standard_df.iterrows():
+            if str(row["Aliases"]).strip() and str(row["Aliases"]) != "None":
+                standard_aliases_dict[row["Standard Field"]] = str(row["Aliases"]).strip()
+                
+    with st.expander("New Custom Fields", expanded=False):
+        st.write("Add entirely new columns to extract.")
+        default_custom = pd.DataFrame({
+            "Field Name": [""],
+            "Description & Aliases": [""]
+        })
+        custom_df = st.data_editor(default_custom, num_rows="dynamic", use_container_width=True, hide_index=True)
+        
+        custom_fields_dict = {}
+        for _, row in custom_df.iterrows():
+            name = str(row["Field Name"]).strip()
+            desc = str(row["Description & Aliases"]).strip()
+            if name and name != "None":
+                custom_fields_dict[name] = desc
+    
+    st.divider()
+    
+    st.header("📄 Batch Upload")
+    st.write("Upload your mixed batch of invoices here.")
+    uploaded_files = st.file_uploader("Upload PDF Documents", type=["pdf"], accept_multiple_files=True)
+
+# Tabs
+tab_extract_view, tab_batch_qa = st.tabs(["📄 Viewer & Extraction Suite", "✅ Current Batch QA"])
+
+# ---------------------------------------------------------
+# TAB 1: VIEWER & EXTRACTION SUITE
+# ---------------------------------------------------------
+with tab_extract_view:
+    st.header("📄 Document Viewer & Extraction")
+    
+    if uploaded_files:
+        with st.expander("🔍 View Uploaded Documents", expanded=False):
+            st.write("Review your uploaded documents below.")
+            search_query = st.text_input("🔍 Search by File Name", "").lower()
+            filtered_files = [f for f in uploaded_files if search_query in f.name.lower()]
+            
+            if not filtered_files:
+                st.warning("No files match your search query.")
+            else:
+                cols = st.columns(4)
+                for idx, file in enumerate(filtered_files):
+                    col = cols[idx % 4]
+                    with col:
+                        st.markdown(f"<div style='white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 14px; margin-bottom: 5px;' title='{file.name}'><b>{file.name}</b></div>", unsafe_allow_html=True)
+                        file.seek(0)
+                        doc = fitz.open(stream=file.read(), filetype="pdf")
+                        if len(doc) > 0:
+                            page = doc[0]
+                            pix = page.get_pixmap(dpi=72)
+                            img_b64 = base64.b64encode(pix.tobytes("jpeg")).decode('utf-8')
+                            st.markdown(f'<img src="data:image/jpeg;base64,{img_b64}" style="width: 100%; border: 1px solid #ccc; box-shadow: 2px 2px 5px rgba(0,0,0,0.1); margin-bottom: 10px;">', unsafe_allow_html=True)
+        
+        st.divider()
+
+        st.subheader("⚙️ Process Documents")
+        if st.button("🚀 Start Extraction", type="primary"):
+            if not all([AZURE_ENDPOINT, AZURE_API_KEY, AZURE_DEPLOYMENT]):
+                st.error("⚠️ Azure credentials missing. Check your `.env` file.")
+            else:
+                st.session_state.files_to_process = uploaded_files
+                st.session_state.start_processing = True
+
+        if st.session_state.start_processing:
+            run_extraction_process(
+                st.session_state.files_to_process, 
+                custom_fields_dict, 
+                standard_aliases_dict, 
+                config_max_pages, 
+                config_dpi,
+                config_sleep_time
+            )
+            st.session_state.start_processing = False
+            st.rerun()
+
+        if st.session_state.extraction_details is not None:
+            st.success("Extraction Data is Ready!")
+            st.subheader("📝 Line Item Details (Full Extraction)")
+            st.dataframe(pd.DataFrame(st.session_state.extraction_details), use_container_width=True, hide_index=True)
+
+            st.divider()
+
+            st.subheader("🛡️ QC Summary")
+            st.dataframe(pd.DataFrame(st.session_state.extraction_summary), use_container_width=True, hide_index=True)
+
+            st.download_button(
+                label="📥 Download Full Extract Data (Excel)",
+                data=st.session_state.extraction_excel,
+                file_name=f"Full_Extraction_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary"
+            )
+
+    else:
+        st.info("Upload PDF documents in the sidebar to view and extract them here.")
+
+
+# ---------------------------------------------------------
+# TAB 2: CURRENT BATCH QA
+# ---------------------------------------------------------
+with tab_batch_qa:
+    st.header("✅ Current Batch QA")
+    st.write("Review extraction exceptions, visual anomalies, and routing issues.")
+    
+    batch_df = st.session_state.audit_df
+    
+    if batch_df.empty:
+        st.info("Process a batch of invoices to view current metrics.")
+    else:
+        batch_invoices = len(batch_df)
+        batch_vendors = batch_df['vendor_name'].nunique()
+        batch_spend_k = batch_df['extracted_total'].sum() / 1000.0
+        
+        valid_df = batch_df[~batch_df['invoice_number'].isin(['N/A', 'ERROR', '', None]) & ~batch_df['vendor_name'].isin(['N/A', 'ERROR'])]
+        duplicates_in_batch = valid_df[valid_df.duplicated(subset=['vendor_name', 'invoice_number'], keep=False)]
+        batch_dup_count = len(duplicates_in_batch)
+            
+        bc1, bc2, bc3, bc4 = st.columns(4)
+        bc1.metric("Current Invoices Processed", f"{batch_invoices:,}")
+        bc2.metric("Total Unique Vendors", f"{batch_vendors:,}")
+        bc3.metric("Total Spend", f"${batch_spend_k:,.1f}K")
+        bc4.metric("Batch Duplicates Found", f"{batch_dup_count:,}", delta_color="inverse")
+
+        if batch_dup_count > 0:
+            st.warning("⚠️ Duplicate Invoice Numbers detected within this current batch:")
+            st.dataframe(duplicates_in_batch[['file_name', 'vendor_name', 'invoice_number', 'extracted_total']], use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        # --- UX ENHANCEMENT: Side-by-Side Audit Mode ---
+        st.subheader("🕵️ Side-by-Side Exception Audit Mode")
+        st.write("Review flagged files side-by-side with the original document.")
+        
+        files_with_issues = batch_df[(batch_df['status'] != 'PASS') | (batch_df['row_warnings'] != 'N/A')]['file_name'].unique()
+        
+        if len(files_with_issues) > 0:
+            selected_audit_file = st.selectbox("Select a flagged file to audit:", files_with_issues)
+            
+            if selected_audit_file and selected_audit_file in st.session_state.uploaded_files_cache:
+                audit_row = batch_df[batch_df['file_name'] == selected_audit_file].iloc[0]
+                
+                col_pdf, col_data = st.columns([1.2, 1])
+                with col_pdf:
+                    st.markdown("**Original Document**")
+                    display_pdf(st.session_state.uploaded_files_cache[selected_audit_file])
+                
+                with col_data:
+                    st.markdown("**Extraction Status**")
+                    if audit_row['status'] == 'PASS':
+                        st.success("Overall Status: PASS")
+                    else:
+                        st.error(f"Overall Status: FAIL\n\nReasons: {audit_row['reason_for_review']}")
+                    
+                    if audit_row['hallucination_alert']:
+                        st.error("🚨 HALLUCINATION WARNING: The extracted invoice number does not exist in the raw PDF text.")
+                    if audit_row['row_warnings'] != 'N/A':
+                        st.warning(f"⚠️ Row Math Warning: {audit_row['row_warnings']}")
+                        
+                    st.markdown("**Key Extracted Data**")
+                    st.text_input("Vendor", value=audit_row['vendor_name'], disabled=True)
+                    st.text_input("Invoice Number", value=audit_row['invoice_number'], disabled=True)
+                    st.text_input("Origin", value=audit_row['origin'], disabled=True)
+                    st.text_input("Destination", value=audit_row['destination'], disabled=True)
+                    st.text_input("Total Amount", value=f"${audit_row['extracted_total']}", disabled=True)
+        else:
+            st.success("No files require manual auditing!")
+
+        st.divider()
+        
+        # --- UX ENHANCEMENT: Cell-Level Heatmapping ---
+        st.subheader("📄 Status Overview (Heatmap)")
+        st.write("Cells highlighted in **Red** indicate a severe hallucination. **Yellow** indicates an optional math warning. **Green/Red** text shows overall status.")
+        
+        status_df = batch_df[['file_name', 'invoice_number', 'vendor_name', 'status', 'hallucination_alert', 'row_warnings']].copy()
+        
+        def highlight_cells(row):
+            styles = [''] * len(row)
+            # Highlight Overall Status
+            status_idx = status_df.columns.get_loc('status')
+            styles[status_idx] = 'color: #2ecc71; font-weight: bold;' if row['status'] == 'PASS' else 'color: #e74c3c; font-weight: bold;'
+            
+            # Highlight Hallucination (Red Background)
+            if row['hallucination_alert'] == True:
+                inv_idx = status_df.columns.get_loc('invoice_number')
+                styles[inv_idx] = 'background-color: rgba(231, 76, 60, 0.3); font-weight: bold;'
+                
+            # Highlight Math Warnings (Yellow Background)
+            if row['row_warnings'] != 'N/A':
+                warn_idx = status_df.columns.get_loc('row_warnings')
+                styles[warn_idx] = 'background-color: rgba(241, 196, 15, 0.3); color: black;'
+                
+            return styles
+            
+        styled_status_df = status_df.style.apply(highlight_cells, axis=1)
+        st.dataframe(styled_status_df, use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        st.subheader("🤖 AI Routing Suggestions (Current Batch)")
+        batch_missing_flags = ['N/A', 'None', '', 'null', 'None']
+        
+        if st.button("⚙️ Generate Suggestions from Current Batch"):
+            valid_origins = batch_df[~batch_df['origin'].isin(batch_missing_flags) & batch_df['origin'].notna()]
+            valid_dests = batch_df[~batch_df['destination'].isin(batch_missing_flags) & batch_df['destination'].notna()]
+            
+            orig_counts = valid_origins.groupby(['vendor_name', 'origin']).size().reset_index(name='count')
+            orig_counts = orig_counts.sort_values(['vendor_name', 'count'], ascending=[True, False])
+            orig_dict = {supp: " | ".join([f"{r['origin']} (x{r['count']})" for idx, r in g.to_dict('records')]) for supp, g in orig_counts.groupby('vendor_name')}
+                
+            dest_counts = valid_dests.groupby(['vendor_name', 'destination']).size().reset_index(name='count')
+            dest_counts = dest_counts.sort_values(['vendor_name', 'count'], ascending=[True, False])
+            dest_dict = {supp: " | ".join([f"{r['destination']} (x{r['count']})" for idx, r in g.to_dict('records')]) for supp, g in dest_counts.groupby('vendor_name')}
+            
+            batch_routing_issues = batch_df[
+                batch_df['origin'].isin(batch_missing_flags) | batch_df['origin'].isna() |
+                batch_df['destination'].isin(batch_missing_flags) | batch_df['destination'].isna()
+            ]
+            
+            for idx, row in batch_routing_issues.iterrows():
+                supp = row['vendor_name']
+                st.session_state.audit_df.loc[idx, 'suggested_origin'] = orig_dict.get(supp, "No batch data")
+                st.session_state.audit_df.loc[idx, 'suggested_destination'] = dest_dict.get(supp, "No batch data")
+                
+            st.success("Batch suggestions generated successfully!")
+            st.rerun()
+            
+        current_batch_issues = st.session_state.audit_df[
+            st.session_state.audit_df['origin'].isin(batch_missing_flags) | st.session_state.audit_df['origin'].isna() |
+            st.session_state.audit_df['destination'].isin(batch_missing_flags) | st.session_state.audit_df['destination'].isna()
+        ].copy()
+
+        if not current_batch_issues.empty:
+            review_df = current_batch_issues[['file_name', 'vendor_name', 'origin', 'suggested_origin', 'final_origin', 'destination', 'suggested_destination', 'final_destination']]
+            edited_routes = st.data_editor(
+                review_df,
+                use_container_width=True,
+                column_config={
+                    "file_name": st.column_config.TextColumn("File", disabled=True),
+                    "vendor_name": st.column_config.TextColumn("Vendor", disabled=True),
+                    "origin": st.column_config.TextColumn("Raw Origin", disabled=True),
+                    "suggested_origin": st.column_config.TextColumn("🤖 Batch Suggestion", disabled=True),
+                    "final_origin": st.column_config.TextColumn("✅ Approved Origin"),
+                    "destination": st.column_config.TextColumn("Raw Dest", disabled=True),
+                    "suggested_destination": st.column_config.TextColumn("🤖 Batch Suggestion", disabled=True),
+                    "final_destination": st.column_config.TextColumn("✅ Approved Dest")
+                }
+            )
+            
+            if st.button("💾 Save Approved Routes to Memory", type="primary"):
+                for index, row in edited_routes.iterrows():
+                    if pd.notna(row['final_origin']) and str(row['final_origin']).strip() != "":
+                        st.session_state.audit_df.loc[index, 'origin'] = row['final_origin']
+                        st.session_state.audit_df.loc[index, 'final_origin'] = row['final_origin']
+                    if pd.notna(row['final_destination']) and str(row['final_destination']).strip() != "":
+                        st.session_state.audit_df.loc[index, 'destination'] = row['final_destination']
+                        st.session_state.audit_df.loc[index, 'final_destination'] = row['final_destination']
+                st.success("Routes successfully updated.")
+                time.sleep(1)
+                st.rerun()
+        else:
+            st.info("No missing routing addresses found in the current batch!")
