@@ -28,6 +28,7 @@ AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
 # ==============================================================
 
 def standardize_vendor(name):
+    """Cleans up the vendor name to make grouping more reliable."""
     if not isinstance(name, str) or name in ['N/A', 'ERROR', '']:
         return name
     name = name.upper()
@@ -44,7 +45,7 @@ def get_raw_pdf_text(file_bytes: bytes) -> str:
     return text
 
 # ==============================================================
-# 1. Define Data Schema 
+# 1. Define Data Schema (Unchanged)
 # ==============================================================
 
 class LineItem(BaseModel):
@@ -94,7 +95,7 @@ class InvoiceDocument(BaseModel):
     invoices: List[InvoiceData] = Field(description="List of distinct invoices. Combine items if invoice spans pages.")
 
 # ==============================================================
-# 2. PDF to Image Conversion & Extraction 
+# 2. PDF to Image Conversion & Extraction
 # ==============================================================
 
 def pdf_to_base64_images(file_bytes: bytes, max_pages: int, dpi: int) -> Tuple[List[str], int]:
@@ -193,7 +194,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
     
     current_run_summary = []
     current_run_details = []
-    current_run_audit = [] 
+    current_run_audit = []
 
     start_time_batch = time.time()
     total_files = len(files_list)
@@ -218,6 +219,12 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
             if not extracted_document.invoices:
                 ws_qc.append([filename, "N/A", "N/A", "N/A", "N/A", "FAIL - NO DATA", "0 Invoices Found in PDF", "", "", "", "False", ""])
                 current_run_summary.append({"File Name": filename, "Vendor Name": "N/A", "Invoice #": "N/A", "Origin": "N/A", "Destination": "N/A", "Status": "FAIL", "Reason": "No Invoices Found in PDF"})
+                current_run_audit.append({
+                    "file_name": filename, "vendor_name": "N/A", "invoice_number": "N/A", "origin": "N/A", "destination": "N/A",
+                    "suggested_origin": "", "suggested_destination": "", "final_origin": "", "final_destination": "",
+                    "status": "FAIL", "reason_for_review": "0 Invoices Found", "hallucination_alert": False, "row_warnings": "N/A",
+                    "extracted_total": 0.0, "calculated_sum": 0.0, "variance": 0.0, "processing_time": file_proc_time, "page_count": total_pages
+                })
                 continue
             
             for extracted_data in extracted_document.invoices:
@@ -239,7 +246,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                 variance = round(extracted_data.total_amount - total_calculated, 2)
                 
                 review_reasons = []
-                row_warnings = [] # Optional warnings, won't trigger FAIL
+                row_warnings = []
                 
                 if variance != 0.0: review_reasons.append(f"Math Variance of {variance}")
                 if hallucination_alert: review_reasons.append("HALLUCINATION: Inv # not in doc")
@@ -254,10 +261,9 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                         short_desc = item.description[:15] + "..." if item.description and len(item.description) > 15 else item.description
                         review_reasons.append(f"Low Conf: UOM on '{short_desc}'")
                     
-                    # Optional Flag: Item Math Check
                     if item.quantity and item.unit_price and item.line_total:
                         expected = item.quantity * item.unit_price
-                        if abs(expected - item.line_total) > 0.05: # Allow 5 cents tolerance for rounding/discounts
+                        if abs(expected - item.line_total) > 0.05: 
                             row_warnings.append(f"Row Mismatch: Qty {item.quantity} * {item.unit_price} != {item.line_total}")
 
                 needs_review = len(review_reasons) > 0
@@ -361,6 +367,12 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
         except Exception as e:
             file_proc_time = round(time.time() - file_start_time, 2)
             current_run_summary.append({"File Name": filename, "Vendor Name": "ERROR", "Invoice #": "ERROR", "Origin": "ERROR", "Destination": "ERROR", "Status": "❌ ERROR", "Reason": "API/System Crash", "Proc Time": f"{file_proc_time}s"})
+            current_run_audit.append({
+                "file_name": filename, "vendor_name": "ERROR", "invoice_number": "ERROR", "origin": "ERROR", "destination": "ERROR",
+                "suggested_origin": "", "suggested_destination": "", "final_origin": "", "final_destination": "",
+                "status": "FAIL", "reason_for_review": "API Crash", "hallucination_alert": False, "row_warnings": "N/A",
+                "extracted_total": 0.0, "calculated_sum": 0.0, "variance": 0.0, "processing_time": file_proc_time, "page_count": 0
+            })
             error_count += 1
         
         if idx < total_files - 1: time.sleep(sleep_time) 
@@ -541,6 +553,12 @@ with tab_batch_qa:
     if batch_df.empty:
         st.info("Process a batch of invoices to view current metrics.")
     else:
+        # Failsafe: Ensure new columns exist to prevent KeyError
+        if 'row_warnings' not in batch_df.columns:
+            batch_df['row_warnings'] = 'N/A'
+        if 'hallucination_alert' not in batch_df.columns:
+            batch_df['hallucination_alert'] = False
+
         batch_invoices = len(batch_df)
         batch_vendors = batch_df['vendor_name'].nunique()
         batch_spend_k = batch_df['extracted_total'].sum() / 1000.0
@@ -549,11 +567,15 @@ with tab_batch_qa:
         duplicates_in_batch = valid_df[valid_df.duplicated(subset=['vendor_name', 'invoice_number'], keep=False)]
         batch_dup_count = len(duplicates_in_batch)
             
-        bc1, bc2, bc3, bc4 = st.columns(4)
+        total_time_sec = batch_df['processing_time'].sum() if 'processing_time' in batch_df.columns else 0.0
+        mins, secs = divmod(int(total_time_sec), 60)
+        
+        bc1, bc2, bc3, bc4, bc5 = st.columns(5)
         bc1.metric("Current Invoices Processed", f"{batch_invoices:,}")
         bc2.metric("Total Unique Vendors", f"{batch_vendors:,}")
         bc3.metric("Total Spend", f"${batch_spend_k:,.1f}K")
         bc4.metric("Batch Duplicates Found", f"{batch_dup_count:,}", delta_color="inverse")
+        bc5.metric("Batch Execution Time", f"{mins}m {secs}s")
 
         if batch_dup_count > 0:
             st.warning("⚠️ Duplicate Invoice Numbers detected within this current batch:")
@@ -561,7 +583,7 @@ with tab_batch_qa:
 
         st.divider()
 
-        # --- UX ENHANCEMENT: Side-by-Side Audit Mode ---
+        # --- Side-by-Side Audit Mode ---
         st.subheader("🕵️ Side-by-Side Exception Audit Mode")
         st.write("Review flagged files side-by-side with the original document.")
         
@@ -585,9 +607,9 @@ with tab_batch_qa:
                     else:
                         st.error(f"Overall Status: FAIL\n\nReasons: {audit_row['reason_for_review']}")
                     
-                    if audit_row['hallucination_alert']:
+                    if audit_row.get('hallucination_alert', False):
                         st.error("🚨 HALLUCINATION WARNING: The extracted invoice number does not exist in the raw PDF text.")
-                    if audit_row['row_warnings'] != 'N/A':
+                    if audit_row.get('row_warnings', 'N/A') != 'N/A':
                         st.warning(f"⚠️ Row Math Warning: {audit_row['row_warnings']}")
                         
                     st.markdown("**Key Extracted Data**")
@@ -600,26 +622,23 @@ with tab_batch_qa:
             st.success("No files require manual auditing!")
 
         st.divider()
-        
-        # --- UX ENHANCEMENT: Cell-Level Heatmapping ---
+
+        # --- Cell-Level Heatmapping ---
         st.subheader("📄 Status Overview (Heatmap)")
         st.write("Cells highlighted in **Red** indicate a severe hallucination. **Yellow** indicates an optional math warning. **Green/Red** text shows overall status.")
         
-        status_df = batch_df[['file_name', 'invoice_number', 'vendor_name', 'status', 'hallucination_alert', 'row_warnings']].copy()
+        status_df = batch_df[['file_name', 'invoice_number', 'vendor_name', 'status', 'hallucination_alert', 'row_warnings', 'reason_for_review']].copy()
         
         def highlight_cells(row):
             styles = [''] * len(row)
-            # Highlight Overall Status
             status_idx = status_df.columns.get_loc('status')
             styles[status_idx] = 'color: #2ecc71; font-weight: bold;' if row['status'] == 'PASS' else 'color: #e74c3c; font-weight: bold;'
             
-            # Highlight Hallucination (Red Background)
-            if row['hallucination_alert'] == True:
+            if row.get('hallucination_alert', False) == True:
                 inv_idx = status_df.columns.get_loc('invoice_number')
                 styles[inv_idx] = 'background-color: rgba(231, 76, 60, 0.3); font-weight: bold;'
                 
-            # Highlight Math Warnings (Yellow Background)
-            if row['row_warnings'] != 'N/A':
+            if row.get('row_warnings', 'N/A') != 'N/A':
                 warn_idx = status_df.columns.get_loc('row_warnings')
                 styles[warn_idx] = 'background-color: rgba(241, 196, 15, 0.3); color: black;'
                 
@@ -630,8 +649,51 @@ with tab_batch_qa:
 
         st.divider()
 
-        st.subheader("🤖 AI Routing Suggestions (Current Batch)")
+        # --- Restored: Batch Vendor Routing & Exception Breakdown ---
+        st.subheader("🔎 Batch Vendor Routing & Exception Breakdown")
+        st.write("Filter to see a detailed routing scorecard and math error count by vendor for the **current batch**.")
+        
         batch_missing_flags = ['N/A', 'None', '', 'null', 'None']
+        
+        b_vendor_df = batch_df[~batch_df['vendor_name'].isin(['N/A', 'ERROR'])].copy()
+        b_vendor_df['missing_origin'] = b_vendor_df['origin'].isin(batch_missing_flags) | b_vendor_df['origin'].isna()
+        b_vendor_df['valid_origin'] = ~b_vendor_df['missing_origin']
+        b_vendor_df['missing_dest'] = b_vendor_df['destination'].isin(batch_missing_flags) | b_vendor_df['destination'].isna()
+        b_vendor_df['valid_dest'] = ~b_vendor_df['missing_dest']
+        b_vendor_df['amount_mismatch'] = b_vendor_df['variance'] != 0.0
+
+        b_vendor_summary = b_vendor_df.groupby('vendor_name').agg(
+            Total_Invoices=('file_name', 'count'),
+            Valid_Origin=('valid_origin', 'sum'),
+            Missing_Origin=('missing_origin', 'sum'),
+            Valid_Destination=('valid_dest', 'sum'),
+            Missing_Destination=('missing_dest', 'sum'),
+            Amount_Mismatch=('amount_mismatch', 'sum')
+        ).reset_index()
+        
+        b_vendor_summary.columns = [
+            'Vendor Name', 'Total Invoices', 
+            'Has Origin', 'Missing Origin', 
+            'Has Destination', 'Missing Destination', 
+            'Amount Mismatch'
+        ]
+        b_vendor_summary = b_vendor_summary.sort_values('Total Invoices', ascending=False)
+        
+        b_all_vendors = b_vendor_summary['Vendor Name'].tolist()
+        b_selected_vendors = st.multiselect("Filter Batch by Vendor(s):", options=b_all_vendors, default=[])
+        
+        if b_selected_vendors:
+            b_filtered_summary = b_vendor_summary[b_vendor_summary['Vendor Name'].isin(b_selected_vendors)]
+        else:
+            b_filtered_summary = b_vendor_summary
+            
+        st.dataframe(b_filtered_summary, use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        # --- AI Routing Suggestions (Current Batch) ---
+        st.subheader("🤖 AI Routing Suggestions (Current Batch)")
+        st.write("If an invoice is missing an Origin or Destination, this tool checks **this exact batch** to see if that specific Vendor has valid addresses on their other invoices, and suggests the most frequent ones.")
         
         if st.button("⚙️ Generate Suggestions from Current Batch"):
             valid_origins = batch_df[~batch_df['origin'].isin(batch_missing_flags) & batch_df['origin'].notna()]
