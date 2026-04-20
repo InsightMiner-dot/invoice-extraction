@@ -45,7 +45,7 @@ def get_raw_pdf_text(file_bytes: bytes) -> str:
     return text
 
 # ==============================================================
-# 1. Define Data Schema (Unchanged)
+# 1. Define Data Schema
 # ==============================================================
 
 class LineItem(BaseModel):
@@ -95,7 +95,7 @@ class InvoiceDocument(BaseModel):
     invoices: List[InvoiceData] = Field(description="List of distinct invoices. Combine items if invoice spans pages.")
 
 # ==============================================================
-# 2. PDF to Image Conversion & Extraction
+# 2. PDF to Image Conversion & Extraction 
 # ==============================================================
 
 def pdf_to_base64_images(file_bytes: bytes, max_pages: int, dpi: int) -> Tuple[List[str], int]:
@@ -194,7 +194,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
     
     current_run_summary = []
     current_run_details = []
-    current_run_audit = []
+    current_run_audit = [] 
 
     start_time_batch = time.time()
     total_files = len(files_list)
@@ -207,9 +207,8 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
         try:
             file.seek(0)
             file_bytes = file.read()
-            st.session_state.uploaded_files_cache[filename] = file_bytes # Cache for audit viewer
+            st.session_state.uploaded_files_cache[filename] = file_bytes
             
-            # Anti-Hallucination: Extract raw text from PDF
             raw_pdf_text = get_raw_pdf_text(file_bytes)
             clean_raw_text = re.sub(r'\s+', '', raw_pdf_text).lower()
 
@@ -230,7 +229,6 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
             for extracted_data in extracted_document.invoices:
                 clean_vendor = standardize_vendor(extracted_data.vendor_name)
 
-                # Cross-validate Invoice Number against raw text
                 hallucination_alert = False
                 if extracted_data.invoice_number:
                     clean_inv = re.sub(r'\s+', '', extracted_data.invoice_number).lower()
@@ -246,7 +244,7 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
                 variance = round(extracted_data.total_amount - total_calculated, 2)
                 
                 review_reasons = []
-                row_warnings = []
+                row_warnings = [] 
                 
                 if variance != 0.0: review_reasons.append(f"Math Variance of {variance}")
                 if hallucination_alert: review_reasons.append("HALLUCINATION: Inv # not in doc")
@@ -398,6 +396,21 @@ def run_extraction_process(files_list, custom_fields_dict, standard_aliases_dict
     status_text.empty()
     st.success(f"🎉 {prefix} Batch Processing Complete! Invoices Extracted: {success_count} | Errors: {error_count}")
 
+@st.dialog("📄 Fullscreen Document Viewer", width="large")
+def view_fullscreen_pdf(file_bytes, file_name):
+    st.markdown(f"### {file_name}")
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    
+    html_content = '<div style="height: 75vh; overflow-y: scroll; border: 1px solid #ddd; padding: 20px; background-color: #525659; text-align: center;">'
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        pix = page.get_pixmap(dpi=150)
+        img_b64 = base64.b64encode(pix.tobytes("jpeg")).decode('utf-8')
+        html_content += f'<img src="data:image/jpeg;base64,{img_b64}" style="width: 95%; max-width: 900px; margin-bottom: 20px; box-shadow: 0px 4px 10px rgba(0,0,0,0.5);"><br>'
+    html_content += '</div>'
+    
+    st.markdown(html_content, unsafe_allow_html=True)
+
 def display_pdf(file_bytes):
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     html_content = '<div style="height: 60vh; overflow-y: scroll; border: 1px solid #ddd; padding: 10px; background-color: #525659; text-align: center;">'
@@ -476,26 +489,30 @@ with tab_extract_view:
     st.header("📄 Document Viewer & Extraction")
     
     if uploaded_files:
-        with st.expander("🔍 View Uploaded Documents", expanded=False):
-            st.write("Review your uploaded documents below.")
-            search_query = st.text_input("🔍 Search by File Name", "").lower()
-            filtered_files = [f for f in uploaded_files if search_query in f.name.lower()]
-            
-            if not filtered_files:
-                st.warning("No files match your search query.")
-            else:
-                cols = st.columns(4)
-                for idx, file in enumerate(filtered_files):
-                    col = cols[idx % 4]
-                    with col:
-                        st.markdown(f"<div style='white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 14px; margin-bottom: 5px;' title='{file.name}'><b>{file.name}</b></div>", unsafe_allow_html=True)
-                        file.seek(0)
-                        doc = fitz.open(stream=file.read(), filetype="pdf")
-                        if len(doc) > 0:
-                            page = doc[0]
-                            pix = page.get_pixmap(dpi=72)
-                            img_b64 = base64.b64encode(pix.tobytes("jpeg")).decode('utf-8')
-                            st.markdown(f'<img src="data:image/jpeg;base64,{img_b64}" style="width: 100%; border: 1px solid #ccc; box-shadow: 2px 2px 5px rgba(0,0,0,0.1); margin-bottom: 10px;">', unsafe_allow_html=True)
+        # REMOVED EXPANDER: The document viewer is now always visible immediately upon upload.
+        st.subheader("🔍 Review Uploaded Documents")
+        search_query = st.text_input("🔍 Search by File Name", "").lower()
+        filtered_files = [f for f in uploaded_files if search_query in f.name.lower()]
+        
+        if not filtered_files:
+            st.warning("No files match your search query.")
+        else:
+            cols = st.columns(4)
+            for idx, file in enumerate(filtered_files):
+                col = cols[idx % 4]
+                with col:
+                    st.markdown(f"<div style='white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 14px; margin-bottom: 5px;' title='{file.name}'><b>{file.name}</b></div>", unsafe_allow_html=True)
+                    file.seek(0)
+                    doc = fitz.open(stream=file.read(), filetype="pdf")
+                    if len(doc) > 0:
+                        page = doc[0]
+                        pix = page.get_pixmap(dpi=72)
+                        img_b64 = base64.b64encode(pix.tobytes("jpeg")).decode('utf-8')
+                        st.markdown(f'<img src="data:image/jpeg;base64,{img_b64}" style="width: 100%; border: 1px solid #ccc; box-shadow: 2px 2px 5px rgba(0,0,0,0.1); margin-bottom: 10px;">', unsafe_allow_html=True)
+                    
+                    file.seek(0)
+                    if st.button("🔍 View Full Screen", key=f"view_{idx}", use_container_width=True):
+                        view_fullscreen_pdf(file.read(), file.name)
         
         st.divider()
 
@@ -553,16 +570,25 @@ with tab_batch_qa:
     if batch_df.empty:
         st.info("Process a batch of invoices to view current metrics.")
     else:
-        # Failsafe: Ensure new columns exist to prevent KeyError
+        # Failsafe for new columns
         if 'row_warnings' not in batch_df.columns:
             batch_df['row_warnings'] = 'N/A'
         if 'hallucination_alert' not in batch_df.columns:
             batch_df['hallucination_alert'] = False
 
+        batch_missing_flags = ['N/A', 'None', '', 'null', 'None']
+        
+        # Calculate KPI metrics
         batch_invoices = len(batch_df)
         batch_vendors = batch_df['vendor_name'].nunique()
         batch_spend_k = batch_df['extracted_total'].sum() / 1000.0
         
+        passed_invoices = len(batch_df[batch_df['status'] == 'PASS'])
+        pass_rate = (passed_invoices / batch_invoices * 100) if batch_invoices > 0 else 0.0
+        
+        math_issues_count = len(batch_df[batch_df['variance'] != 0.0])
+        routing_issues_count = len(batch_df[batch_df['origin'].isin(batch_missing_flags) | batch_df['origin'].isna() | batch_df['destination'].isin(batch_missing_flags) | batch_df['destination'].isna()])
+
         valid_df = batch_df[~batch_df['invoice_number'].isin(['N/A', 'ERROR', '', None]) & ~batch_df['vendor_name'].isin(['N/A', 'ERROR'])]
         duplicates_in_batch = valid_df[valid_df.duplicated(subset=['vendor_name', 'invoice_number'], keep=False)]
         batch_dup_count = len(duplicates_in_batch)
@@ -570,59 +596,25 @@ with tab_batch_qa:
         total_time_sec = batch_df['processing_time'].sum() if 'processing_time' in batch_df.columns else 0.0
         mins, secs = divmod(int(total_time_sec), 60)
         
-        bc1, bc2, bc3, bc4, bc5 = st.columns(5)
-        bc1.metric("Current Invoices Processed", f"{batch_invoices:,}")
-        bc2.metric("Total Unique Vendors", f"{batch_vendors:,}")
-        bc3.metric("Total Spend", f"${batch_spend_k:,.1f}K")
-        bc4.metric("Batch Duplicates Found", f"{batch_dup_count:,}", delta_color="inverse")
-        bc5.metric("Batch Execution Time", f"{mins}m {secs}s")
+        # Display KPIs in two rows
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Current Invoices", f"{batch_invoices:,}")
+        m2.metric("Straight-Through Processing", f"{pass_rate:.1f}%")
+        m3.metric("Total Spend", f"${batch_spend_k:,.1f}K")
+        m4.metric("Execution Time", f"{mins}m {secs}s")
+
+        m5, m6, m7, m8 = st.columns(4)
+        m5.metric("Unique Vendors", f"{batch_vendors:,}")
+        m6.metric("Duplicates Found", f"{batch_dup_count:,}", delta_color="inverse")
+        m7.metric("Math Variances", f"{math_issues_count:,}", delta_color="inverse" if math_issues_count > 0 else "normal")
+        m8.metric("Routing Exceptions", f"{routing_issues_count:,}", delta_color="inverse" if routing_issues_count > 0 else "normal")
 
         if batch_dup_count > 0:
             st.warning("⚠️ Duplicate Invoice Numbers detected within this current batch:")
             st.dataframe(duplicates_in_batch[['file_name', 'vendor_name', 'invoice_number', 'extracted_total']], use_container_width=True, hide_index=True)
 
         st.divider()
-
-        # --- Side-by-Side Audit Mode ---
-        st.subheader("🕵️ Side-by-Side Exception Audit Mode")
-        st.write("Review flagged files side-by-side with the original document.")
         
-        files_with_issues = batch_df[(batch_df['status'] != 'PASS') | (batch_df['row_warnings'] != 'N/A')]['file_name'].unique()
-        
-        if len(files_with_issues) > 0:
-            selected_audit_file = st.selectbox("Select a flagged file to audit:", files_with_issues)
-            
-            if selected_audit_file and selected_audit_file in st.session_state.uploaded_files_cache:
-                audit_row = batch_df[batch_df['file_name'] == selected_audit_file].iloc[0]
-                
-                col_pdf, col_data = st.columns([1.2, 1])
-                with col_pdf:
-                    st.markdown("**Original Document**")
-                    display_pdf(st.session_state.uploaded_files_cache[selected_audit_file])
-                
-                with col_data:
-                    st.markdown("**Extraction Status**")
-                    if audit_row['status'] == 'PASS':
-                        st.success("Overall Status: PASS")
-                    else:
-                        st.error(f"Overall Status: FAIL\n\nReasons: {audit_row['reason_for_review']}")
-                    
-                    if audit_row.get('hallucination_alert', False):
-                        st.error("🚨 HALLUCINATION WARNING: The extracted invoice number does not exist in the raw PDF text.")
-                    if audit_row.get('row_warnings', 'N/A') != 'N/A':
-                        st.warning(f"⚠️ Row Math Warning: {audit_row['row_warnings']}")
-                        
-                    st.markdown("**Key Extracted Data**")
-                    st.text_input("Vendor", value=audit_row['vendor_name'], disabled=True)
-                    st.text_input("Invoice Number", value=audit_row['invoice_number'], disabled=True)
-                    st.text_input("Origin", value=audit_row['origin'], disabled=True)
-                    st.text_input("Destination", value=audit_row['destination'], disabled=True)
-                    st.text_input("Total Amount", value=f"${audit_row['extracted_total']}", disabled=True)
-        else:
-            st.success("No files require manual auditing!")
-
-        st.divider()
-
         # --- Cell-Level Heatmapping ---
         st.subheader("📄 Status Overview (Heatmap)")
         st.write("Cells highlighted in **Red** indicate a severe hallucination. **Yellow** indicates an optional math warning. **Green/Red** text shows overall status.")
@@ -649,11 +641,9 @@ with tab_batch_qa:
 
         st.divider()
 
-        # --- Restored: Batch Vendor Routing & Exception Breakdown ---
+        # --- Batch Vendor Routing & Exception Breakdown ---
         st.subheader("🔎 Batch Vendor Routing & Exception Breakdown")
         st.write("Filter to see a detailed routing scorecard and math error count by vendor for the **current batch**.")
-        
-        batch_missing_flags = ['N/A', 'None', '', 'null', 'None']
         
         b_vendor_df = batch_df[~batch_df['vendor_name'].isin(['N/A', 'ERROR'])].copy()
         b_vendor_df['missing_origin'] = b_vendor_df['origin'].isin(batch_missing_flags) | b_vendor_df['origin'].isna()
@@ -755,3 +745,46 @@ with tab_batch_qa:
                 st.rerun()
         else:
             st.info("No missing routing addresses found in the current batch!")
+
+        st.divider()
+
+        # --- Side-by-Side Audit Mode (Moved to bottom) ---
+        with st.expander("🕵️ Side-by-Side Exception Audit Mode", expanded=False):
+            st.write("Review flagged files side-by-side with the original document.")
+            
+            files_with_issues = batch_df[(batch_df['status'] != 'PASS') | (batch_df['row_warnings'] != 'N/A')]['file_name'].unique()
+            
+            if len(files_with_issues) > 0:
+                selected_audit_file = st.selectbox("Select a flagged file to audit:", files_with_issues)
+                
+                if selected_audit_file and selected_audit_file in st.session_state.uploaded_files_cache:
+                    audit_row = batch_df[batch_df['file_name'] == selected_audit_file].iloc[0]
+                    
+                    # Full Row Warnings on Top
+                    if audit_row['status'] == 'PASS':
+                        st.success(f"Overall Status: PASS for {selected_audit_file}")
+                    else:
+                        st.error(f"Overall Status: FAIL | Reasons: {audit_row['reason_for_review']}")
+                    
+                    if audit_row.get('hallucination_alert', False):
+                        st.error("🚨 HALLUCINATION WARNING: The extracted invoice number does not exist in the raw PDF text.")
+                    if audit_row.get('row_warnings', 'N/A') != 'N/A':
+                        st.warning(f"⚠️ Row Math Warning: {audit_row['row_warnings']}")
+                    
+                    st.write("") # Spacer
+
+                    # Two Columns for Document and Extracted Data
+                    col_pdf, col_data = st.columns([1.5, 1])
+                    with col_pdf:
+                        st.markdown("**Original Document**")
+                        display_pdf(st.session_state.uploaded_files_cache[selected_audit_file])
+                    
+                    with col_data:
+                        st.markdown("**Key Extracted Data**")
+                        st.text_input("Vendor", value=audit_row['vendor_name'], disabled=True)
+                        st.text_input("Invoice Number", value=audit_row['invoice_number'], disabled=True)
+                        st.text_input("Origin", value=audit_row['origin'], disabled=True)
+                        st.text_input("Destination", value=audit_row['destination'], disabled=True)
+                        st.text_input("Total Amount", value=f"${audit_row['extracted_total']}", disabled=True)
+            else:
+                st.success("No files require manual auditing!")
