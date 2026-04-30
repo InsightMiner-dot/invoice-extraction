@@ -10,8 +10,15 @@
             <h4 style="margin-top: 0; color: #2980b9;">⚙️ Step 1: Configuration, Aliases & Custom Fields</h4>
             
             <div style="display: flex; gap: 20px; margin-top: 15px;">
-                <div><label><strong>Max Pages per PDF:</strong></label><br><input type="number" id="configMaxPages" value="15" min="1" max="100" style="padding: 5px; width: 80px;"></div>
-                <div><label><strong>Resolution (DPI):</strong></label><br><input type="number" id="configDPI" value="300" min="72" max="600" step="72" style="padding: 5px; width: 80px;"></div>
+                <div>
+                    <label><strong>Max Pages per PDF:</strong></label><br>
+                    <input type="number" id="configMaxPages" value="15" min="1" max="100" style="padding: 5px; width: 80px;">
+                </div>
+                <div>
+                    <label><strong>Resolution (DPI):</strong></label><br>
+                    <!-- FIXED: Removed step="72" to allow 300 (or any custom integer) to pass validation -->
+                    <input type="number" id="configDPI" value="300" min="72" max="600" step="1" style="padding: 5px; width: 80px;">
+                </div>
             </div>
 
             <hr style="border: 0; border-top: 1px solid #ccc; margin: 15px 0;">
@@ -37,7 +44,7 @@
             </div>
         </div>
 
-        <!-- STEP 2: UPLOAD FILES (OUTSIDE VIEWER) -->
+        <!-- STEP 2: UPLOAD FILES -->
         <div style="margin-bottom: 20px; padding: 15px; border: 2px dashed #3498db; border-radius: 8px; background-color: #fafdff;">
             <label style="font-weight: bold; font-size: 1.1rem; color: #2c3e50; display: block; margin-bottom: 10px;">📂 Step 2: Upload Invoice PDFs</label>
             <input type="file" id="pdfFiles" name="files" multiple accept="application/pdf" required style="width: 100%; cursor: pointer;">
