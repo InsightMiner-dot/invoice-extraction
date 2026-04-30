@@ -30,6 +30,7 @@ DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str, max_pages: int, dpi: int, aliases: dict, custom_fields: dict):
     start_time = time.time()
     
+    # 1. PDF to Image
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     base64_images = []
     total_pages = len(doc)
@@ -39,7 +40,7 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
         base64_images.append(base64.b64encode(pix.tobytes("jpeg")).decode('utf-8'))
     doc.close()
 
-    # Apply Settings Logic to Prompt
+    # 2. Build Prompt with User Settings
     sys_prompt = "Extract invoice data row by row. Start a new invoice record if invoice numbers change."
     
     if aliases:
@@ -62,6 +63,7 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
     except Exception as e:
         return {"error": str(e), "filename": filename}
 
+    # 3. Validation & Math Checks
     file_proc_time = round(time.time() - start_time, 2)
     master_df = load_master_suppliers()
     master_list = master_df['Original_Supplier_Name'].tolist() if not master_df.empty else []
@@ -89,13 +91,15 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
 
         reasons = []
         if variance != 0.0: reasons.append(f"Math Variance of {variance}")
+        if inv.invoice_number and re.sub(r'\s+', '', inv.invoice_number).lower() not in clean_raw_text:
+            reasons.append("HALLUCINATION: Inv # not in doc")
+        
         needs_review = len(reasons) > 0
         status = "FAIL - NEEDS REVIEW" if needs_review else "PASS"
         
-        # Serialize custom fields for DB storage
         custom_json = json.dumps(inv.custom_fields) if inv.custom_fields else "{}"
 
-        # Insert to DB (34 Columns now)
+        # Insert to DB
         insert_audit_record((
             current_date, current_time, filename, raw_vendor, orig_supp, inv.vendor_address, inv.bill_to, inv.remit_to, inv.invoice_number, inv.date, inv.currency, 
             str(inv.origin), None, None, str(inv.destination), None, None, inv.subtotal, inv.shipping_handling or 0.0, inv.total_amount, total_calc, variance, 
@@ -108,7 +112,6 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
             "Variance": f"${variance:,.2f}", "Status": "✅ PASS" if status == "PASS" else "⚠️ FAIL", "Proc Time": f"{file_proc_time}s"
         })
         
-        # Pass custom fields back to UI
         custom_cols = list(custom_fields.keys())
         for item in inv.line_items:
             row_data = {
@@ -117,15 +120,15 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
                 "Description": item.description, "Qty": item.quantity, "UOM": item.uom, "Price": item.unit_price, 
                 "Line Total": item.line_total, "Origin": inv.origin, "Dest": inv.destination
             }
-            # Add custom data to frontend payload
             for col in custom_cols:
                 row_data[col] = inv.custom_fields.get(col, "Not Found") if inv.custom_fields else "Not Found"
-            
             detail_results.append(row_data)
 
     return {"summary": summary_results, "details": detail_results}
 
+
 def generate_excel_from_db(batch_id: str, custom_cols: list):
+    """Generates a 2-sheet Excel file based on a specific Batch ID"""
     os.makedirs(AUDIT_FOLDER, exist_ok=True)
     excel_path = os.path.join(AUDIT_FOLDER, f"{batch_id}.xlsx")
     
@@ -137,12 +140,11 @@ def generate_excel_from_db(batch_id: str, custom_cols: list):
 
     wb = openpyxl.Workbook()
     
-    # Sheet 1: Details (Dynamic Headers)
+    # Sheet 1: Details (Dynamic Headers based on Custom Fields)
     ws_details = wb.active
     ws_details.title = "Invoice Details"
     details_headers = ["file_name", "page_count", "vendor_name", "original_supplier_name", "invoice_number", "extracted_total", "status", "reason_for_review"]
     
-    # Append Custom Columns to headers
     excel_headers = details_headers.copy()
     if custom_cols: excel_headers.extend(custom_cols)
     ws_details.append(excel_headers)
@@ -150,7 +152,6 @@ def generate_excel_from_db(batch_id: str, custom_cols: list):
     for _, row in df.iterrows():
         base_row = [row[h] for h in details_headers if h in df.columns]
         
-        # Parse JSON and append custom field values
         cf_data = {}
         if 'custom_fields' in df.columns and pd.notna(row['custom_fields']):
             try: cf_data = json.loads(row['custom_fields'])
