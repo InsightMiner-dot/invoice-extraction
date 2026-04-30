@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+    <h2>🇶🇦 Current Batch QA</h2>
+    <p>Review the quality metrics and variances for recently processed files.</p>
+    <table>
+        <thead>
+            <tr><th>File</th><th>Invoice #</th><th>Vendor</th><th>Math Variance</th><th>Status</th></tr>
+        </thead>
+        <tbody id="qaTableBody">
+            <!-- Populated via main.js -->
+        </tbody>
+    </table>
+</div>
+{% endblock %}
