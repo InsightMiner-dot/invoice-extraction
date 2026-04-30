@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+    <h2>📄 Local Document Viewer</h2>
+    <p>Select a PDF from your computer to inspect it natively in the browser without uploading it to the server.</p>
+    
+    <input type="file" id="localPdfFile" accept="application/pdf" style="margin-bottom: 20px;">
+    
+    <div id="pdfContainer" style="width: 100%; height: 75vh; border: 1px solid #ccc; border-radius: 8px; display: none; background-color: #525659;">
+        <!-- Native HTML5 PDF Viewer Object -->
+        <object id="pdfViewer" data="" type="application/pdf" width="100%" height="100%">
+            <p>Your browser does not support PDFs. <a id="pdfFallbackLink" href="">Download the PDF</a>.</p>
+        </object>
+    </div>
+</div>
+
+<script>
+    document.getElementById('localPdfFile').addEventListener('change', function(event) {
+        const file = event.target.files[0];
+        if (file && file.type === "application/pdf") {
+            const fileURL = URL.createObjectURL(file);
+            document.getElementById('pdfViewer').data = fileURL;
+            document.getElementById('pdfFallbackLink').href = fileURL;
+            document.getElementById('pdfContainer').style.display = 'block';
+        } else {
+            alert("Please select a valid PDF file.");
+        }
+    });
+</script>
+{% endblock %}
