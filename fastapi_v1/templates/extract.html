@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+    <h2>🚀 Batch Extraction Suite</h2>
+    <p>Upload mixed batch invoices here. Auto-mapping and Math QC will run concurrently.</p>
+    
+    <form id="uploadForm">
+        <input type="file" id="pdfFiles" name="files" multiple accept="application/pdf" required style="margin-bottom: 15px; display: block;">
+        <button type="submit" class="primary" id="extractBtn">Start Extraction</button>
+    </form>
+    
+    <div id="loader" class="loader">⏳ Processing documents via Azure OpenAI... Please wait.</div>
+</div>
+
+<div class="card" id="resultsCard" style="display: none;">
+    <h3>Extraction Results</h3>
+    <table id="resultsTable">
+        <thead>
+            <tr><th>File Name</th><th>Standardized Vendor</th><th>QC Status</th></tr>
+        </thead>
+        <tbody></tbody>
+    </table>
+</div>
+{% endblock %}
