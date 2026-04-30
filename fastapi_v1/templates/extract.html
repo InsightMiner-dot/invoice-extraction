@@ -5,66 +5,55 @@
     
     <form id="uploadForm">
         
-        <!-- 1. CHOOSE FILES (OUTSIDE EXPANDERS) -->
+        <!-- STEP 1: UPLOAD -->
         <div style="margin-bottom: 20px; padding: 15px; border: 2px dashed #3498db; border-radius: 8px; background-color: #fafdff;">
             <label style="font-weight: bold; font-size: 1.1rem; color: #2c3e50; display: block; margin-bottom: 10px;">📂 Step 1: Upload Invoice PDFs</label>
             <input type="file" id="pdfFiles" name="files" multiple accept="application/pdf" required style="width: 100%; cursor: pointer;">
         </div>
         
-        <!-- 2. DOCUMENT VIEWER (EXPANDER) -->
+        <!-- STEP 2: VIEWER GRID (EXPANDER) -->
         <details style="margin-bottom: 15px; padding: 15px; border: 1px solid #ddd; border-radius: 5px; background: #fafafa;">
             <summary style="font-weight: bold; cursor: pointer; color: var(--primary);">🔍 Step 2: View Uploaded Documents (Optional)</summary>
             <div style="margin-top: 15px;">
-                <p style="font-size: 0.85rem; color: #666;">Click any document below to open it in full screen.</p>
                 <input type="text" id="gridSearch" class="search-bar" placeholder="Search files by name..." style="display: none;">
                 <div id="pdfGrid" class="pdf-grid"></div>
                 <p id="noFilesMsg" style="color: #999; font-style: italic;">No files uploaded yet.</p>
             </div>
         </details>
 
-        <!-- 3. CONFIGURATION & SETTINGS (EXPANDER) -->
+        <!-- STEP 3: SETTINGS (EXPANDER) -->
         <details style="margin-bottom: 25px; padding: 15px; border: 1px solid #3498db; border-radius: 5px; background: #eaf2f8;">
             <summary style="font-weight: bold; cursor: pointer; color: #2980b9;">⚙️ Step 3: Configuration, Aliases & Custom Fields</summary>
             
             <div style="display: flex; gap: 20px; margin-top: 15px;">
-                <div>
-                    <label><strong>Max Pages per PDF:</strong></label><br>
-                    <input type="number" id="configMaxPages" value="15" min="1" max="100" style="padding: 5px; width: 80px;">
-                </div>
-                <div>
-                    <label><strong>Render Resolution (DPI):</strong></label><br>
-                    <input type="number" id="configDPI" value="300" min="72" max="600" step="72" style="padding: 5px; width: 80px;">
-                </div>
+                <div><label><strong>Max Pages per PDF:</strong></label><br><input type="number" id="configMaxPages" value="15" min="1" max="100" style="padding: 5px; width: 80px;"></div>
+                <div><label><strong>Resolution (DPI):</strong></label><br><input type="number" id="configDPI" value="300" min="72" max="600" step="72" style="padding: 5px; width: 80px;"></div>
             </div>
 
             <hr style="border: 0; border-top: 1px solid #ccc; margin: 15px 0;">
             
             <div style="display: flex; gap: 20px;">
-                <!-- ALIASES -->
                 <div style="flex: 1;">
                     <strong>Standard Field Aliases</strong>
-                    <p style="font-size: 0.8rem; color: #666;">Help the AI find built-in fields (e.g. invoice_number: "Bill No").</p>
                     <table id="aliasTable" style="width: 100%; font-size: 0.85rem; margin-bottom: 5px;">
                         <thead><tr><th>Standard Field</th><th>Aliases (Comma separated)</th><th></th></tr></thead>
                         <tbody></tbody>
                     </table>
-                    <button type="button" onclick="addRow('aliasTable')" style="font-size: 0.8rem; padding: 3px 8px;">+ Add Alias</button>
+                    <button type="button" onclick="addRow('aliasTable')" style="font-size: 0.8rem;">+ Add Alias</button>
                 </div>
                 
-                <!-- CUSTOM FIELDS -->
                 <div style="flex: 1;">
                     <strong>New Custom Fields</strong>
-                    <p style="font-size: 0.8rem; color: #666;">Extract entirely new columns to append to your Excel.</p>
                     <table id="customTable" style="width: 100%; font-size: 0.85rem; margin-bottom: 5px;">
                         <thead><tr><th>New Field Name</th><th>Description / Instructions</th><th></th></tr></thead>
                         <tbody></tbody>
                     </table>
-                    <button type="button" onclick="addRow('customTable')" style="font-size: 0.8rem; padding: 3px 8px;">+ Add Custom Field</button>
+                    <button type="button" onclick="addRow('customTable')" style="font-size: 0.8rem;">+ Add Custom Field</button>
                 </div>
             </div>
         </details>
 
-        <!-- 4. SUBMIT BUTTON -->
+        <!-- STEP 4: SUBMIT -->
         <button type="submit" class="primary" id="extractBtn" style="width: 100%; font-size: 1.2rem; padding: 15px;">🚀 Step 4: Start Extraction</button>
     </form>
     
@@ -86,36 +75,28 @@
         </a>
     </div>
 
-    <!-- FULL LINE ITEM DETAILS TABLE -->
     <div class="card">
         <h3>📝 Line Item Details (Fully Scrollable)</h3>
         <div class="table-wrapper">
             <table id="detailsTable" style="white-space: nowrap; font-size: 0.85rem;">
-                <thead>
-                    <tr id="detailsHeaderRow">
-                        <!-- Populated dynamically by JS -->
-                    </tr>
-                </thead>
+                <thead><tr id="detailsHeaderRow"></tr></thead>
                 <tbody></tbody>
             </table>
         </div>
     </div>
 
-    <!-- QC SUMMARY TABLE -->
     <div class="card">
         <h3>🛡️ QC Summary</h3>
         <div class="table-wrapper">
             <table id="summaryTable" style="white-space: nowrap; font-size: 0.9rem;">
-                <thead>
-                    <tr><th>File Name</th><th>Vendor Name</th><th>Invoice #</th><th>Variance</th><th>Proc Time</th><th>Status</th></tr>
-                </thead>
+                <thead><tr><th>File Name</th><th>Vendor Name</th><th>Invoice #</th><th>Variance</th><th>Proc Time</th><th>Status</th></tr></thead>
                 <tbody></tbody>
             </table>
         </div>
     </div>
 </div>
 
-<!-- FULLSCREEN PDF MODAL -->
+<!-- FULLSCREEN MODAL -->
 <div id="pdfModal" class="modal-overlay">
     <div class="modal-content">
         <button id="closeModal" class="modal-close">&times;</button>
