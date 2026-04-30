@@ -3,7 +3,7 @@
 <div class="card">
     <h2>🚀 Batch Extraction Suite</h2>
     
-    <form id="uploadForm">
+    <form id="uploadForm" novalidate>
         
         <!-- STEP 1: CONFIGURATION -->
         <div style="margin-bottom: 20px; padding: 15px; border: 1px solid #3498db; border-radius: 5px; background: #eaf2f8;">
@@ -12,12 +12,13 @@
             <div style="display: flex; gap: 20px; margin-top: 15px;">
                 <div>
                     <label><strong>Max Pages per PDF:</strong></label><br>
-                    <input type="number" id="configMaxPages" value="15" min="1" max="100" style="padding: 5px; width: 80px;">
+                    <!-- FIXED: Removed min/max/step strict browser validation -->
+                    <input type="number" id="configMaxPages" value="15" style="padding: 5px; width: 80px;">
                 </div>
                 <div>
                     <label><strong>Resolution (DPI):</strong></label><br>
-                    <!-- FIXED: Removed step="72" to allow 300 (or any custom integer) to pass validation -->
-                    <input type="number" id="configDPI" value="300" min="72" max="600" step="1" style="padding: 5px; width: 80px;">
+                    <!-- FIXED: Removed min/max/step strict browser validation -->
+                    <input type="number" id="configDPI" value="300" style="padding: 5px; width: 80px;">
                 </div>
             </div>
 
@@ -47,7 +48,7 @@
         <!-- STEP 2: UPLOAD FILES -->
         <div style="margin-bottom: 20px; padding: 15px; border: 2px dashed #3498db; border-radius: 8px; background-color: #fafdff;">
             <label style="font-weight: bold; font-size: 1.1rem; color: #2c3e50; display: block; margin-bottom: 10px;">📂 Step 2: Upload Invoice PDFs</label>
-            <input type="file" id="pdfFiles" name="files" multiple accept="application/pdf" required style="width: 100%; cursor: pointer;">
+            <input type="file" id="pdfFiles" name="files" multiple accept="application/pdf" style="width: 100%; cursor: pointer;">
         </div>
         
         <!-- STEP 3: VIEWER GRID (EXPANDER) -->
@@ -61,20 +62,18 @@
         </details>
 
         <!-- STEP 4: START BUTTON -->
-        <button type="submit" class="primary" id="extractBtn" style="width: 100%; font-size: 1.2rem; padding: 15px;">🚀 Step 4: Start Extraction</button>
+        <button type="button" class="primary" id="extractBtn" style="width: 100%; font-size: 1.2rem; padding: 15px;">🚀 Step 4: Start Extraction</button>
     </form>
     
     <!-- PROGRESS BAR & FINAL STATS -->
-    <div id="progressContainer" class="progress-container">
+    <div id="progressContainer" class="progress-container" style="display: none;">
         <div class="progress-bar"><div id="progressFill" class="progress-fill"></div></div>
         <div class="progress-text">
             <span id="progressStats" style="color: var(--accent);">Initializing...</span>
             <span id="progressTimer">Time: 0s</span>
         </div>
-        <!-- This div will populate when processing finishes -->
-        <div id="finalRunStats" style="display: none; background: #eaf2f8; padding: 15px; border-radius: 5px; margin-top: 15px; font-weight: bold; font-size: 1.1rem; color: #2c3e50; border-left: 5px solid #3498db;">
-            <!-- Stats injected by JS -->
-        </div>
+        <!-- Stats injected by JS -->
+        <div id="finalRunStats" style="display: none; background: #eaf2f8; padding: 15px; border-radius: 5px; margin-top: 15px; font-weight: bold; font-size: 1.1rem; color: #2c3e50; border-left: 5px solid #3498db;"></div>
     </div>
 </div>
 
