@@ -1,17 +1,14 @@
 from fastapi import FastAPI, Request, UploadFile, File, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from typing import List
 import os
-import io
-import sqlite3
-import pandas as pd
 from dotenv import load_dotenv
 
-from core.database import init_db, fetch_audit_data, DB_PATH
+from core.database import init_db, fetch_audit_data
 from services.extraction import process_batch_concurrently
 
 load_dotenv(override=True)
@@ -26,8 +23,11 @@ app = FastAPI(
 
 allowed_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:8000").split(",")
 app.add_middleware(
-    CORSMiddleware, allow_origins=allowed_origins, allow_credentials=True,
-    allow_methods=["GET", "POST"], allow_headers=["*"],
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST"], 
+    allow_headers=["*"],
 )
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -37,7 +37,9 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["X-XSS-Protection"] = "1; mode=block"
+        # Adjusted CSP to allow blob: for the local PDF viewer
         response.headers["Content-Security-Policy"] = "default-src 'self' blob:; script-src 'self' 'unsafe-inline' https://cdn.plot.ly; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:;"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         return response
 
 app.add_middleware(SecurityHeadersMiddleware)
@@ -50,14 +52,9 @@ templates = Jinja2Templates(directory="templates")
 def startup_event():
     init_db()
 
-# --- Page Routes ---
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
     return templates.TemplateResponse(request=request, name="extract.html")
-
-@app.get("/viewer", response_class=HTMLResponse)
-async def viewer(request: Request):
-    return templates.TemplateResponse(request=request, name="viewer.html")
 
 @app.get("/analytics", response_class=HTMLResponse)
 async def analytics(request: Request):
@@ -67,11 +64,6 @@ async def analytics(request: Request):
 async def batch_qa(request: Request):
     return templates.TemplateResponse(request=request, name="batch_qa.html")
 
-@app.get("/chat", response_class=HTMLResponse)
-async def chat(request: Request):
-    return templates.TemplateResponse(request=request, name="chat.html")
-
-# --- API Routes ---
 @app.post("/api/extract")
 async def extract_api(files: List[UploadFile] = File(...)):
     try:
@@ -87,21 +79,17 @@ async def audit_data_api():
     df = fetch_audit_data()
     return JSONResponse(content=df.to_dict(orient="records"))
 
+# NEW ENDPOINT: Download the generated Excel file
 @app.get("/api/download-excel/{batch_id}")
 async def download_excel(batch_id: str):
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        df = pd.read_sql_query(f"SELECT * FROM qc_audit WHERE batch_id='{batch_id}'", conn)
-        conn.close()
-        
-        buffer = io.BytesIO()
-        df.to_excel(buffer, index=False, engine='openpyxl')
-        buffer.seek(0)
-        
-        headers = {'Content-Disposition': f'attachment; filename="Invoice_Batch_{batch_id}.xlsx"'}
-        return StreamingResponse(buffer, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers=headers)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    file_path = os.path.join("audit", f"{batch_id}.xlsx")
+    if os.path.exists(file_path):
+        return FileResponse(
+            path=file_path, 
+            filename=f"Invoice_Extraction_{batch_id}.xlsx", 
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    raise HTTPException(status_code=404, detail="Excel file not found")
 
 if __name__ == "__main__":
     import uvicorn
