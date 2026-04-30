@@ -30,7 +30,6 @@ DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str, max_pages: int, dpi: int, aliases: dict, custom_fields: dict):
     start_time = time.time()
     
-    # 1. Read PDF
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     base64_images = []
     total_pages = len(doc)
@@ -40,13 +39,10 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
         base64_images.append(base64.b64encode(pix.tobytes("jpeg")).decode('utf-8'))
     doc.close()
 
-    # 2. Build Prompt
     sys_prompt = "Extract invoice data row by row. Start a new invoice record if invoice numbers change."
-    
     if aliases:
         alias_str = "\n".join([f"- {k}: Also look for '{v}'" for k, v in aliases.items()])
         sys_prompt += f"\n\nSTANDARD FIELD ALIASES:\n{alias_str}"
-        
     if custom_fields:
         rules_str = "\n".join([f"- Field Key: '{k}' | Definition & Aliases: {v}" for k, v in custom_fields.items()])
         sys_prompt += f"\n\nSTRICT CUSTOM RULES:\n{rules_str}"
@@ -63,7 +59,6 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
     except Exception as e:
         return {"error": str(e), "filename": filename}
 
-    # 3. Clean & Save
     file_proc_time = round(time.time() - start_time, 2)
     master_df = load_master_suppliers()
     master_list = master_df['Original_Supplier_Name'].tolist() if not master_df.empty else []
@@ -98,15 +93,24 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
         status = "FAIL - NEEDS REVIEW" if needs_review else "PASS"
         
         custom_json = json.dumps(inv.custom_fields) if inv.custom_fields else "{}"
+        
+        # Serialize line items for the database so Excel can use them
+        line_items_list = []
+        for item in inv.line_items:
+            line_items_list.append({
+                "page_number": item.page_number, "material": item.material, "description": item.description,
+                "quantity": item.quantity, "uom": item.uom, "uom_confidence": item.uom_confidence,
+                "unit_price": item.unit_price, "line_total": item.line_total
+            })
+        line_items_json = json.dumps(line_items_list)
 
         insert_audit_record((
             current_date, current_time, filename, raw_vendor, orig_supp, inv.vendor_address, inv.bill_to, inv.remit_to, inv.invoice_number, inv.date, inv.currency, 
             str(inv.origin), None, None, str(inv.destination), None, None, inv.subtotal, inv.shipping_handling or 0.0, inv.total_amount, total_calc, variance, 
             inv.invoice_number_confidence, inv.origin_confidence, inv.destination_confidence, inv.total_amount_confidence, "N/A", status, " | ".join(reasons) if needs_review else "N/A", 
-            file_proc_time, total_pages, batch_id, custom_json
+            file_proc_time, total_pages, batch_id, custom_json, line_items_json
         ))
 
-        # IMPORTANT: Added "Total Pages" to summary so frontend can calculate stats
         summary_results.append({
             "File Name": filename, "Vendor Name": raw_vendor, "Invoice #": inv.invoice_number,
             "Variance": f"${variance:,.2f}", "Status": "✅ PASS" if status == "PASS" else "⚠️ FAIL", 
@@ -119,7 +123,9 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
                 "File Name": filename, "Page #": item.page_number, "Vendor Name": raw_vendor, 
                 "Original Supplier": orig_supp, "Invoice Number": inv.invoice_number, "Material": item.material,
                 "Description": item.description, "Qty": item.quantity, "UOM": item.uom, "Price": item.unit_price, 
-                "Line Total": item.line_total, "Origin": inv.origin, "Dest": inv.destination
+                "Line Total": item.line_total, "Origin": inv.origin, "Dest": inv.destination,
+                "Inv# Conf": inv.invoice_number_confidence, "Total Conf": inv.total_amount_confidence, 
+                "Proc Time": f"{file_proc_time}s", "Status": status, "Variance": variance
             }
             for col in custom_cols:
                 row_data[col] = inv.custom_fields.get(col, "Not Found") if inv.custom_fields else "Not Found"
@@ -140,28 +146,58 @@ def generate_excel_from_db(batch_id: str, custom_cols: list):
 
     wb = openpyxl.Workbook()
     
+    # ---------------------------------------------
+    # SHEET 1: LINE ITEMS (EXPLODED)
+    # ---------------------------------------------
     ws_details = wb.active
     ws_details.title = "Invoice Details"
-    details_headers = ["file_name", "page_count", "vendor_name", "original_supplier_name", "invoice_number", "extracted_total", "status", "reason_for_review"]
     
+    details_headers = [
+        "File Name", "Page #", "Vendor Name", "Original Supplier Name", "Invoice Number", "Date", "Currency",
+        "Material", "Description", "Quantity", "UOM", "Unit Price", "Line Total",
+        "Subtotal", "Invoice Total", "Variance", "Inv# Conf", "Total Conf", "UOM Conf",
+        "Proc Time", "Status", "Reason for Review"
+    ]
     excel_headers = details_headers.copy()
     if custom_cols: excel_headers.extend(custom_cols)
     ws_details.append(excel_headers)
     
     for _, row in df.iterrows():
-        base_row = [row[h] for h in details_headers if h in df.columns]
+        # Get custom field data
         cf_data = {}
         if 'custom_fields' in df.columns and pd.notna(row['custom_fields']):
             try: cf_data = json.loads(row['custom_fields'])
             except: pass
             
-        for col in custom_cols:
-            base_row.append(cf_data.get(col, "Not Found"))
-            
-        ws_details.append(base_row)
+        # Extract and loop through line items json
+        if 'line_items' in df.columns and pd.notna(row['line_items']):
+            try:
+                line_items = json.loads(row['line_items'])
+                if not line_items:
+                    line_items = [{}] # Create dummy row if empty
+            except:
+                line_items = [{}]
+        else:
+            line_items = [{}]
 
+        for item in line_items:
+            base_row = [
+                row['file_name'], item.get('page_number', ''), row['vendor_name'], row['original_supplier_name'],
+                row['invoice_number'], row['invoice_date'], row['currency'],
+                item.get('material', ''), item.get('description', 'NO ITEMS FOUND'), item.get('quantity', ''),
+                item.get('uom', ''), item.get('unit_price', ''), item.get('line_total', ''),
+                row['subtotal'], row['extracted_total'], row['variance'], row['invoice_number_conf'], 
+                row['total_amount_conf'], item.get('uom_confidence', ''),
+                row['processing_time'], row['status'], row['reason_for_review']
+            ]
+            for col in custom_cols: base_row.append(cf_data.get(col, "Not Found"))
+            ws_details.append(base_row)
+
+    # ---------------------------------------------
+    # SHEET 2: QC SUMMARY
+    # ---------------------------------------------
     ws_qc = wb.create_sheet(title="QC Summary")
-    qc_headers = ["file_name", "vendor_name", "invoice_number", "origin", "destination", "status", "extracted_total", "variance"]
+    qc_headers = ["file_name", "vendor_name", "invoice_number", "origin", "destination", "status", "extracted_total", "variance", "processing_time", "reason_for_review"]
     ws_qc.append(qc_headers)
     for _, row in df.iterrows():
         ws_qc.append([row[h] for h in qc_headers if h in df.columns])
