@@ -1,20 +1,54 @@
-// Global API Fetcher
 async function fetchAPI(endpoint, options = {}) {
     const response = await fetch(endpoint, options);
     if (!response.ok) throw new Error(`API Error: ${response.status}`);
     return await response.json();
 }
 
-// 1. Extraction UI Logic
+// 1. Extraction UI & Document Viewer Logic
 const uploadForm = document.getElementById('uploadForm');
 if (uploadForm) {
+    const filesInput = document.getElementById('pdfFiles');
+    const docSelect = document.getElementById('docSelect');
+    const pdfViewer = document.getElementById('pdfViewer');
+    const pdfContainer = document.getElementById('pdfContainer');
+    const pdfFallback = document.getElementById('pdfFallback');
+
+    // Populate Viewer Dropdown when files are selected
+    filesInput.addEventListener('change', () => {
+        docSelect.innerHTML = '<option value="">Select a document to view...</option>';
+        docSelect.style.display = filesInput.files.length > 0 ? 'block' : 'none';
+        pdfContainer.style.display = 'none';
+
+        Array.from(filesInput.files).forEach((file, index) => {
+            const option = document.createElement('option');
+            option.value = index;
+            option.textContent = file.name;
+            docSelect.appendChild(option);
+        });
+    });
+
+    // Render the selected PDF
+    docSelect.addEventListener('change', (e) => {
+        const fileIndex = e.target.value;
+        if (fileIndex !== "") {
+            const file = filesInput.files[fileIndex];
+            const fileURL = URL.createObjectURL(file);
+            pdfViewer.data = fileURL;
+            pdfFallback.href = fileURL;
+            pdfContainer.style.display = 'block';
+        } else {
+            pdfContainer.style.display = 'none';
+        }
+    });
+
+    // Handle Form Submission & Table Population
     uploadForm.addEventListener('submit', async (e) => {
         e.preventDefault();
-        const filesInput = document.getElementById('pdfFiles');
         const loader = document.getElementById('loader');
         const btn = document.getElementById('extractBtn');
-        const tbody = document.querySelector('#resultsTable tbody');
-        const resultsCard = document.getElementById('resultsCard');
+        const resultsContainer = document.getElementById('resultsContainer');
+        const detailsBody = document.querySelector('#detailsTable tbody');
+        const summaryBody = document.querySelector('#summaryTable tbody');
         const excelBtn = document.getElementById('downloadExcelBtn');
         
         if (!filesInput.files.length) return;
@@ -22,36 +56,64 @@ if (uploadForm) {
         const formData = new FormData();
         for (const file of filesInput.files) formData.append('files', file);
 
-        btn.disabled = true; loader.style.display = 'block'; tbody.innerHTML = ''; 
-        resultsCard.style.display = 'none'; excelBtn.style.display = 'none';
+        // Reset UI
+        btn.disabled = true; 
+        loader.style.display = 'block'; 
+        detailsBody.innerHTML = ''; 
+        summaryBody.innerHTML = ''; 
+        resultsContainer.style.display = 'none';
 
         try {
             const result = await fetchAPI('/api/extract', { method: 'POST', body: formData });
-            if (result.status === 'success' && result.data.length > 0) {
+            
+            if (result.status === 'success') {
+                const data = result.data;
                 
-                // Get the batch_id from the first row to setup the Excel download link
-                const currentBatchId = result.data[0].batch_id;
-                excelBtn.href = `/api/download-excel/${currentBatchId}`;
-                excelBtn.style.display = 'block';
+                // Link the Excel download to the exact batch ID generated on the backend
+                excelBtn.href = `/api/download-excel/${data.batch_id}`;
 
-                result.data.forEach(row => {
+                // Populate Line Items Table
+                data.details.forEach(row => {
                     const tr = document.createElement('tr');
                     tr.innerHTML = `
-                        <td>${row.file}</td>
-                        <td>${row.vendor}</td>
-                        <td>⏱️ ${row.time}</td>
-                        <td class="${row.status.includes('FAIL') ? 'status-fail' : 'status-pass'}">${row.status}</td>
+                        <td>${row["File Name"]}</td>
+                        <td>${row["Page #"] || '-'}</td>
+                        <td>${row["Description"]}</td>
+                        <td>${row["Quantity"] || '-'}</td>
+                        <td>${row["UOM"] || '-'}</td>
+                        <td>${row["Unit Price"] || '-'}</td>
+                        <td>${row["Line Total"] || '-'}</td>
                     `;
-                    tbody.appendChild(tr);
+                    detailsBody.appendChild(tr);
                 });
-                resultsCard.style.display = 'block';
+
+                // Populate QC Summary Table
+                data.summary.forEach(row => {
+                    const tr = document.createElement('tr');
+                    tr.innerHTML = `
+                        <td>${row["File Name"]}</td>
+                        <td>${row["Vendor Name"]}</td>
+                        <td>${row["Invoice #"] || 'N/A'}</td>
+                        <td>${row["Variance"]}</td>
+                        <td>${row["Proc Time"]}</td>
+                        <td class="${row["Status"].includes('FAIL') ? 'status-fail' : 'status-pass'}">${row["Status"]}</td>
+                    `;
+                    summaryBody.appendChild(tr);
+                });
+
+                // Show all results
+                resultsContainer.style.display = 'block';
             }
-        } catch (error) { alert(error.message); } 
-        finally { btn.disabled = false; loader.style.display = 'none'; filesInput.value = ''; }
+        } catch (error) { 
+            alert("Extraction Failed: " + error.message); 
+        } finally { 
+            btn.disabled = false; 
+            loader.style.display = 'none'; 
+        }
     });
 }
 
-// 2. Analytics UI Logic (Plotly)
+// 2. Analytics UI Logic (Plotly Integration)
 if (document.getElementById('chart-container')) {
     fetchAPI('/api/audit-data').then(data => {
         const vendorSpend = {};
@@ -62,20 +124,5 @@ if (document.getElementById('chart-container')) {
         });
         const trace = { x: Object.keys(vendorSpend), y: Object.values(vendorSpend), type: 'bar', marker: { color: '#3498db' }};
         Plotly.newPlot('chart-container', [trace], { title: 'Total Spend by Vendor ($)' });
-    });
-}
-
-// 3. Batch QA Data Loader
-if (document.getElementById('qaTableBody')) {
-    fetchAPI('/api/audit-data').then(data => {
-        const tbody = document.getElementById('qaTableBody');
-        // Get last 50 for QA
-        data.slice(-50).reverse().forEach(row => {
-            const tr = document.createElement('tr');
-            tr.innerHTML = `<td>${row.file_name || 'N/A'}</td><td>${row.invoice_number || 'N/A'}</td>
-                            <td>${row.vendor_name}</td><td>$${(row.variance || 0).toFixed(2)}</td>
-                            <td class="${row.status.includes('FAIL') ? 'status-fail' : 'status-pass'}">${row.status}</td>`;
-            tbody.appendChild(tr);
-        });
     });
 }
