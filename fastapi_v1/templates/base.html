@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- Security: Informing browsers about intent -->
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <title>AI Invoice Intelligence</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+</head>
+<body>
+    <header class="sticky-header">
+        <div class="logo">🧾 Invoice Intel</div>
+        <nav class="nav-links">
+            <a href="/">Extraction Suite</a>
+            <a href="/batch-qa">Batch QA</a>
+            <a href="/analytics">Analytics</a>
+            <a href="/chat">DB Chat</a>
+        </nav>
+        <div class="user-controls">
+            <span>Welcome, Analyst</span>
+            <button class="btn-logout">Logout</button>
+        </div>
+    </header>
+
+    <main class="container">
+        {% block content %}{% endblock %}
+    </main>
+    
+    <script src="/static/js/main.js"></script>
+</body>
+</html>
