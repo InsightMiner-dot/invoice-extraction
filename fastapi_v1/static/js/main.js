@@ -28,7 +28,7 @@ function getTableData(tableId) {
     return data;
 }
 
-// Viewer Logic
+// --- Viewer & Grid Logic ---
 const filesInput = document.getElementById('pdfFiles');
 const pdfGrid = document.getElementById('pdfGrid');
 const gridSearch = document.getElementById('gridSearch');
@@ -75,7 +75,7 @@ if(document.getElementById('closeModal')) {
     });
 }
 
-// Extraction Logic
+// --- Main Extraction Logic ---
 const uploadForm = document.getElementById('uploadForm');
 if (uploadForm) {
     uploadForm.addEventListener('submit', async (e) => {
@@ -87,30 +87,41 @@ if (uploadForm) {
             const progFill = document.getElementById('progressFill');
             const progStats = document.getElementById('progressStats');
             const progTimer = document.getElementById('progressTimer');
+            const finalRunStats = document.getElementById('finalRunStats');
             
             const files = Array.from(document.getElementById('pdfFiles').files);
-            if (files.length === 0) return alert("Please select a file.");
+            if (files.length === 0) {
+                alert("Please select at least one PDF file.");
+                return;
+            }
 
-            // Generate dynamic headers
+            // Gather Dynamic Headers
             const customColKeys = Object.keys(getTableData('customTable'));
             let baseHeaders = `<th>File Name</th><th>Page #</th><th>Supplier</th><th>Inv #</th><th>Material</th><th>Description</th><th>Qty</th><th>UOM</th><th>Price</th><th>Line Total</th><th>Origin</th><th>Dest</th>`;
             customColKeys.forEach(col => baseHeaders += `<th style="color: #3498db;">${col}</th>`);
             document.getElementById('detailsHeaderRow').innerHTML = baseHeaders;
 
+            // Reset UI
             btn.disabled = true;
             progContainer.style.display = 'block';
+            finalRunStats.style.display = 'none';
             document.getElementById('resultsContainer').style.display = 'none';
             document.querySelector('#detailsTable tbody').innerHTML = '';
             document.querySelector('#summaryTable tbody').innerHTML = '';
+            progFill.style.width = '0%';
             
             const total = files.length;
             let processed = 0;
+            let totalPagesExtracted = 0; // Track Total Pages
             const batchId = "BATCH_" + Date.now();
             
+            // Start Global Timer
             const startTime = Date.now();
-            const timerInterval = setInterval(() => { progTimer.innerText = `Time: ${Math.floor((Date.now() - startTime)/1000)}s`; }, 1000);
+            const timerInterval = setInterval(() => { 
+                progTimer.innerText = `Time: ${Math.floor((Date.now() - startTime)/1000)}s`; 
+            }, 1000);
 
-            // Sequential Loop
+            // Sequential processing
             for (let i = 0; i < total; i++) {
                 progStats.innerText = `Extracting ${i + 1} of ${total}: ${files[i].name}...`;
                 
@@ -124,13 +135,19 @@ if (uploadForm) {
 
                 try {
                     const result = await fetchAPI('/api/extract-single', { method: 'POST', body: formData });
+                    
                     if (result.status === 'success' && result.data) {
+                        
+                        // Append Summary & track pages
                         result.data.summary.forEach(row => {
+                            if (row["Total Pages"]) totalPagesExtracted += row["Total Pages"]; // Accumulate pages
+                            
                             const tr = document.createElement('tr');
                             tr.innerHTML = `<td>${row["File Name"]}</td><td>${row["Vendor Name"]}</td><td>${row["Invoice #"] || 'N/A'}</td><td>${row["Variance"]}</td><td>${row["Proc Time"]}</td><td class="${row["Status"].includes('FAIL') ? 'status-fail' : 'status-pass'}">${row["Status"]}</td>`;
                             document.querySelector('#summaryTable tbody').appendChild(tr);
                         });
                         
+                        // Append Details
                         result.data.details.forEach(row => {
                             let customCells = "";
                             customColKeys.forEach(col => customCells += `<td>${row[col] || '-'}</td>`);
@@ -139,30 +156,42 @@ if (uploadForm) {
                             document.querySelector('#detailsTable tbody').appendChild(tr);
                         });
                     }
-                } catch (err) { console.error("API Call failed:", err); }
+                } catch (err) { 
+                    console.error("API Call failed:", err); 
+                }
 
                 processed++;
                 progFill.style.width = `${(processed / total) * 100}%`;
             }
 
+            // End processing
             clearInterval(timerInterval);
+            const totalTimeSeconds = Math.floor((Date.now() - startTime) / 1000);
 
-            // Save Excel
             progStats.innerText = "Generating Excel File...";
+            
+            // Trigger Excel Save
             const excelForm = new FormData();
             excelForm.append('batch_id', batchId);
             excelForm.append('custom_fields', JSON.stringify(customColKeys));
-            
             await fetch('/api/generate-excel', { method: 'POST', body: excelForm });
             document.getElementById('downloadExcelBtn').href = `/api/download-excel/${batchId}`;
 
+            // Show Final Stats Card
             progStats.innerText = "✅ Complete!";
+            finalRunStats.innerHTML = `📊 Batch Complete! &nbsp; | &nbsp; Total PDFs: ${total} &nbsp; | &nbsp; Total Pages: ${totalPagesExtracted} &nbsp; | &nbsp; Total Time: ${totalTimeSeconds}s`;
+            finalRunStats.style.display = 'block';
+            
+            // Show Tables
             document.getElementById('resultsContainer').style.display = 'block';
             btn.disabled = false;
 
         } catch (fatalError) {
-            alert("Error: " + fatalError.message);
-            document.getElementById('extractBtn').disabled = false;
+            alert("A fatal error occurred preventing extraction:\n" + fatalError.message);
+            console.error(fatalError);
+            if (document.getElementById('extractBtn')) {
+                document.getElementById('extractBtn').disabled = false;
+            }
         }
     });
 }
