@@ -24,15 +24,15 @@ def init_db():
             origin_conf TEXT, destination_conf TEXT, total_amount_conf TEXT,
             uom_conf TEXT, status TEXT, reason_for_review TEXT,
             processing_time REAL, page_count INTEGER, batch_id TEXT,
-            custom_fields TEXT
+            custom_fields TEXT, line_items TEXT
         )
     ''')
     
-    # Safe migration if the table already existed without custom_fields
-    try:
-        cursor.execute("ALTER TABLE qc_audit ADD COLUMN custom_fields TEXT")
-    except sqlite3.OperationalError:
-        pass # Column already exists
+    # Safe migration: Add columns if they are missing from an older database
+    try: cursor.execute("ALTER TABLE qc_audit ADD COLUMN custom_fields TEXT")
+    except: pass
+    try: cursor.execute("ALTER TABLE qc_audit ADD COLUMN line_items TEXT")
+    except: pass
         
     conn.commit()
     conn.close()
@@ -47,6 +47,7 @@ def fetch_audit_data() -> pd.DataFrame:
 def insert_audit_record(record: tuple):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+    # Now inserting 35 values
     cursor.execute('''
         INSERT INTO qc_audit (
             extraction_date, extraction_time, file_name, vendor_name, original_supplier_name, 
@@ -54,8 +55,8 @@ def insert_audit_record(record: tuple):
             origin, suggested_origin, final_origin, destination, suggested_destination, final_destination, 
             subtotal, shipping_handling, extracted_total, calculated_sum, variance, 
             invoice_number_conf, origin_conf, destination_conf, total_amount_conf, uom_conf, 
-            status, reason_for_review, processing_time, page_count, batch_id, custom_fields
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            status, reason_for_review, processing_time, page_count, batch_id, custom_fields, line_items
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', record)
     conn.commit()
     conn.close()
