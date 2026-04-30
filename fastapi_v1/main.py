@@ -78,7 +78,39 @@ async def extract_api(files: List[UploadFile] = File(...)):
 async def audit_data_api():
     df = fetch_audit_data()
     return JSONResponse(content=df.to_dict(orient="records"))
+import json
 
+@app.post("/api/extract-single")
+async def extract_single_api(
+    file: UploadFile = File(...), 
+    batch_id: str = Form(...),
+    max_pages: int = Form(15),
+    dpi: int = Form(300),
+    aliases: str = Form("{}"),
+    custom_fields: str = Form("{}")
+):
+    try:
+        file_bytes = await file.read()
+        
+        # Parse settings
+        aliases_dict = json.loads(aliases)
+        custom_fields_dict = json.loads(custom_fields)
+        
+        result = await process_single_invoice(
+            file_bytes, file.filename, batch_id, max_pages, dpi, aliases_dict, custom_fields_dict
+        )
+        if "error" in result: raise HTTPException(status_code=500, detail=result["error"])
+        return {"status": "success", "data": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/generate-excel")
+async def generate_excel_api(batch_id: str = Form(...), custom_fields: str = Form("[]")):
+    custom_cols = json.loads(custom_fields) # Need the keys to build Excel headers
+    success = generate_excel_from_db(batch_id, custom_cols)
+    if success: return {"status": "success"}
+    raise HTTPException(status_code=404, detail="No data found for this batch")
+    
 # NEW ENDPOINT: Download the generated Excel file
 @app.get("/api/download-excel/{batch_id}")
 async def download_excel(batch_id: str):
