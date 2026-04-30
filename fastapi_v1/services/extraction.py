@@ -30,7 +30,7 @@ DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str, max_pages: int, dpi: int, aliases: dict, custom_fields: dict):
     start_time = time.time()
     
-    # 1. PDF to Image
+    # 1. Read PDF
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     base64_images = []
     total_pages = len(doc)
@@ -40,7 +40,7 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
         base64_images.append(base64.b64encode(pix.tobytes("jpeg")).decode('utf-8'))
     doc.close()
 
-    # 2. Build Prompt with User Settings
+    # 2. Build Prompt
     sys_prompt = "Extract invoice data row by row. Start a new invoice record if invoice numbers change."
     
     if aliases:
@@ -63,7 +63,7 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
     except Exception as e:
         return {"error": str(e), "filename": filename}
 
-    # 3. Validation & Math Checks
+    # 3. Clean & Save
     file_proc_time = round(time.time() - start_time, 2)
     master_df = load_master_suppliers()
     master_list = master_df['Original_Supplier_Name'].tolist() if not master_df.empty else []
@@ -99,7 +99,6 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
         
         custom_json = json.dumps(inv.custom_fields) if inv.custom_fields else "{}"
 
-        # Insert to DB
         insert_audit_record((
             current_date, current_time, filename, raw_vendor, orig_supp, inv.vendor_address, inv.bill_to, inv.remit_to, inv.invoice_number, inv.date, inv.currency, 
             str(inv.origin), None, None, str(inv.destination), None, None, inv.subtotal, inv.shipping_handling or 0.0, inv.total_amount, total_calc, variance, 
@@ -107,9 +106,11 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
             file_proc_time, total_pages, batch_id, custom_json
         ))
 
+        # IMPORTANT: Added "Total Pages" to summary so frontend can calculate stats
         summary_results.append({
             "File Name": filename, "Vendor Name": raw_vendor, "Invoice #": inv.invoice_number,
-            "Variance": f"${variance:,.2f}", "Status": "✅ PASS" if status == "PASS" else "⚠️ FAIL", "Proc Time": f"{file_proc_time}s"
+            "Variance": f"${variance:,.2f}", "Status": "✅ PASS" if status == "PASS" else "⚠️ FAIL", 
+            "Proc Time": f"{file_proc_time}s", "Total Pages": total_pages
         })
         
         custom_cols = list(custom_fields.keys())
@@ -128,7 +129,6 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
 
 
 def generate_excel_from_db(batch_id: str, custom_cols: list):
-    """Generates a 2-sheet Excel file based on a specific Batch ID"""
     os.makedirs(AUDIT_FOLDER, exist_ok=True)
     excel_path = os.path.join(AUDIT_FOLDER, f"{batch_id}.xlsx")
     
@@ -140,7 +140,6 @@ def generate_excel_from_db(batch_id: str, custom_cols: list):
 
     wb = openpyxl.Workbook()
     
-    # Sheet 1: Details (Dynamic Headers based on Custom Fields)
     ws_details = wb.active
     ws_details.title = "Invoice Details"
     details_headers = ["file_name", "page_count", "vendor_name", "original_supplier_name", "invoice_number", "extracted_total", "status", "reason_for_review"]
@@ -151,7 +150,6 @@ def generate_excel_from_db(batch_id: str, custom_cols: list):
     
     for _, row in df.iterrows():
         base_row = [row[h] for h in details_headers if h in df.columns]
-        
         cf_data = {}
         if 'custom_fields' in df.columns and pd.notna(row['custom_fields']):
             try: cf_data = json.loads(row['custom_fields'])
@@ -162,7 +160,6 @@ def generate_excel_from_db(batch_id: str, custom_cols: list):
             
         ws_details.append(base_row)
 
-    # Sheet 2: Summary
     ws_qc = wb.create_sheet(title="QC Summary")
     qc_headers = ["file_name", "vendor_name", "invoice_number", "origin", "destination", "status", "extracted_total", "variance"]
     ws_qc.append(qc_headers)
