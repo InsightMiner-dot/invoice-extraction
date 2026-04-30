@@ -27,6 +27,8 @@ DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 
 def setup_excel_workbook():
     wb = openpyxl.Workbook()
+    
+    # Sheet 1: Line Items
     ws_details = wb.active
     ws_details.title = "Invoice Details"
     details_headers = [
@@ -37,6 +39,7 @@ def setup_excel_workbook():
     ]
     ws_details.append(details_headers)
     
+    # Sheet 2: QC Summary
     ws_qc = wb.create_sheet(title="QC Summary")
     qc_headers = [
         "File Name", "Vendor Name", "Original Supplier Name", "Invoice Number", "Origin", "Destination", "Status", "Reason for Review", 
@@ -49,7 +52,10 @@ def setup_excel_workbook():
     for sheet in [ws_details, ws_qc]:
         sheet.freeze_panes = "A2"
         for cell in sheet[1]:
-            cell.fill = header_fill; cell.font = header_font; cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            
     return wb, ws_details, ws_qc
 
 async def extract_single_invoice(file_bytes, max_pages, dpi):
@@ -86,7 +92,6 @@ async def process_batch_concurrently(file_bytes_list, file_names, max_pages=15, 
     current_date, current_time = now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S")
 
     wb, ws_details, ws_qc = setup_excel_workbook()
-    
     current_run_summary = []
     current_run_details = []
 
@@ -95,7 +100,7 @@ async def process_batch_concurrently(file_bytes_list, file_names, max_pages=15, 
         file_proc_time = round((time.time() - start_time_batch) / len(file_names), 2)
         
         if isinstance(result, Exception):
-            current_run_summary.append({"File Name": filename, "Vendor Name": "ERROR", "Invoice #": "ERROR", "Status": "FAIL - CRITICAL ERROR", "Reason": str(result)})
+            current_run_summary.append({"File Name": filename, "Vendor Name": "ERROR", "Invoice #": "ERROR", "Status": "FAIL - CRITICAL ERROR", "Variance": "$0.00", "Proc Time": f"{file_proc_time}s"})
             continue
             
         extracted_doc, total_pages = result
