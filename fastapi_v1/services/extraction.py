@@ -1,6 +1,7 @@
 import fitz
 import base64
 import asyncio
+import time
 from datetime import datetime
 import re
 from fuzzywuzzy import process
@@ -50,6 +51,8 @@ async def extract_single_invoice(file_bytes, max_pages, dpi):
     return response, total_pages
 
 async def process_batch_concurrently(file_bytes_list, file_names, max_pages=15, dpi=300):
+    start_time_batch = time.time()
+    
     tasks = [extract_single_invoice(fb, max_pages, dpi) for fb in file_bytes_list]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     
@@ -63,12 +66,16 @@ async def process_batch_concurrently(file_bytes_list, file_names, max_pages=15, 
 
     for idx, result in enumerate(results):
         filename = file_names[idx]
+        
+        # Calculate individual file processing time (roughly)
+        file_proc_time = round((time.time() - start_time_batch) / len(file_names), 2)
+        
         if isinstance(result, Exception):
             insert_audit_record((
                 current_date, current_time, filename, "ERROR", "ERROR", "ERROR", "ERROR", "ERROR", 
                 "ERROR", "ERROR", "ERROR", "ERROR", None, None, "ERROR", None, None, 
                 0.0, 0.0, 0.0, 0.0, 0.0, "ERROR", "ERROR", "ERROR", "ERROR", "ERROR", 
-                "FAIL - CRITICAL ERROR", str(result), 0.0, 0, batch_id
+                "FAIL - CRITICAL ERROR", str(result), file_proc_time, 0, batch_id
             ))
             continue
             
@@ -96,6 +103,7 @@ async def process_batch_concurrently(file_bytes_list, file_names, max_pages=15, 
             needs_review = len(reasons) > 0
             status = "FAIL - NEEDS REVIEW" if needs_review else "PASS"
 
+            # Insert into DB (Includes proc time and batch_id)
             insert_audit_record((
                 current_date, current_time, filename, raw_vendor, orig_supp, 
                 inv.vendor_address, inv.bill_to, inv.remit_to, inv.invoice_number, inv.date, inv.currency, 
@@ -103,8 +111,15 @@ async def process_batch_concurrently(file_bytes_list, file_names, max_pages=15, 
                 inv.subtotal, inv.shipping_handling or 0.0, inv.total_amount, total_calc, variance, 
                 inv.invoice_number_confidence, inv.origin_confidence, inv.destination_confidence, 
                 inv.total_amount_confidence, "N/A", status, " | ".join(reasons) if needs_review else "N/A", 
-                0.0, total_pages, batch_id
+                file_proc_time, total_pages, batch_id
             ))
-            processed_data.append({"file": filename, "vendor": orig_supp, "status": status, "variance": variance})
+            processed_data.append({
+                "file": filename, 
+                "vendor": orig_supp, 
+                "status": status, 
+                "variance": variance,
+                "time": f"{file_proc_time}s",
+                "batch_id": batch_id
+            })
 
     return processed_data
