@@ -1,4 +1,4 @@
-// Global API Fetcher with Basic Error Handling
+// Global API Fetcher
 async function fetchAPI(endpoint, options = {}) {
     const response = await fetch(endpoint, options);
     if (!response.ok) throw new Error(`API Error: ${response.status}`);
@@ -15,21 +15,33 @@ if (uploadForm) {
         const btn = document.getElementById('extractBtn');
         const tbody = document.querySelector('#resultsTable tbody');
         const resultsCard = document.getElementById('resultsCard');
+        const excelBtn = document.getElementById('downloadExcelBtn');
         
         if (!filesInput.files.length) return;
 
         const formData = new FormData();
         for (const file of filesInput.files) formData.append('files', file);
 
-        btn.disabled = true; loader.style.display = 'block'; tbody.innerHTML = ''; resultsCard.style.display = 'none';
+        btn.disabled = true; loader.style.display = 'block'; tbody.innerHTML = ''; 
+        resultsCard.style.display = 'none'; excelBtn.style.display = 'none';
 
         try {
             const result = await fetchAPI('/api/extract', { method: 'POST', body: formData });
-            if (result.status === 'success') {
+            if (result.status === 'success' && result.data.length > 0) {
+                
+                // Get the batch_id from the first row to setup the Excel download link
+                const currentBatchId = result.data[0].batch_id;
+                excelBtn.href = `/api/download-excel/${currentBatchId}`;
+                excelBtn.style.display = 'block';
+
                 result.data.forEach(row => {
                     const tr = document.createElement('tr');
-                    tr.innerHTML = `<td>${row.file}</td><td>${row.vendor}</td>
-                                    <td class="${row.status.includes('FAIL') ? 'status-fail' : 'status-pass'}">${row.status}</td>`;
+                    tr.innerHTML = `
+                        <td>${row.file}</td>
+                        <td>${row.vendor}</td>
+                        <td>⏱️ ${row.time}</td>
+                        <td class="${row.status.includes('FAIL') ? 'status-fail' : 'status-pass'}">${row.status}</td>
+                    `;
                     tbody.appendChild(tr);
                 });
                 resultsCard.style.display = 'block';
@@ -39,7 +51,7 @@ if (uploadForm) {
     });
 }
 
-// 2. Analytics UI Logic (Plotly Integration)
+// 2. Analytics UI Logic (Plotly)
 if (document.getElementById('chart-container')) {
     fetchAPI('/api/audit-data').then(data => {
         const vendorSpend = {};
