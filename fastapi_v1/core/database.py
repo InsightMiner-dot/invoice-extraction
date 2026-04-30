@@ -23,15 +23,22 @@ def init_db():
             calculated_sum REAL, variance REAL, invoice_number_conf TEXT,
             origin_conf TEXT, destination_conf TEXT, total_amount_conf TEXT,
             uom_conf TEXT, status TEXT, reason_for_review TEXT,
-            processing_time REAL, page_count INTEGER, batch_id TEXT
+            processing_time REAL, page_count INTEGER, batch_id TEXT,
+            custom_fields TEXT
         )
     ''')
+    
+    # Safe migration if the table already existed without custom_fields
+    try:
+        cursor.execute("ALTER TABLE qc_audit ADD COLUMN custom_fields TEXT")
+    except sqlite3.OperationalError:
+        pass # Column already exists
+        
     conn.commit()
     conn.close()
 
 def fetch_audit_data() -> pd.DataFrame:
-    if not os.path.exists(DB_PATH):
-        return pd.DataFrame()
+    if not os.path.exists(DB_PATH): return pd.DataFrame()
     conn = sqlite3.connect(DB_PATH)
     df = pd.read_sql_query("SELECT * FROM qc_audit", conn)
     conn.close()
@@ -47,18 +54,16 @@ def insert_audit_record(record: tuple):
             origin, suggested_origin, final_origin, destination, suggested_destination, final_destination, 
             subtotal, shipping_handling, extracted_total, calculated_sum, variance, 
             invoice_number_conf, origin_conf, destination_conf, total_amount_conf, uom_conf, 
-            status, reason_for_review, processing_time, page_count, batch_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            status, reason_for_review, processing_time, page_count, batch_id, custom_fields
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', record)
     conn.commit()
     conn.close()
 
 def load_master_suppliers() -> pd.DataFrame:
     if os.path.exists(MASTER_CSV_PATH):
-        try:
-            return pd.read_csv(MASTER_CSV_PATH, encoding='utf-8-sig')[['Original_Supplier_Name']].dropna()
-        except:
-            pass
+        try: return pd.read_csv(MASTER_CSV_PATH, encoding='utf-8-sig')[['Original_Supplier_Name']].dropna()
+        except: pass
     return pd.DataFrame(columns=["Original_Supplier_Name"])
 
 def standardize_vendor(name):
