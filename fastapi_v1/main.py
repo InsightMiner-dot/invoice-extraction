@@ -1,19 +1,21 @@
 from fastapi import FastAPI, Request, UploadFile, File, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from typing import List
 import os
+import io
+import sqlite3
+import pandas as pd
 from dotenv import load_dotenv
 
-from core.database import init_db, fetch_audit_data
+from core.database import init_db, fetch_audit_data, DB_PATH
 from services.extraction import process_batch_concurrently
 
 load_dotenv(override=True)
 
-# 1. SECURITY: Hide docs in production to pass scanner mapping
 is_prod = os.getenv("ENVIRONMENT", "development") == "production"
 app = FastAPI(
     title="Invoice Intelligence API",
@@ -22,17 +24,12 @@ app = FastAPI(
     openapi_url=None if is_prod else "/openapi.json"
 )
 
-# 2. SECURITY: Strict CORS Policy
 allowed_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:8000").split(",")
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST"], # Restrict to necessary methods
-    allow_headers=["*"],
+    CORSMiddleware, allow_origins=allowed_origins, allow_credentials=True,
+    allow_methods=["GET", "POST"], allow_headers=["*"],
 )
 
-# 3. SECURITY: Enterprise Headers Middleware (Stops BitSight/Bishop Fox triggers)
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
@@ -40,15 +37,11 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["X-XSS-Protection"] = "1; mode=block"
-        # CSP allows local scripts and Plotly CDN
-        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.plot.ly; style-src 'self' 'unsafe-inline'; img-src 'self' data:;"
-        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-        response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+        response.headers["Content-Security-Policy"] = "default-src 'self' blob:; script-src 'self' 'unsafe-inline' https://cdn.plot.ly; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:;"
         return response
 
 app.add_middleware(SecurityHeadersMiddleware)
 
-# Mounts
 os.makedirs("static", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
@@ -60,19 +53,23 @@ def startup_event():
 # --- Page Routes ---
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
-    return templates.TemplateResponse("extract.html", {"request": request})
+    return templates.TemplateResponse(request=request, name="extract.html")
+
+@app.get("/viewer", response_class=HTMLResponse)
+async def viewer(request: Request):
+    return templates.TemplateResponse(request=request, name="viewer.html")
 
 @app.get("/analytics", response_class=HTMLResponse)
 async def analytics(request: Request):
-    return templates.TemplateResponse("analytics.html", {"request": request})
+    return templates.TemplateResponse(request=request, name="analytics.html")
 
 @app.get("/batch-qa", response_class=HTMLResponse)
 async def batch_qa(request: Request):
-    return templates.TemplateResponse("batch_qa.html", {"request": request})
+    return templates.TemplateResponse(request=request, name="batch_qa.html")
 
 @app.get("/chat", response_class=HTMLResponse)
 async def chat(request: Request):
-    return templates.TemplateResponse("chat.html", {"request": request})
+    return templates.TemplateResponse(request=request, name="chat.html")
 
 # --- API Routes ---
 @app.post("/api/extract")
@@ -90,7 +87,22 @@ async def audit_data_api():
     df = fetch_audit_data()
     return JSONResponse(content=df.to_dict(orient="records"))
 
+@app.get("/api/download-excel/{batch_id}")
+async def download_excel(batch_id: str):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        df = pd.read_sql_query(f"SELECT * FROM qc_audit WHERE batch_id='{batch_id}'", conn)
+        conn.close()
+        
+        buffer = io.BytesIO()
+        df.to_excel(buffer, index=False, engine='openpyxl')
+        buffer.seek(0)
+        
+        headers = {'Content-Disposition': f'attachment; filename="Invoice_Batch_{batch_id}.xlsx"'}
+        return StreamingResponse(buffer, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers=headers)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 if __name__ == "__main__":
     import uvicorn
-    # In production, use standard deployment (Gunicorn/Uvicorn workers), this is for local start
     uvicorn.run("main:app", host="0.0.0.0", port=8000)
