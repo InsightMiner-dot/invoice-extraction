@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+    <h2>💬 Chat with DB (Under Construction)</h2>
+    <p>The LangChain SQL Agent endpoint is being migrated from Streamlit. In the FastAPI architecture, this requires setting up WebSockets or standard polling for conversational memory.</p>
+    <p><em>Check back soon for the RESTful Chat implementation.</em></p>
+</div>
+{% endblock %}
