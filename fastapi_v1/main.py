@@ -1,19 +1,23 @@
-from fastapi import FastAPI, Request, UploadFile, File, HTTPException
+from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
-from typing import List
 import os
+import json
 from dotenv import load_dotenv
 
+# Import your local modules
 from core.database import init_db, fetch_audit_data
-from services.extraction import process_batch_concurrently
+from services.extraction import process_single_invoice, generate_excel_from_db
 
+# Load environment variables
 load_dotenv(override=True)
 
+# Determine environment for hiding docs
 is_prod = os.getenv("ENVIRONMENT", "development") == "production"
+
 app = FastAPI(
     title="Invoice Intelligence API",
     docs_url=None if is_prod else "/docs",
@@ -21,6 +25,7 @@ app = FastAPI(
     openapi_url=None if is_prod else "/openapi.json"
 )
 
+# --- Security & CORS Middleware ---
 allowed_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:8000").split(",")
 app.add_middleware(
     CORSMiddleware,
@@ -37,23 +42,30 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["X-XSS-Protection"] = "1; mode=block"
-        # Adjusted CSP to allow blob: for the local PDF viewer
+        # CSP allows blob: for the native PDF viewer to work securely
         response.headers["Content-Security-Policy"] = "default-src 'self' blob:; script-src 'self' 'unsafe-inline' https://cdn.plot.ly; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:;"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         return response
 
 app.add_middleware(SecurityHeadersMiddleware)
 
+# --- Mount Static Files and Templates ---
 os.makedirs("static", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
+# Initialize database on startup
 @app.on_event("startup")
 def startup_event():
     init_db()
 
+# ==========================================
+# HTML PAGE ROUTES (Frontend Views)
+# ==========================================
+
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
+    # This serves the main extraction, settings, and viewer page
     return templates.TemplateResponse(request=request, name="extract.html")
 
 @app.get("/analytics", response_class=HTMLResponse)
@@ -64,21 +76,14 @@ async def analytics(request: Request):
 async def batch_qa(request: Request):
     return templates.TemplateResponse(request=request, name="batch_qa.html")
 
-@app.post("/api/extract")
-async def extract_api(files: List[UploadFile] = File(...)):
-    try:
-        file_bytes = [await f.read() for f in files]
-        file_names = [f.filename for f in files]
-        results = await process_batch_concurrently(file_bytes, file_names)
-        return {"status": "success", "data": results}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+@app.get("/chat", response_class=HTMLResponse)
+async def chat(request: Request):
+    return templates.TemplateResponse(request=request, name="chat.html")
 
-@app.get("/api/audit-data")
-async def audit_data_api():
-    df = fetch_audit_data()
-    return JSONResponse(content=df.to_dict(orient="records"))
-import json
+
+# ==========================================
+# REST API ROUTES (Backend Logic)
+# ==========================================
 
 @app.post("/api/extract-single")
 async def extract_single_api(
@@ -89,40 +94,87 @@ async def extract_single_api(
     aliases: str = Form("{}"),
     custom_fields: str = Form("{}")
 ):
+    """
+    Processes ONE invoice at a time. The frontend calls this in a loop 
+    so it can update the progress bar in real-time.
+    """
     try:
         file_bytes = await file.read()
         
-        # Parse settings
+        # Parse settings sent from frontend UI
         aliases_dict = json.loads(aliases)
         custom_fields_dict = json.loads(custom_fields)
         
         result = await process_single_invoice(
-            file_bytes, file.filename, batch_id, max_pages, dpi, aliases_dict, custom_fields_dict
+            file_bytes=file_bytes, 
+            filename=file.filename, 
+            batch_id=batch_id, 
+            max_pages=max_pages, 
+            dpi=dpi, 
+            aliases=aliases_dict, 
+            custom_fields=custom_fields_dict
         )
-        if "error" in result: raise HTTPException(status_code=500, detail=result["error"])
+        
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result["error"])
+            
         return {"status": "success", "data": result}
+        
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.post("/api/generate-excel")
-async def generate_excel_api(batch_id: str = Form(...), custom_fields: str = Form("[]")):
-    custom_cols = json.loads(custom_fields) # Need the keys to build Excel headers
-    success = generate_excel_from_db(batch_id, custom_cols)
-    if success: return {"status": "success"}
-    raise HTTPException(status_code=404, detail="No data found for this batch")
-    
-# NEW ENDPOINT: Download the generated Excel file
+async def generate_excel_api(
+    batch_id: str = Form(...), 
+    custom_fields: str = Form("[]")
+):
+    """
+    Triggered by the frontend once the extraction loop finishes.
+    Queries the DB and physically saves the .xlsx file to disk.
+    """
+    try:
+        custom_cols = json.loads(custom_fields)
+        success = generate_excel_from_db(batch_id, custom_cols)
+        
+        if success:
+            return {"status": "success"}
+        raise HTTPException(status_code=404, detail="No data found for this batch")
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/download-excel/{batch_id}")
 async def download_excel(batch_id: str):
+    """
+    Provides the actual file download stream for the generated Excel file.
+    """
     file_path = os.path.join("audit", f"{batch_id}.xlsx")
+    
     if os.path.exists(file_path):
         return FileResponse(
             path=file_path, 
             filename=f"Invoice_Extraction_{batch_id}.xlsx", 
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-    raise HTTPException(status_code=404, detail="Excel file not found")
+        
+    raise HTTPException(status_code=404, detail="Excel file not found on server")
+
+
+@app.get("/api/audit-data")
+async def audit_data_api():
+    """
+    Returns the full database to the frontend for Analytics and QA rendering.
+    """
+    try:
+        df = fetch_audit_data()
+        return JSONResponse(content=df.to_dict(orient="records"))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000)
+    # Start the server locally
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
