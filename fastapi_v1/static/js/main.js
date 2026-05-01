@@ -207,8 +207,8 @@ if (extractBtn) {
             const customFieldsDict = getTableData('customTable');
             const customColKeys = Object.keys(customFieldsDict);
 
-            // 3. Generate Dynamic Headers
-            let baseHeaders = `<th>File Name</th><th>Page #</th><th>Supplier</th><th>Inv #</th><th>Material</th><th>Description</th><th>Qty</th><th>UOM</th><th>Price</th><th>Line Total</th><th>Inv# Conf</th><th>Total Conf</th><th>Variance</th><th>Proc Time</th>`;
+            // 3. Generate Dynamic Headers (Supplier column removed)
+            let baseHeaders = `<th>File Name</th><th>Page #</th><th>Inv #</th><th>Material</th><th>Description</th><th>Qty</th><th>UOM</th><th>Price</th><th>Line Total</th><th>Inv# Conf</th><th>Total Conf</th><th>Variance</th><th>Proc Time</th>`;
             customColKeys.forEach(col => { baseHeaders += `<th style="color: #3498db;">${col}</th>`; });
             if (headerRow) headerRow.innerHTML = baseHeaders;
 
@@ -266,7 +266,7 @@ if (extractBtn) {
                                 });
                             }
                             
-                            // Append Line Level Details 
+                            // Append Line Level Details (Supplier row logic removed)
                             if (detailsBody) {
                                 response.data.details.forEach(row => {
                                     let customCells = "";
@@ -276,7 +276,6 @@ if (extractBtn) {
                                     tr.innerHTML = `
                                         <td>${row["File Name"]}</td>
                                         <td>${row["Page #"]||'-'}</td>
-                                        <td>${row["Original Supplier"]||'-'}</td>
                                         <td>${row["Invoice Number"]||'-'}</td>
                                         <td>${row["Material"]||'-'}</td>
                                         <td>${row["Description"]}</td>
