@@ -30,7 +30,6 @@ const standardFields = [
     "tax_name", "tax_amount", "fee_name", "fee_amount"
 ];
 
-// NEW: Pre-defined common aliases for auto-filling
 const defaultAliases = {
     "invoice_number": "Bill No, Inv #, Invoice No, Reference Number, Document Number",
     "date": "Invoice Date, Billing Date, Document Date, Issue Date",
@@ -55,17 +54,14 @@ const defaultAliases = {
     "fee_amount": "Fee Total, Charge Amount"
 };
 
-// NEW: Auto-fill function triggered when dropdown changes
 function updateDefaultAlias(selectElement) {
     const selectedField = selectElement.value;
-    // Find the text input box right next to the dropdown
     const inputElement = selectElement.parentElement.nextElementSibling.querySelector('input');
     
-    // If we have default aliases for this field, automatically type them in!
     if (inputElement && defaultAliases[selectedField]) {
         inputElement.value = defaultAliases[selectedField];
     } else if (inputElement) {
-        inputElement.value = ""; // Clear if no defaults exist
+        inputElement.value = ""; 
     }
 }
 
@@ -77,7 +73,6 @@ function addRow(tableId) {
     
     if (tableId === 'aliasTable') {
         let optionsHtml = standardFields.map(f => `<option value="${f}">${f}</option>`).join('');
-        // Added onchange="updateDefaultAlias(this)" to trigger the auto-fill
         keyHtml = `<select style="width: 100%; box-sizing: border-box; padding: 5px;" onchange="updateDefaultAlias(this)">
                         <option value="" disabled selected>Select Standard Field...</option>
                         ${optionsHtml}
@@ -199,7 +194,7 @@ if (extractBtn) {
             // 1. Check Files
             const fileInputElement = document.getElementById('pdfFiles');
             if (!fileInputElement || !fileInputElement.files || fileInputElement.files.length === 0) {
-                alert("❌ Please upload at least one PDF file in Step 2.");
+                alert("❌ Please upload at least one file in Step 2.");
                 return;
             }
             const files = Array.from(fileInputElement.files);
@@ -212,7 +207,7 @@ if (extractBtn) {
             const customFieldsDict = getTableData('customTable');
             const customColKeys = Object.keys(customFieldsDict);
 
-            // 3. Generate Dynamic Headers 
+            // 3. Generate Dynamic Headers
             let baseHeaders = `<th>File Name</th><th>Page #</th><th>Supplier</th><th>Inv #</th><th>Material</th><th>Description</th><th>Qty</th><th>UOM</th><th>Price</th><th>Line Total</th><th>Inv# Conf</th><th>Total Conf</th><th>Variance</th><th>Proc Time</th>`;
             customColKeys.forEach(col => { baseHeaders += `<th style="color: #3498db;">${col}</th>`; });
             if (headerRow) headerRow.innerHTML = baseHeaders;
