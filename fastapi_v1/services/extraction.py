@@ -47,7 +47,10 @@ def render_file_to_base64(file_bytes: bytes, filename: str, max_pages: int, dpi:
     for p in range(pages):
         page = doc[p]
         pix = page.get_pixmap(dpi=dpi, alpha=False)
-        base64_images.append(base64.b64encode(pix.tobytes("jpeg", optimize=True)).decode('utf-8'))
+        
+        # FIXED: Removed 'optimize=True' since PyMuPDF handles JPEG compression automatically
+        base64_images.append(base64.b64encode(pix.tobytes("jpeg")).decode('utf-8'))
+        
         raw_pdf_text_list.append(page.get_text("text"))
         del pix
         
