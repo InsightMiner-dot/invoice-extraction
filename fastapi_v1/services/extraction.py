@@ -32,12 +32,20 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
     
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     base64_images = []
+    raw_pdf_text_list = []
+    
     total_pages = len(doc)
     pages = min(total_pages, max_pages)
+    
     for p in range(pages):
-        pix = doc[p].get_pixmap(dpi=dpi)
+        page = doc[p]
+        pix = page.get_pixmap(dpi=dpi)
         base64_images.append(base64.b64encode(pix.tobytes("jpeg")).decode('utf-8'))
+        raw_pdf_text_list.append(page.get_text("text"))
+        
     doc.close()
+    
+    clean_raw_text = re.sub(r'\s+', '', "".join(raw_pdf_text_list)).lower()
 
     sys_prompt = "Extract invoice data row by row. Start a new invoice record if invoice numbers change."
     if aliases:
@@ -65,9 +73,6 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
     
     now = datetime.now()
     current_date, current_time = now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S")
-    
-    raw_pdf_text = "".join([page.get_text("text") for page in fitz.open(stream=file_bytes, filetype="pdf")])
-    clean_raw_text = re.sub(r'\s+', '', raw_pdf_text).lower()
 
     summary_results = []
     detail_results = []
@@ -80,9 +85,10 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
         else:
             orig_supp = standardize_vendor(raw_vendor)
 
-        calc_line_sum = sum(item.line_total for item in inv.line_items if item.line_total)
-        total_calc = calc_line_sum + (inv.shipping_handling or 0.0) + sum(t.tax_amount for t in inv.taxes if t.tax_amount)
-        variance = round(inv.total_amount - total_calc, 2)
+        # --- UPDATED VARIANCE MATH ---
+        # Variance = Invoice Total - Sum of Line Totals
+        calc_line_sum = sum(item.line_total for item in inv.line_items if item.line_total is not None)
+        variance = round(inv.total_amount - calc_line_sum, 2)
 
         reasons = []
         if variance != 0.0: reasons.append(f"Math Variance of {variance}")
@@ -90,11 +96,12 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
             reasons.append("HALLUCINATION: Inv # not in doc")
         
         needs_review = len(reasons) > 0
-        status = "FAIL - NEEDS REVIEW" if needs_review else "PASS"
+        
+        # --- UPDATED STATUS STRING ---
+        status = "NEEDS REVIEW" if needs_review else "PASS"
         
         custom_json = json.dumps(inv.custom_fields) if inv.custom_fields else "{}"
         
-        # Serialize line items for the database so Excel can use them
         line_items_list = []
         for item in inv.line_items:
             line_items_list.append({
@@ -106,14 +113,14 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
 
         insert_audit_record((
             current_date, current_time, filename, raw_vendor, orig_supp, inv.vendor_address, inv.bill_to, inv.remit_to, inv.invoice_number, inv.date, inv.currency, 
-            str(inv.origin), None, None, str(inv.destination), None, None, inv.subtotal, inv.shipping_handling or 0.0, inv.total_amount, total_calc, variance, 
+            str(inv.origin), None, None, str(inv.destination), None, None, inv.subtotal, inv.shipping_handling or 0.0, inv.total_amount, calc_line_sum, variance, 
             inv.invoice_number_confidence, inv.origin_confidence, inv.destination_confidence, inv.total_amount_confidence, "N/A", status, " | ".join(reasons) if needs_review else "N/A", 
             file_proc_time, total_pages, batch_id, custom_json, line_items_json
         ))
 
         summary_results.append({
             "File Name": filename, "Vendor Name": raw_vendor, "Invoice #": inv.invoice_number,
-            "Variance": f"${variance:,.2f}", "Status": "✅ PASS" if status == "PASS" else "⚠️ FAIL", 
+            "Variance": f"${variance:,.2f}", "Status": "✅ PASS" if status == "PASS" else "⚠️ NEEDS REVIEW", 
             "Proc Time": f"{file_proc_time}s", "Total Pages": total_pages
         })
         
@@ -125,13 +132,13 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
                 "Description": item.description, "Qty": item.quantity, "UOM": item.uom, "Price": item.unit_price, 
                 "Line Total": item.line_total, "Origin": inv.origin, "Dest": inv.destination,
                 "Inv# Conf": inv.invoice_number_confidence, "Total Conf": inv.total_amount_confidence, 
-                "Proc Time": f"{file_proc_time}s", "Status": status, "Variance": variance
+                "Proc Time": f"{file_proc_time}s", "Status": "✅ PASS" if status == "PASS" else "⚠️ NEEDS REVIEW", "Variance": variance
             }
             for col in custom_cols:
                 row_data[col] = inv.custom_fields.get(col, "Not Found") if inv.custom_fields else "Not Found"
             detail_results.append(row_data)
 
-    return {"summary": summary_results, "details": detail_results}
+    return {"summary": summary_results, "details": detail_results, "total_file_pages": total_pages}
 
 
 def generate_excel_from_db(batch_id: str, custom_cols: list):
@@ -146,9 +153,7 @@ def generate_excel_from_db(batch_id: str, custom_cols: list):
 
     wb = openpyxl.Workbook()
     
-    # ---------------------------------------------
-    # SHEET 1: LINE ITEMS (EXPLODED)
-    # ---------------------------------------------
+    # SHEET 1: LINE ITEMS
     ws_details = wb.active
     ws_details.title = "Invoice Details"
     
@@ -163,20 +168,16 @@ def generate_excel_from_db(batch_id: str, custom_cols: list):
     ws_details.append(excel_headers)
     
     for _, row in df.iterrows():
-        # Get custom field data
         cf_data = {}
         if 'custom_fields' in df.columns and pd.notna(row['custom_fields']):
             try: cf_data = json.loads(row['custom_fields'])
             except: pass
             
-        # Extract and loop through line items json
         if 'line_items' in df.columns and pd.notna(row['line_items']):
             try:
                 line_items = json.loads(row['line_items'])
-                if not line_items:
-                    line_items = [{}] # Create dummy row if empty
-            except:
-                line_items = [{}]
+                if not line_items: line_items = [{}] 
+            except: line_items = [{}]
         else:
             line_items = [{}]
 
@@ -193,9 +194,7 @@ def generate_excel_from_db(batch_id: str, custom_cols: list):
             for col in custom_cols: base_row.append(cf_data.get(col, "Not Found"))
             ws_details.append(base_row)
 
-    # ---------------------------------------------
-    # SHEET 2: QC SUMMARY
-    # ---------------------------------------------
+    # SHEET 2: QC SUMMARY (Variance is explicitly present here)
     ws_qc = wb.create_sheet(title="QC Summary")
     qc_headers = ["file_name", "vendor_name", "invoice_number", "origin", "destination", "status", "extracted_total", "variance", "processing_time", "reason_for_review"]
     ws_qc.append(qc_headers)
