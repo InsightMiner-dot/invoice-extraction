@@ -15,7 +15,6 @@ from openpyxl.styles import Font, PatternFill, Alignment
 from dotenv import load_dotenv
 
 from core.schemas import InvoiceDocument
-# REMOVED load_master_suppliers and standardize_vendor
 from core.database import insert_audit_record, DB_PATH, AUDIT_FOLDER
 
 load_dotenv(override=True)
@@ -33,6 +32,7 @@ def render_file_to_base64(file_bytes: bytes, filename: str, max_pages: int, dpi:
     base64_images = []
     raw_pdf_text_list = []
     
+    # Safely determine filetype for PyMuPDF
     ext = filename.split('.')[-1].lower()
     if ext == 'jpg': ext = 'jpeg'
     elif ext == 'tif': ext = 'tiff'
@@ -40,17 +40,16 @@ def render_file_to_base64(file_bytes: bytes, filename: str, max_pages: int, dpi:
     if ext not in ['pdf', 'png', 'jpeg', 'tiff']:
         ext = 'pdf'
 
+    # PyMuPDF seamlessly handles both PDFs and Image formats natively
     doc = fitz.open(stream=file_bytes, filetype=ext)
     total_pages = len(doc)
     pages = min(total_pages, max_pages)
     
     for p in range(pages):
         page = doc[p]
+        # alpha=False strips transparency from PNGs preventing JPEG conversion crashes
         pix = page.get_pixmap(dpi=dpi, alpha=False)
-        
-        # FIXED: Removed 'optimize=True' since PyMuPDF handles JPEG compression automatically
         base64_images.append(base64.b64encode(pix.tobytes("jpeg")).decode('utf-8'))
-        
         raw_pdf_text_list.append(page.get_text("text"))
         del pix
         
@@ -61,11 +60,13 @@ def render_file_to_base64(file_bytes: bytes, filename: str, max_pages: int, dpi:
 async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str, max_pages: int, dpi: int, aliases: dict, custom_fields: dict):
     start_time = time.time()
     
+    # 1. Extract File in background 
     base64_images, total_pages, raw_pdf_text = await asyncio.to_thread(
         render_file_to_base64, file_bytes, filename, max_pages, dpi
     )
     clean_raw_text = re.sub(r'\s+', '', raw_pdf_text).lower() if raw_pdf_text else ""
 
+    # 2. Strict Anti-Hallucination System Prompt
     system_prompt = (
         "You are an expert accountant processing a document that may contain multiple distinct invoices. "
         "STRICT PAGING RULES: 1) If the same invoice number continues across multiple pages, combine all line items, taxes, and totals into a SINGLE invoice record. 2) If you see a NEW invoice number, start a NEW invoice record. "
@@ -88,6 +89,7 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
     for img in base64_images:
         content_array.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}})
 
+    # 3. Call Azure OpenAI via Instructor
     try:
         extracted_doc = await client.chat.completions.create(
             model=DEPLOYMENT, response_model=InvoiceDocument, 
@@ -104,6 +106,7 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
     summary_results = []
     detail_results = []
 
+    # 4. Process Each Extracted Invoice
     for extracted_data in extracted_doc.invoices:
         raw_vendor = extracted_data.vendor_name
 
@@ -153,7 +156,8 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
         full_json_dump = extracted_data.model_dump_json()
         custom_json = json.dumps(extracted_data.custom_fields) if extracted_data.custom_fields else "{}"
 
-        # Insert to SQLite (Passing None as the 5th parameter for Original Supplier Name to maintain DB Schema)
+        # 5. Insert to SQLite Audit DB (Threaded to prevent blocking)
+        # Passing None for Original Supplier Name to match DB Schema securely
         audit_tuple = (
             current_date, current_time, filename, raw_vendor, None, extracted_data.vendor_address, 
             extracted_data.bill_to, extracted_data.remit_to, extracted_data.invoice_number, extracted_data.date, 
@@ -165,12 +169,14 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
         )
         await asyncio.to_thread(insert_audit_record, audit_tuple)
 
+        # 6. Populate Output Summary
         summary_results.append({
             "File Name": filename, "Vendor Name": raw_vendor, "Invoice #": extracted_data.invoice_number,
             "Variance": f"${variance:,.2f}", "Status": "✅ PASS" if status == "PASS" else "⚠️ NEEDS HUMAN REVIEW", 
             "Proc Time": f"{file_proc_time}s"
         })
         
+        # 7. Populate Output Details
         def create_ui_row(page_num, material, desc, qty, uom, price, line_total):
             row = {
                 "File Name": filename, "Page #": page_num, "Invoice Number": extracted_data.invoice_number, 
@@ -212,7 +218,7 @@ def generate_excel_from_db(batch_id: str, custom_cols: list):
     
     ws_details = wb.active
     ws_details.title = "Invoice Details"
-    # Removed "Original Supplier Name" from headers
+    # Original Supplier Name removed from headers
     details_headers = [
         "File Name", "Page #", "Vendor Name", "Vendor Address", "Bill To", "Remit To",
         "Origin", "Destination", "Invoice Number", "Date", "Currency", 
@@ -266,7 +272,7 @@ def generate_excel_from_db(batch_id: str, custom_cols: list):
                 ws_details.append(create_excel_row(None, "FEE", fee.get('fee_name'), None, None, None, None, fee.get('fee_amount'), None, None))
 
     ws_qc = wb.create_sheet(title="QC Summary")
-    # Removed "Original Supplier Name" from headers
+    # Original Supplier Name removed from headers
     qc_headers = [
         "file_name", "vendor_name", "invoice_number", 
         "origin", "destination", "status", "reason_for_review", 
