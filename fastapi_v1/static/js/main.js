@@ -1,3 +1,7 @@
+// ==========================================
+// 1. CORE UTILITIES & API FETCHER
+// ==========================================
+
 async function fetchAPI(endpoint, options = {}) {
     const response = await fetch(endpoint, options);
     if (!response.ok) {
@@ -13,12 +17,37 @@ async function fetchAPI(endpoint, options = {}) {
     return await response.json();
 }
 
+// ==========================================
+// 2. SETTINGS TABLES LOGIC (ALIASES & CUSTOM)
+// ==========================================
+
+const standardFields = [
+    "invoice_number", "date", "vendor_name", "vendor_address", 
+    "bill_to", "remit_to", "origin", "destination", "currency", 
+    "subtotal", "shipping_name", "shipping_handling", "total_amount",
+    "material", "description", "line_origin", "line_destination", 
+    "quantity", "uom", "unit_price", "line_total",
+    "tax_name", "tax_amount", "fee_name", "fee_amount"
+];
+
 function addRow(tableId) {
     const tbody = document.querySelector(`#${tableId} tbody`);
     const tr = document.createElement('tr');
+    
+    let keyHtml = "";
+    if (tableId === 'aliasTable') {
+        let optionsHtml = standardFields.map(f => `<option value="${f}">${f}</option>`).join('');
+        keyHtml = `<select style="width: 100%; box-sizing: border-box; padding: 5px;">
+                        <option value="" disabled selected>Select Standard Field...</option>
+                        ${optionsHtml}
+                   </select>`;
+    } else {
+        keyHtml = `<input type="text" style="width: 100%; box-sizing: border-box; padding: 5px;" placeholder="New Field Name...">`;
+    }
+
     tr.innerHTML = `
-        <td><input type="text" style="width: 100%; box-sizing: border-box;" placeholder="Key..."></td>
-        <td><input type="text" style="width: 100%; box-sizing: border-box;" placeholder="Value..."></td>
+        <td>${keyHtml}</td>
+        <td><input type="text" style="width: 100%; box-sizing: border-box; padding: 5px;" placeholder="Aliases or Instructions..."></td>
         <td><button type="button" onclick="this.parentElement.parentElement.remove()" style="color: red; border: none; background: none; cursor: pointer;">X</button></td>
     `;
     tbody.appendChild(tr);
@@ -29,13 +58,21 @@ function getTableData(tableId) {
     const rows = document.querySelectorAll(`#${tableId} tbody tr`);
     if (rows) {
         rows.forEach(row => {
-            const key = row.cells[0].querySelector('input').value.trim();
-            const val = row.cells[1].querySelector('input').value.trim();
+            const keyElement = row.cells[0].querySelector('input, select');
+            const valElement = row.cells[1].querySelector('input');
+            
+            const key = keyElement ? keyElement.value.trim() : '';
+            const val = valElement ? valElement.value.trim() : '';
+            
             if (key) data[key] = val;
         });
     }
     return data;
 }
+
+// ==========================================
+// 3. DOCUMENT GRID & NATIVE PDF VIEWER
+// ==========================================
 
 const filesInput = document.getElementById('pdfFiles');
 const pdfGrid = document.getElementById('pdfGrid');
@@ -93,7 +130,10 @@ if (closeModal) {
     });
 }
 
-// Extraction Logic
+// ==========================================
+// 4. EXTRACTION LOGIC (CONCURRENT BATCHING)
+// ==========================================
+
 const extractBtn = document.getElementById('extractBtn');
 
 if (extractBtn) {
@@ -117,7 +157,7 @@ if (extractBtn) {
 
             const fileInputElement = document.getElementById('pdfFiles');
             if (!fileInputElement || !fileInputElement.files || fileInputElement.files.length === 0) {
-                alert("❌ Please upload at least one PDF file in Step 2.");
+                alert("❌ Please upload at least one file in Step 2.");
                 return;
             }
             const files = Array.from(fileInputElement.files);
@@ -129,7 +169,7 @@ if (extractBtn) {
             const customFieldsDict = getTableData('customTable');
             const customColKeys = Object.keys(customFieldsDict);
 
-            let baseHeaders = `<th>File Name</th><th>Page #</th><th>Supplier</th><th>Inv #</th><th>Material</th><th>Description</th><th>Qty</th><th>UOM</th><th>Price</th><th>Line Total</th><th>Inv# Conf</th><th>Total Conf</th><th>Variance</th><th>Proc Time</th><th>Status</th>`;
+            let baseHeaders = `<th>File Name</th><th>Page #</th><th>Supplier</th><th>Inv #</th><th>Material</th><th>Description</th><th>Qty</th><th>UOM</th><th>Price</th><th>Line Total</th><th>Inv# Conf</th><th>Total Conf</th><th>Variance</th><th>Proc Time</th>`;
             customColKeys.forEach(col => { baseHeaders += `<th style="color: #3498db;">${col}</th>`; });
             if (headerRow) headerRow.innerHTML = baseHeaders;
 
@@ -176,8 +216,8 @@ if (extractBtn) {
                             
                             if (summaryBody) {
                                 response.data.summary.forEach(row => {
-                                    // Look for NEEDS REVIEW to apply the red styling
-                                    const statusClass = row["Status"].includes('NEEDS REVIEW') ? 'status-fail' : 'status-pass';
+                                    // --- NEW STATUS CLASS CHECK ---
+                                    const statusClass = row["Status"].includes('NEEDS HUMAN REVIEW') ? 'status-fail' : 'status-pass';
                                     const tr = document.createElement('tr');
                                     tr.innerHTML = `<td>${row["File Name"]}</td><td>${row["Vendor Name"]}</td><td>${row["Invoice #"] || 'N/A'}</td><td>${row["Variance"]}</td><td>${row["Proc Time"]}</td><td class="${statusClass}">${row["Status"]}</td>`;
                                     summaryBody.appendChild(tr);
@@ -189,11 +229,23 @@ if (extractBtn) {
                                     let customCells = "";
                                     customColKeys.forEach(col => customCells += `<td>${row[col] || '-'}</td>`);
                                     
-                                    // Look for NEEDS REVIEW to apply the red styling
-                                    const statusClass = row["Status"].includes('NEEDS REVIEW') ? 'status-fail' : 'status-pass';
                                     const tr = document.createElement('tr');
                                     tr.innerHTML = `
-                                        <td>${row["File Name"]}</td><td>${row["Page #"]||'-'}</td><td>${row["Original Supplier"]||'-'}</td><td>${row["Invoice Number"]||'-'}</td><td>${row["Material"]||'-'}</td><td>${row["Description"]}</td><td>${row["Qty"]||'-'}</td><td>${row["UOM"]||'-'}</td><td>${row["Price"]||'-'}</td><td>${row["Line Total"]||'-'}</td><td>${row["Inv# Conf"]||'-'}</td><td>${row["Total Conf"]||'-'}</td><td>$${row["Variance"]||'0.00'}</td><td>${row["Proc Time"]}</td><td class="${statusClass}">${row["Status"]}</td>${customCells}
+                                        <td>${row["File Name"]}</td>
+                                        <td>${row["Page #"]||'-'}</td>
+                                        <td>${row["Original Supplier"]||'-'}</td>
+                                        <td>${row["Invoice Number"]||'-'}</td>
+                                        <td>${row["Material"]||'-'}</td>
+                                        <td>${row["Description"]}</td>
+                                        <td>${row["Qty"]||'-'}</td>
+                                        <td>${row["UOM"]||'-'}</td>
+                                        <td>${row["Price"]||'-'}</td>
+                                        <td>${row["Line Total"]||'-'}</td>
+                                        <td>${row["Inv# Conf"]||'-'}</td>
+                                        <td>${row["Total Conf"]||'-'}</td>
+                                        <td>$${row["Variance"]||'0.00'}</td>
+                                        <td>${row["Proc Time"]}</td>
+                                        ${customCells}
                                     `;
                                     detailsBody.appendChild(tr);
                                 });
@@ -229,7 +281,7 @@ if (extractBtn) {
 
             if (progStats) progStats.innerText = "✅ Extraction Complete!";
             if (finalRunStats) {
-                finalRunStats.innerHTML = `📊 Batch Complete! &nbsp; | &nbsp; Total PDFs: ${total} &nbsp; | &nbsp; Total Pages: ${totalPagesExtracted} &nbsp; | &nbsp; Total Time: ${totalTimeSeconds}s`;
+                finalRunStats.innerHTML = `📊 Batch Complete! &nbsp; | &nbsp; Total Files: ${total} &nbsp; | &nbsp; Total Pages: ${totalPagesExtracted} &nbsp; | &nbsp; Total Time: ${totalTimeSeconds}s`;
                 finalRunStats.style.display = 'block';
             }
             if (resultsContainer) resultsContainer.style.display = 'block';
