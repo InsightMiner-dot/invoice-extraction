@@ -21,7 +21,6 @@ async function fetchAPI(endpoint, options = {}) {
 // 2. SETTINGS TABLES LOGIC (ALIASES & CUSTOM)
 // ==========================================
 
-// Pre-defined list of your schema's standard fields for the dropdown menu
 const standardFields = [
     "invoice_number", "date", "vendor_name", "vendor_address", 
     "bill_to", "remit_to", "origin", "destination", "currency", 
@@ -31,21 +30,59 @@ const standardFields = [
     "tax_name", "tax_amount", "fee_name", "fee_amount"
 ];
 
+// NEW: Pre-defined common aliases for auto-filling
+const defaultAliases = {
+    "invoice_number": "Bill No, Inv #, Invoice No, Reference Number, Document Number",
+    "date": "Invoice Date, Billing Date, Document Date, Issue Date",
+    "vendor_name": "Supplier, Biller, Merchant, Company",
+    "vendor_address": "Supplier Address, Remittance Address",
+    "bill_to": "Customer, Sold To, Billed To, Buyer",
+    "remit_to": "Pay To, Remittance, Make Checks Payable To",
+    "origin": "Ship From, Origin Address, Sender Address",
+    "destination": "Ship To, Delivery Address, Consignee",
+    "subtotal": "Net Amount, Total Before Tax, Pre-tax Total",
+    "shipping_handling": "Freight, Shipping, Handling, Delivery, Postage",
+    "total_amount": "Grand Total, Amount Due, Total Payable, Balance Due",
+    "material": "Item Code, Part Number, SKU, Product ID",
+    "description": "Item Description, Product Name, Details",
+    "quantity": "Qty, Ordered, Shipped, Count",
+    "uom": "Unit, Measure",
+    "unit_price": "Rate, Price, Cost, Unit Cost",
+    "line_total": "Amount, Ext Price, Total, Net Price",
+    "tax_name": "Tax Type, GST, VAT, QST, HST, TPS, TVQ",
+    "tax_amount": "Tax Total, Tax Amount",
+    "fee_name": "Charge Name, Fee Type, Surcharge",
+    "fee_amount": "Fee Total, Charge Amount"
+};
+
+// NEW: Auto-fill function triggered when dropdown changes
+function updateDefaultAlias(selectElement) {
+    const selectedField = selectElement.value;
+    // Find the text input box right next to the dropdown
+    const inputElement = selectElement.parentElement.nextElementSibling.querySelector('input');
+    
+    // If we have default aliases for this field, automatically type them in!
+    if (inputElement && defaultAliases[selectedField]) {
+        inputElement.value = defaultAliases[selectedField];
+    } else if (inputElement) {
+        inputElement.value = ""; // Clear if no defaults exist
+    }
+}
+
 function addRow(tableId) {
     const tbody = document.querySelector(`#${tableId} tbody`);
     const tr = document.createElement('tr');
     
     let keyHtml = "";
     
-    // If it's the Alias table, generate a Dropdown (<select>)
     if (tableId === 'aliasTable') {
         let optionsHtml = standardFields.map(f => `<option value="${f}">${f}</option>`).join('');
-        keyHtml = `<select style="width: 100%; box-sizing: border-box; padding: 5px;">
+        // Added onchange="updateDefaultAlias(this)" to trigger the auto-fill
+        keyHtml = `<select style="width: 100%; box-sizing: border-box; padding: 5px;" onchange="updateDefaultAlias(this)">
                         <option value="" disabled selected>Select Standard Field...</option>
                         ${optionsHtml}
                    </select>`;
     } else {
-        // If it's the Custom Field table, generate a standard text input
         keyHtml = `<input type="text" style="width: 100%; box-sizing: border-box; padding: 5px;" placeholder="New Field Name...">`;
     }
 
@@ -62,7 +99,6 @@ function getTableData(tableId) {
     const rows = document.querySelectorAll(`#${tableId} tbody tr`);
     if (rows) {
         rows.forEach(row => {
-            // Check for either a select dropdown OR a text input
             const keyElement = row.cells[0].querySelector('input, select');
             const valElement = row.cells[1].querySelector('input');
             
@@ -176,7 +212,7 @@ if (extractBtn) {
             const customFieldsDict = getTableData('customTable');
             const customColKeys = Object.keys(customFieldsDict);
 
-            // 3. Generate Dynamic Headers (Status column is intentionally excluded here per your request)
+            // 3. Generate Dynamic Headers 
             let baseHeaders = `<th>File Name</th><th>Page #</th><th>Supplier</th><th>Inv #</th><th>Material</th><th>Description</th><th>Qty</th><th>UOM</th><th>Price</th><th>Line Total</th><th>Inv# Conf</th><th>Total Conf</th><th>Variance</th><th>Proc Time</th>`;
             customColKeys.forEach(col => { baseHeaders += `<th style="color: #3498db;">${col}</th>`; });
             if (headerRow) headerRow.innerHTML = baseHeaders;
@@ -225,10 +261,9 @@ if (extractBtn) {
                                 totalPagesExtracted += response.data.total_file_pages;
                             }
                             
-                            // Append to QC Summary (Status column is kept here)
+                            // Append Summary 
                             if (summaryBody) {
                                 response.data.summary.forEach(row => {
-                                    // Highlight red if it says NEEDS HUMAN REVIEW
                                     const statusClass = row["Status"].includes('NEEDS HUMAN REVIEW') ? 'status-fail' : 'status-pass';
                                     const tr = document.createElement('tr');
                                     tr.innerHTML = `<td>${row["File Name"]}</td><td>${row["Vendor Name"]}</td><td>${row["Invoice #"] || 'N/A'}</td><td>${row["Variance"]}</td><td>${row["Proc Time"]}</td><td class="${statusClass}">${row["Status"]}</td>`;
@@ -236,7 +271,7 @@ if (extractBtn) {
                                 });
                             }
                             
-                            // Append to Line Level Details (Status logic entirely removed)
+                            // Append Line Level Details 
                             if (detailsBody) {
                                 response.data.details.forEach(row => {
                                     let customCells = "";
@@ -272,7 +307,6 @@ if (extractBtn) {
                     if (progFill) progFill.style.width = `${(processed / total) * 100}%`;
                 });
 
-                // Wait for chunk to finish before moving to next batch
                 await Promise.all(chunkPromises);
             }
 
