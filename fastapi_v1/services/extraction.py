@@ -30,34 +30,44 @@ client = instructor.from_openai(AsyncAzureOpenAI(
 ))
 DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 
-# --- INGESTION UPDATE: Threaded File to Base64 (Strictly splits PDF and Image processing) ---
+# --- SMART ROUTER INGESTION ---
 def render_file_to_base64(file_bytes: bytes, filename: str, max_pages: int, dpi: int):
     base64_images = []
     raw_pdf_text_list = []
     total_pages = 1
+    is_digital = False
     
     ext = filename.split('.')[-1].lower()
     
-    # 1. STRICTLY PDF LOGIC (Uses PyMuPDF)
+    # 1. PDF LOGIC (With Smart Digital Check)
     if ext == 'pdf':
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         total_pages = len(doc)
         pages = min(total_pages, max_pages)
         
+        # Check first page to route the document
+        if pages > 0:
+            first_page_text = doc[0].get_text("text").strip()
+            # If there's more than 50 characters, it's a native digital PDF
+            if len(first_page_text) > 50:
+                is_digital = True
+                
         for p in range(pages):
             page = doc[p]
-            pix = page.get_pixmap(dpi=dpi)
-            base64_images.append(base64.b64encode(pix.tobytes("jpeg")).decode('utf-8'))
             raw_pdf_text_list.append(page.get_text("text"))
-            del pix
+            
+            # CPU SAVER: Only render images if it is NOT a digital PDF
+            if not is_digital:
+                pix = page.get_pixmap(dpi=dpi)
+                base64_images.append(base64.b64encode(pix.tobytes("jpeg")).decode('utf-8'))
+                del pix
             
         doc.close()
         
-    # 2. STRICTLY IMAGE LOGIC (Uses Pillow safely)
+    # 2. IMAGE LOGIC (Uses Pillow safely, always treated as non-digital)
     elif ext in ['png', 'jpg', 'jpeg', 'tif', 'tiff']:
         try:
             img = Image.open(io.BytesIO(file_bytes))
-            # Convert to RGB to prevent crashes from transparent PNGs or CMYK TIFFs
             if img.mode != 'RGB':
                 img = img.convert('RGB')
                 
@@ -65,23 +75,22 @@ def render_file_to_base64(file_bytes: bytes, filename: str, max_pages: int, dpi:
             img.save(img_byte_arr, format='JPEG', quality=85)
             
             base64_images.append(base64.b64encode(img_byte_arr.getvalue()).decode('utf-8'))
-            # Images don't have embedded text, so raw_pdf_text_list remains empty
         except Exception as e:
             print(f"Failed to process image {filename} with Pillow: {e}")
 
-    return base64_images, total_pages, "".join(raw_pdf_text_list)
+    return base64_images, total_pages, "".join(raw_pdf_text_list), is_digital
 
 
 async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str, max_pages: int, dpi: int, aliases: dict, custom_fields: dict):
     start_time = time.time()
     
-    # 1. Extract File in background (Now passes filename for the router)
-    base64_images, total_pages, raw_pdf_text = await asyncio.to_thread(
+    # 1. Extract File & Routing Flag in background
+    base64_images, total_pages, raw_pdf_text, is_digital = await asyncio.to_thread(
         render_file_to_base64, file_bytes, filename, max_pages, dpi
     )
     clean_raw_text = re.sub(r'\s+', '', raw_pdf_text).lower() if raw_pdf_text else ""
 
-    # 2. Strict Anti-Hallucination System Prompt (UNTOUCHED)
+    # 2. Strict Anti-Hallucination System Prompt
     system_prompt = (
         "You are an expert accountant processing a document that may contain multiple distinct invoices. "
         "STRICT PAGING RULES: 1) If the same invoice number continues across multiple pages, combine all line items, taxes, and totals into a SINGLE invoice record. 2) If you see a NEW invoice number, start a NEW invoice record. "
@@ -100,11 +109,24 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
         rules_str = "\n".join([f"- Field Key: '{k}' | Definition & Aliases: {v}" for k, v in custom_fields.items()])
         system_prompt += f"\n\nSTRICT CUSTOM RULES:\n{rules_str}"
 
-    content_array = [{"type": "text", "text": "Extract data from this multi-page document. Evaluate confidence ('High', 'Medium', 'Low'). Note page numbers."}]
-    for img in base64_images:
-        content_array.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}})
+    # --- HYBRID ROUTER LOGIC ---
+    content_array = []
+    if is_digital:
+        # FAST LANE: Pure Text Payload
+        content_array.append({
+            "type": "text", 
+            "text": f"Extract data from this digital document. Evaluate confidence ('High', 'Medium', 'Low'). Note page numbers.\n\nRAW DOCUMENT TEXT:\n{raw_pdf_text}"
+        })
+    else:
+        # SLOW LANE: Vision Payload (Scanned PDFs & Images)
+        content_array.append({
+            "type": "text", 
+            "text": "Extract data from this document image. Evaluate confidence ('High', 'Medium', 'Low'). Note page numbers."
+        })
+        for img in base64_images:
+            content_array.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}})
 
-    # 3. Call Azure OpenAI via Instructor (UNTOUCHED)
+    # 3. Call Azure OpenAI via Instructor
     try:
         extracted_doc = await client.chat.completions.create(
             model=DEPLOYMENT, response_model=InvoiceDocument, 
@@ -123,7 +145,7 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
     summary_results = []
     detail_results = []
 
-    # 4. Process Each Extracted Invoice (UNTOUCHED)
+    # 4. Process Each Extracted Invoice
     for extracted_data in extracted_doc.invoices:
         raw_vendor = extracted_data.vendor_name
         
