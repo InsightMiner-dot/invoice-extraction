@@ -1,7 +1,3 @@
-// ==========================================
-// 1. CORE UTILITIES & API FETCHER
-// ==========================================
-
 async function fetchAPI(endpoint, options = {}) {
     const response = await fetch(endpoint, options);
     if (!response.ok) {
@@ -16,10 +12,6 @@ async function fetchAPI(endpoint, options = {}) {
     }
     return await response.json();
 }
-
-// ==========================================
-// 2. SETTINGS TABLES LOGIC (ALIASES & CUSTOM)
-// ==========================================
 
 function addRow(tableId) {
     const tbody = document.querySelector(`#${tableId} tbody`);
@@ -44,10 +36,6 @@ function getTableData(tableId) {
     }
     return data;
 }
-
-// ==========================================
-// 3. DOCUMENT GRID & NATIVE PDF VIEWER
-// ==========================================
 
 const filesInput = document.getElementById('pdfFiles');
 const pdfGrid = document.getElementById('pdfGrid');
@@ -105,10 +93,7 @@ if (closeModal) {
     });
 }
 
-// ==========================================
-// 4. EXTRACTION LOGIC (CONCURRENT BATCHING)
-// ==========================================
-
+// Extraction Logic
 const extractBtn = document.getElementById('extractBtn');
 
 if (extractBtn) {
@@ -130,7 +115,6 @@ if (extractBtn) {
         try {
             if (errorBox) errorBox.style.display = 'none';
 
-            // 1. Check Files
             const fileInputElement = document.getElementById('pdfFiles');
             if (!fileInputElement || !fileInputElement.files || fileInputElement.files.length === 0) {
                 alert("❌ Please upload at least one PDF file in Step 2.");
@@ -138,7 +122,6 @@ if (extractBtn) {
             }
             const files = Array.from(fileInputElement.files);
 
-            // 2. Gather Settings
             const maxPages = document.getElementById('configMaxPages').value || "15";
             const dpi = document.getElementById('configDPI').value || "150";
             const concurrencyLimit = parseInt(document.getElementById('configBatchSize').value) || 5; 
@@ -146,12 +129,10 @@ if (extractBtn) {
             const customFieldsDict = getTableData('customTable');
             const customColKeys = Object.keys(customFieldsDict);
 
-            // 3. Generate Dynamic Headers for Details Table (Includes QC info at line level)
             let baseHeaders = `<th>File Name</th><th>Page #</th><th>Supplier</th><th>Inv #</th><th>Material</th><th>Description</th><th>Qty</th><th>UOM</th><th>Price</th><th>Line Total</th><th>Inv# Conf</th><th>Total Conf</th><th>Variance</th><th>Proc Time</th><th>Status</th>`;
             customColKeys.forEach(col => { baseHeaders += `<th style="color: #3498db;">${col}</th>`; });
             if (headerRow) headerRow.innerHTML = baseHeaders;
 
-            // 4. Lock UI and Reset
             extractBtn.disabled = true;
             extractBtn.innerText = "⏳ Extracting... Please Wait";
             if (progContainer) progContainer.style.display = 'block';
@@ -166,18 +147,15 @@ if (extractBtn) {
             let totalPagesExtracted = 0;
             const batchId = "BATCH_" + Date.now();
             
-            // 5. Start Global Timer
             const startTime = Date.now();
             const timerInterval = setInterval(() => { 
                 if (progTimer) progTimer.innerText = `Time: ${Math.floor((Date.now() - startTime)/1000)}s`; 
             }, 1000);
 
-            // 6. THE CONCURRENT LOOP
             for (let i = 0; i < total; i += concurrencyLimit) {
                 const chunk = files.slice(i, i + concurrencyLimit);
                 if (progStats) progStats.innerText = `Extracting batch... (${processed} of ${total} finished)`;
                 
-                // Map the chunk into an array of Promises
                 const chunkPromises = chunk.map(async (file) => {
                     const formData = new FormData();
                     formData.append('file', file);
@@ -188,44 +166,34 @@ if (extractBtn) {
                     formData.append('custom_fields', JSON.stringify(customFieldsDict));
 
                     try {
-                        const result = await fetchAPI('/api/extract-single', { method: 'POST', body: formData });
+                        const response = await fetchAPI('/api/extract-single', { method: 'POST', body: formData });
                         
-                        if (result.status === 'success' && result.data) {
+                        if (response.status === 'success' && response.data) {
                             
-                            // Append Summary
+                            if (response.data.total_file_pages) {
+                                totalPagesExtracted += response.data.total_file_pages;
+                            }
+                            
                             if (summaryBody) {
-                                result.data.summary.forEach(row => {
-                                    if (row["Total Pages"]) totalPagesExtracted += row["Total Pages"];
+                                response.data.summary.forEach(row => {
+                                    // Look for NEEDS REVIEW to apply the red styling
+                                    const statusClass = row["Status"].includes('NEEDS REVIEW') ? 'status-fail' : 'status-pass';
                                     const tr = document.createElement('tr');
-                                    tr.innerHTML = `<td>${row["File Name"]}</td><td>${row["Vendor Name"]}</td><td>${row["Invoice #"] || 'N/A'}</td><td>${row["Variance"]}</td><td>${row["Proc Time"]}</td><td class="${row["Status"].includes('FAIL') ? 'status-fail' : 'status-pass'}">${row["Status"]}</td>`;
+                                    tr.innerHTML = `<td>${row["File Name"]}</td><td>${row["Vendor Name"]}</td><td>${row["Invoice #"] || 'N/A'}</td><td>${row["Variance"]}</td><td>${row["Proc Time"]}</td><td class="${statusClass}">${row["Status"]}</td>`;
                                     summaryBody.appendChild(tr);
                                 });
                             }
                             
-                            // Append Line Level Details
                             if (detailsBody) {
-                                result.data.details.forEach(row => {
+                                response.data.details.forEach(row => {
                                     let customCells = "";
                                     customColKeys.forEach(col => customCells += `<td>${row[col] || '-'}</td>`);
-                                    const statusClass = row["Status"].includes('FAIL') ? 'status-fail' : 'status-pass';
+                                    
+                                    // Look for NEEDS REVIEW to apply the red styling
+                                    const statusClass = row["Status"].includes('NEEDS REVIEW') ? 'status-fail' : 'status-pass';
                                     const tr = document.createElement('tr');
                                     tr.innerHTML = `
-                                        <td>${row["File Name"]}</td>
-                                        <td>${row["Page #"]||'-'}</td>
-                                        <td>${row["Original Supplier"]||'-'}</td>
-                                        <td>${row["Invoice Number"]||'-'}</td>
-                                        <td>${row["Material"]||'-'}</td>
-                                        <td>${row["Description"]}</td>
-                                        <td>${row["Qty"]||'-'}</td>
-                                        <td>${row["UOM"]||'-'}</td>
-                                        <td>${row["Price"]||'-'}</td>
-                                        <td>${row["Line Total"]||'-'}</td>
-                                        <td>${row["Inv# Conf"]||'-'}</td>
-                                        <td>${row["Total Conf"]||'-'}</td>
-                                        <td>$${row["Variance"]||'0.00'}</td>
-                                        <td>${row["Proc Time"]}</td>
-                                        <td class="${statusClass}">${row["Status"]}</td>
-                                        ${customCells}
+                                        <td>${row["File Name"]}</td><td>${row["Page #"]||'-'}</td><td>${row["Original Supplier"]||'-'}</td><td>${row["Invoice Number"]||'-'}</td><td>${row["Material"]||'-'}</td><td>${row["Description"]}</td><td>${row["Qty"]||'-'}</td><td>${row["UOM"]||'-'}</td><td>${row["Price"]||'-'}</td><td>${row["Line Total"]||'-'}</td><td>${row["Inv# Conf"]||'-'}</td><td>${row["Total Conf"]||'-'}</td><td>$${row["Variance"]||'0.00'}</td><td>${row["Proc Time"]}</td><td class="${statusClass}">${row["Status"]}</td>${customCells}
                                     `;
                                     detailsBody.appendChild(tr);
                                 });
@@ -233,19 +201,15 @@ if (extractBtn) {
                         }
                     } catch (err) {
                         console.error(`File ${file.name} failed:`, err);
-                        // We intentionally log but don't break the loop, so one bad PDF doesn't kill the batch
                     }
 
-                    // Update Progress visually after each file in the chunk finishes
                     processed++;
                     if (progFill) progFill.style.width = `${(processed / total) * 100}%`;
                 });
 
-                // AWAIT all requests in the current chunk before moving to the next chunk
                 await Promise.all(chunkPromises);
             }
 
-            // 7. Cleanup & Save Excel
             clearInterval(timerInterval);
             const totalTimeSeconds = Math.floor((Date.now() - startTime) / 1000);
 
@@ -263,7 +227,6 @@ if (extractBtn) {
                 console.error("Excel generation failed on server", e);
             }
 
-            // 8. Finish UI State
             if (progStats) progStats.innerText = "✅ Extraction Complete!";
             if (finalRunStats) {
                 finalRunStats.innerHTML = `📊 Batch Complete! &nbsp; | &nbsp; Total PDFs: ${total} &nbsp; | &nbsp; Total Pages: ${totalPagesExtracted} &nbsp; | &nbsp; Total Time: ${totalTimeSeconds}s`;
