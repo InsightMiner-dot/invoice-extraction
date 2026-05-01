@@ -5,6 +5,8 @@ from datetime import datetime
 import re
 import json
 import asyncio
+import io
+from PIL import Image
 from fuzzywuzzy import process
 from openai import AsyncAzureOpenAI
 import instructor
@@ -28,34 +30,47 @@ client = instructor.from_openai(AsyncAzureOpenAI(
 ))
 DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 
-# Threaded PDF to Base64 to prevent blocking
-def render_pdf_to_base64(file_bytes: bytes, max_pages: int, dpi: int):
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
+# Threaded File to Base64 (Handles PDFs and Images)
+def render_file_to_base64(file_bytes: bytes, filename: str, max_pages: int, dpi: int):
     base64_images = []
     raw_pdf_text_list = []
-    total_pages = len(doc)
-    pages = min(total_pages, max_pages)
+    total_pages = 1
     
-    for p in range(pages):
-        page = doc[p]
-        pix = page.get_pixmap(dpi=dpi)
-        base64_images.append(base64.b64encode(pix.tobytes("jpeg")).decode('utf-8'))
-        raw_pdf_text_list.append(page.get_text("text"))
-        del pix
+    ext = filename.split('.')[-1].lower()
+    
+    if ext == 'pdf':
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        total_pages = len(doc)
+        pages = min(total_pages, max_pages)
+        for p in range(pages):
+            page = doc[p]
+            pix = page.get_pixmap(dpi=dpi)
+            base64_images.append(base64.b64encode(pix.tobytes("jpeg")).decode('utf-8'))
+            raw_pdf_text_list.append(page.get_text("text"))
+            del pix
+        doc.close()
         
-    doc.close()
+    elif ext in ['png', 'jpg', 'jpeg', 'tif', 'tiff']:
+        try:
+            img = Image.open(io.BytesIO(file_bytes))
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            img_byte_arr = io.BytesIO()
+            img.save(img_byte_arr, format='JPEG', quality=85)
+            base64_images.append(base64.b64encode(img_byte_arr.getvalue()).decode('utf-8'))
+        except Exception as e:
+            print(f"Failed to process image: {e}")
+
     return base64_images, total_pages, "".join(raw_pdf_text_list)
 
 async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str, max_pages: int, dpi: int, aliases: dict, custom_fields: dict):
     start_time = time.time()
     
-    # 1. Process PDF in background thread
     base64_images, total_pages, raw_pdf_text = await asyncio.to_thread(
-        render_pdf_to_base64, file_bytes, max_pages, dpi
+        render_file_to_base64, file_bytes, filename, max_pages, dpi
     )
-    clean_raw_text = re.sub(r'\s+', '', raw_pdf_text).lower()
+    clean_raw_text = re.sub(r'\s+', '', raw_pdf_text).lower() if raw_pdf_text else ""
 
-    # 2. EXACT ORIGINAL SYSTEM PROMPT
     system_prompt = "You are an expert accountant processing a document that may contain multiple distinct invoices. STRICT PAGING RULES: 1) If the same invoice number continues across multiple pages, combine all line items, taxes, and totals into a SINGLE invoice record. 2) If you see a NEW invoice number, start a NEW invoice record. CRITICAL RULE AGAINST DUPLICATES: Never extract the same tax or fee twice. ANTI-LAZINESS RULE: DO NOT BE LAZY. You must extract every single line item row by row."
     
     if aliases:
@@ -91,14 +106,12 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
     for extracted_data in extracted_doc.invoices:
         raw_vendor = extracted_data.vendor_name
         
-        # Original Supplier Matching
         if master_list and raw_vendor and raw_vendor not in ['N/A', 'ERROR', '']:
             match_result = process.extractOne(raw_vendor, master_list)
             orig_supp = match_result[0] if match_result and match_result[1] >= 95 else standardize_vendor(raw_vendor)
         else:
             orig_supp = standardize_vendor(raw_vendor)
 
-        # EXACT ORIGINAL MATH
         calculated_line_sum = sum(item.line_total for item in extracted_data.line_items if item.line_total is not None)
         safe_ship = extracted_data.shipping_handling or 0.0
         safe_total_tax = sum(tax.tax_amount for tax in extracted_data.taxes if tax.tax_amount is not None)
@@ -107,9 +120,8 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
         total_calculated = calculated_line_sum + safe_total_tax + safe_ship + safe_fees
         variance = round(extracted_data.total_amount - total_calculated, 2)
 
-        # EXACT ORIGINAL REASON/STATUS LOGIC
         hallucination_alert = False
-        if extracted_data.invoice_number:
+        if extracted_data.invoice_number and clean_raw_text:
             clean_inv = re.sub(r'\s+', '', extracted_data.invoice_number).lower()
             if clean_inv and clean_inv not in clean_raw_text:
                 hallucination_alert = True
@@ -132,17 +144,17 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
                 review_reasons.append(f"Low Conf: UOM on '{short_desc}'")
 
         needs_review = len(review_reasons) > 0
-        status = "FAIL - NEEDS REVIEW" if needs_review else "PASS"
+        
+        # --- NEW STATUS TEXT ---
+        status = "NEEDS HUMAN REVIEW" if needs_review else "PASS"
         reasons_string = " | ".join(review_reasons) if needs_review else "N/A"
         uom_string = ", ".join(list(unique_uoms)) if unique_uoms else "N/A"
         
-        # ORIGINAL ORIGIN/DESTINATION FALLBACK LOGIC
         first_line_orig = extracted_data.line_items[0].line_origin if len(extracted_data.line_items) > 0 else None
         first_line_dest = extracted_data.line_items[0].line_destination if len(extracted_data.line_items) > 0 else None
         qc_origin = first_line_orig if first_line_orig else extracted_data.origin
         qc_dest = first_line_dest if first_line_dest else extracted_data.destination
 
-        # Serialize full JSON for robust Excel generation later
         full_json_dump = extracted_data.model_dump_json()
         custom_json = json.dumps(extracted_data.custom_fields) if extracted_data.custom_fields else "{}"
 
@@ -158,19 +170,18 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
 
         summary_results.append({
             "File Name": filename, "Vendor Name": raw_vendor, "Invoice #": extracted_data.invoice_number,
-            "Variance": f"${variance:,.2f}", "Status": "✅ PASS" if status == "PASS" else "⚠️ FAIL", 
+            "Variance": f"${variance:,.2f}", "Status": "✅ PASS" if status == "PASS" else "⚠️ NEEDS HUMAN REVIEW", 
             "Proc Time": f"{file_proc_time}s"
         })
         
-        # --- UI Details Table Generator ---
-        # Helper function replicating the exact original `create_row_dict`
         def create_ui_row(page_num, material, desc, qty, uom, price, line_total):
             row = {
                 "File Name": filename, "Page #": page_num, "Original Supplier": orig_supp, 
                 "Invoice Number": extracted_data.invoice_number, "Material": material,
                 "Description": desc, "Qty": qty, "UOM": uom, "Price": price, "Line Total": line_total, 
                 "Inv# Conf": extracted_data.invoice_number_confidence, "Total Conf": extracted_data.total_amount_confidence, 
-                "Variance": variance, "Proc Time": f"{file_proc_time}s", "Status": status
+                "Variance": variance, "Proc Time": f"{file_proc_time}s", 
+                "Status": "✅ PASS" if status == "PASS" else "⚠️ NEEDS HUMAN REVIEW"
             }
             for col in list(custom_fields.keys()): row[col] = extracted_data.custom_fields.get(col, "Not Found")
             return row
@@ -181,7 +192,6 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
             for item in extracted_data.line_items:
                 detail_results.append(create_ui_row(item.page_number, item.material, item.description, item.quantity, item.uom, item.unit_price, item.line_total))
         
-        # Re-inject Taxes/Shipping/Fees visually for the UI Table
         if safe_ship > 0:
             detail_results.append(create_ui_row(None, "SHIPPING", extracted_data.shipping_name or "Shipping", None, None, None, safe_ship))
         for tax in extracted_data.taxes:
@@ -204,7 +214,6 @@ def generate_excel_from_db(batch_id: str, custom_cols: list):
 
     wb = openpyxl.Workbook()
     
-    # EXACT ORIGINAL EXCEL SHEET HEADERS
     ws_details = wb.active
     ws_details.title = "Invoice Details"
     details_headers = [
@@ -218,10 +227,8 @@ def generate_excel_from_db(batch_id: str, custom_cols: list):
     ws_details.append(excel_headers)
     
     for _, row in df.iterrows():
-        try:
-            full_data = json.loads(row['line_items']) # We saved the full dump here
-        except:
-            continue
+        try: full_data = json.loads(row['line_items'])
+        except: continue
             
         def create_excel_row(page_num, material, desc, qty, uom, uom_conf, price, line_total, line_orig, line_dest):
             final_orig = line_orig if line_orig else full_data.get('origin', '')
@@ -249,7 +256,6 @@ def generate_excel_from_db(batch_id: str, custom_cols: list):
                     item.get('line_origin'), item.get('line_destination')
                 ))
         
-        # Inject Shipping, Taxes, Fees into Excel exactly like original
         safe_ship = full_data.get('shipping_handling')
         if safe_ship and float(safe_ship) > 0:
             ws_details.append(create_excel_row(None, "SHIPPING", full_data.get('shipping_name') or "Shipping", None, None, None, None, float(safe_ship), None, None))
@@ -262,7 +268,6 @@ def generate_excel_from_db(batch_id: str, custom_cols: list):
             if fee.get('fee_amount'):
                 ws_details.append(create_excel_row(None, "FEE", fee.get('fee_name'), None, None, None, None, fee.get('fee_amount'), None, None))
 
-    # EXACT ORIGINAL QC SUMMARY HEADERS
     ws_qc = wb.create_sheet(title="QC Summary")
     qc_headers = [
         "file_name", "vendor_name", "original_supplier_name", "invoice_number", 
