@@ -1,5 +1,4 @@
 import fitz
-import pymupdf4llm  # NEW: The Markdown extractor
 import base64
 import time
 from datetime import datetime
@@ -31,50 +30,30 @@ client = instructor.from_openai(AsyncAzureOpenAI(
 ))
 DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 
-# --- THE SMART HYBRID ROUTER ---
-def extract_file_content(file_bytes: bytes, filename: str, max_pages: int, dpi: int):
+# --- STABLE INGESTION (Everything converts to Base64 Images) ---
+def render_file_to_base64(file_bytes: bytes, filename: str, max_pages: int, dpi: int):
     base64_images = []
-    markdown_text = ""
-    is_digital = False
+    raw_pdf_text_list = []
     total_pages = 1
     
     ext = filename.split('.')[-1].lower()
     
-    # --- 1. PDF ROUTING ---
+    # 1. STRICTLY PDF LOGIC (Uses PyMuPDF to get images AND text)
     if ext == 'pdf':
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         total_pages = len(doc)
-        pages_to_process = min(total_pages, max_pages)
+        pages = min(total_pages, max_pages)
         
-        # Check if Digital (Does it have text?)
-        if pages_to_process > 0:
-            first_page_text = doc[0].get_text("text").strip()
-            if len(first_page_text) > 50:
-                is_digital = True
+        for p in range(pages):
+            page = doc[p]
+            pix = page.get_pixmap(dpi=dpi)
+            base64_images.append(base64.b64encode(pix.tobytes("jpeg")).decode('utf-8'))
+            raw_pdf_text_list.append(page.get_text("text"))
+            del pix
+            
         doc.close()
-
-        if is_digital:
-            # EXPRESS LANE: Use pymupdf4llm to convert to structured Markdown
-            try:
-                # pymupdf4llm requires a doc object, so we re-open it
-                doc_for_md = fitz.open(stream=file_bytes, filetype="pdf")
-                markdown_text = pymupdf4llm.to_markdown(doc_for_md, pages=list(range(pages_to_process)))
-                doc_for_md.close()
-            except Exception as e:
-                print(f"Markdown extraction failed, falling back to Vision: {e}")
-                is_digital = False # Fallback to Vision if markdown fails
-
-        # If it's scanned (or Markdown failed), use the Vision Lane
-        if not is_digital:
-            doc_vis = fitz.open(stream=file_bytes, filetype="pdf")
-            for p in range(pages_to_process):
-                page = doc_vis[p]
-                pix = page.get_pixmap(dpi=dpi)
-                base64_images.append(base64.b64encode(pix.tobytes("jpeg")).decode('utf-8'))
-                del pix
-            doc_vis.close()
-
-    # --- 2. IMAGE ROUTING (Always Vision Lane) ---
+        
+    # 2. STRICTLY IMAGE LOGIC (Uses Pillow safely)
     elif ext in ['png', 'jpg', 'jpeg', 'tif', 'tiff']:
         try:
             img = Image.open(io.BytesIO(file_bytes))
@@ -88,24 +67,21 @@ def extract_file_content(file_bytes: bytes, filename: str, max_pages: int, dpi: 
         except Exception as e:
             print(f"Failed to process image {filename} with Pillow: {e}")
 
-    # We return the markdown_text (if digital) OR the base64_images (if visual)
-    return base64_images, total_pages, markdown_text, is_digital
+    return base64_images, total_pages, "".join(raw_pdf_text_list)
 
 
 async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str, max_pages: int, dpi: int, aliases: dict, custom_fields: dict):
     start_time = time.time()
     
-    # 1. Route the File
-    base64_images, total_pages, markdown_text, is_digital = await asyncio.to_thread(
-        extract_file_content, file_bytes, filename, max_pages, dpi
+    # 1. Extract File in background 
+    base64_images, total_pages, raw_pdf_text = await asyncio.to_thread(
+        render_file_to_base64, file_bytes, filename, max_pages, dpi
     )
-    
-    # We strip whitespace for the hallucination check
-    clean_raw_text = re.sub(r'\s+', '', markdown_text).lower() if markdown_text else ""
+    clean_raw_text = re.sub(r'\s+', '', raw_pdf_text).lower() if raw_pdf_text else ""
 
     # 2. Strict Anti-Hallucination System Prompt
     system_prompt = (
-        "You are an expert accountant processing an invoice document. "
+        "You are an expert accountant processing a document that may contain multiple distinct invoices. "
         "STRICT PAGING RULES: 1) If the same invoice number continues across multiple pages, combine all line items, taxes, and totals into a SINGLE invoice record. 2) If you see a NEW invoice number, start a NEW invoice record. "
         "CRITICAL RULE AGAINST DUPLICATES: Never extract the same tax or fee twice. "
         "ANTI-LAZINESS RULE: DO NOT BE LAZY. You must extract every single line item row by row. "
@@ -122,25 +98,12 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
         rules_str = "\n".join([f"- Field Key: '{k}' | Definition & Aliases: {v}" for k, v in custom_fields.items()])
         system_prompt += f"\n\nSTRICT CUSTOM RULES:\n{rules_str}"
 
-    # --- 3. CONSTRUCT THE PAYLOAD BASED ON THE ROUTE ---
-    content_array = []
-    
-    if is_digital:
-        # FAST EXPRESS LANE: Pure Text Payload
-        content_array.append({
-            "type": "text", 
-            "text": f"Extract data from this structured document. Evaluate confidence ('High', 'Medium', 'Low').\n\nRAW DOCUMENT TEXT (MARKDOWN FORMAT):\n{markdown_text}"
-        })
-    else:
-        # VISION LANE: Images Payload
-        content_array.append({
-            "type": "text", 
-            "text": "Extract data from this document image. Evaluate confidence ('High', 'Medium', 'Low'). Note page numbers if visible."
-        })
-        for img in base64_images:
-            content_array.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}})
+    # --- VISION-ONLY PAYLOAD ---
+    content_array = [{"type": "text", "text": "Extract data from this multi-page document. Evaluate confidence ('High', 'Medium', 'Low'). Note page numbers."}]
+    for img in base64_images:
+        content_array.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}})
 
-    # 4. Call Azure OpenAI via Instructor
+    # 3. Call Azure OpenAI via Instructor
     try:
         extracted_doc = await client.chat.completions.create(
             model=DEPLOYMENT, response_model=InvoiceDocument, 
@@ -159,7 +122,7 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
     summary_results = []
     detail_results = []
 
-    # 5. Process Each Extracted Invoice
+    # 4. Process Each Extracted Invoice
     for extracted_data in extracted_doc.invoices:
         raw_vendor = extracted_data.vendor_name
         
@@ -215,7 +178,7 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
         full_json_dump = extracted_data.model_dump_json()
         custom_json = json.dumps(extracted_data.custom_fields) if extracted_data.custom_fields else "{}"
 
-        # 6. Insert to SQLite Audit DB
+        # 5. Insert to SQLite Audit DB
         insert_audit_record((
             current_date, current_time, filename, raw_vendor, orig_supp, extracted_data.vendor_address, 
             extracted_data.bill_to, extracted_data.remit_to, extracted_data.invoice_number, extracted_data.date, 
@@ -226,14 +189,14 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
             status, reasons_string, file_proc_time, total_pages, batch_id, custom_json, full_json_dump
         ))
 
-        # 7. Populate Output Summary
+        # 6. Populate Output Summary
         summary_results.append({
             "File Name": filename, "Vendor Name": raw_vendor, "Invoice #": extracted_data.invoice_number,
             "Variance": f"${variance:,.2f}", "Status": "✅ PASS" if status == "PASS" else "⚠️ NEEDS HUMAN REVIEW", 
             "Proc Time": f"{file_proc_time}s"
         })
         
-        # 8. Populate Output Details
+        # 7. Populate Output Details
         def create_ui_row(page_num, material, desc, qty, uom, price, line_total):
             row = {
                 "File Name": filename, "Page #": page_num, "Original Supplier": orig_supp, 
