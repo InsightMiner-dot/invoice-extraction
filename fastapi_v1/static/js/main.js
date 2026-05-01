@@ -256,12 +256,21 @@ if (extractBtn) {
                                 totalPagesExtracted += response.data.total_file_pages;
                             }
                             
-                            // Append Summary 
+                            // Append Summary (Now rendering LLM Time and Sec/Page)
                             if (summaryBody) {
                                 response.data.summary.forEach(row => {
                                     const statusClass = row["Status"].includes('NEEDS HUMAN REVIEW') ? 'status-fail' : 'status-pass';
                                     const tr = document.createElement('tr');
-                                    tr.innerHTML = `<td>${row["File Name"]}</td><td>${row["Vendor Name"]}</td><td>${row["Invoice #"] || 'N/A'}</td><td>${row["Variance"]}</td><td>${row["Proc Time"]}</td><td class="${statusClass}">${row["Status"]}</td>`;
+                                    tr.innerHTML = `
+                                        <td>${row["File Name"]}</td>
+                                        <td>${row["Vendor Name"]}</td>
+                                        <td>${row["Invoice #"] || 'N/A'}</td>
+                                        <td>${row["Variance"]}</td>
+                                        <td>${row["Proc Time"]}</td>
+                                        <td style="color: #e67e22; font-weight: bold;">${row["LLM Time"]}</td>
+                                        <td style="color: #8e44ad; font-weight: bold;">${row["Sec/Page"]}</td>
+                                        <td class="${statusClass}">${row["Status"]}</td>
+                                    `;
                                     summaryBody.appendChild(tr);
                                 });
                             }
