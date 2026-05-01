@@ -28,7 +28,7 @@ client = instructor.from_openai(AsyncAzureOpenAI(
 ))
 DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 
-# REVERTED: Strictly handles PDFs using PyMuPDF to guarantee stability
+# Threaded PDF to Base64 to prevent blocking the main server thread
 def render_pdf_to_base64(file_bytes: bytes, max_pages: int, dpi: int):
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     base64_images = []
@@ -39,7 +39,6 @@ def render_pdf_to_base64(file_bytes: bytes, max_pages: int, dpi: int):
     for p in range(pages):
         page = doc[p]
         pix = page.get_pixmap(dpi=dpi)
-        # Using jpeg output to keep payload light
         base64_images.append(base64.b64encode(pix.tobytes("jpeg")).decode('utf-8'))
         raw_pdf_text_list.append(page.get_text("text"))
         del pix
@@ -47,15 +46,26 @@ def render_pdf_to_base64(file_bytes: bytes, max_pages: int, dpi: int):
     doc.close()
     return base64_images, total_pages, "".join(raw_pdf_text_list)
 
+
 async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str, max_pages: int, dpi: int, aliases: dict, custom_fields: dict):
     start_time = time.time()
     
+    # 1. Extract PDF Images & Text in background
     base64_images, total_pages, raw_pdf_text = await asyncio.to_thread(
         render_pdf_to_base64, file_bytes, max_pages, dpi
     )
     clean_raw_text = re.sub(r'\s+', '', raw_pdf_text).lower()
 
-    system_prompt = "You are an expert accountant processing a document that may contain multiple distinct invoices. STRICT PAGING RULES: 1) If the same invoice number continues across multiple pages, combine all line items, taxes, and totals into a SINGLE invoice record. 2) If you see a NEW invoice number, start a NEW invoice record. CRITICAL RULE AGAINST DUPLICATES: Never extract the same tax or fee twice. ANTI-LAZINESS RULE: DO NOT BE LAZY. You must extract every single line item row by row."
+    # 2. Strict Anti-Hallucination System Prompt
+    system_prompt = (
+        "You are an expert accountant processing a document that may contain multiple distinct invoices. "
+        "STRICT PAGING RULES: 1) If the same invoice number continues across multiple pages, combine all line items, taxes, and totals into a SINGLE invoice record. 2) If you see a NEW invoice number, start a NEW invoice record. "
+        "CRITICAL RULE AGAINST DUPLICATES: Never extract the same tax or fee twice. "
+        "ANTI-LAZINESS RULE: DO NOT BE LAZY. You must extract every single line item row by row. "
+        "ANTI-HALLUCINATION RULE (CRITICAL): You must NEVER guess, infer, calculate, or hallucinate data. Extract strictly and exclusively what is visibly printed on the document. "
+        "If a specific value (like an origin address, destination, invoice number, or line item detail) is not explicitly written on the page, you MUST leave it blank (null). Do not fill in assumptions. "
+        "If the text is blurry, ambiguous, or you are in doubt about a value, leave it blank or extract your best literal read and immediately set its confidence score to 'Low'."
+    )
     
     if aliases:
         alias_str = "\n".join([f"- {k}: Also look for '{v}'" for k, v in aliases.items()])
@@ -69,6 +79,7 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
     for img in base64_images:
         content_array.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}})
 
+    # 3. Call Azure OpenAI via Instructor
     try:
         extracted_doc = await client.chat.completions.create(
             model=DEPLOYMENT, response_model=InvoiceDocument, 
@@ -87,15 +98,18 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
     summary_results = []
     detail_results = []
 
+    # 4. Process Each Extracted Invoice
     for extracted_data in extracted_doc.invoices:
         raw_vendor = extracted_data.vendor_name
         
+        # Fuzzy Match Vendor
         if master_list and raw_vendor and raw_vendor not in ['N/A', 'ERROR', '']:
             match_result = process.extractOne(raw_vendor, master_list)
             orig_supp = match_result[0] if match_result and match_result[1] >= 95 else standardize_vendor(raw_vendor)
         else:
             orig_supp = standardize_vendor(raw_vendor)
 
+        # Variance Math (Line Items + Taxes + Shipping + Fees)
         calculated_line_sum = sum(item.line_total for item in extracted_data.line_items if item.line_total is not None)
         safe_ship = extracted_data.shipping_handling or 0.0
         safe_total_tax = sum(tax.tax_amount for tax in extracted_data.taxes if tax.tax_amount is not None)
@@ -104,12 +118,14 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
         total_calculated = calculated_line_sum + safe_total_tax + safe_ship + safe_fees
         variance = round(extracted_data.total_amount - total_calculated, 2)
 
+        # Hallucination Check (Verify Invoice # against raw PDF text)
         hallucination_alert = False
         if extracted_data.invoice_number:
             clean_inv = re.sub(r'\s+', '', extracted_data.invoice_number).lower()
             if clean_inv and clean_inv not in clean_raw_text:
                 hallucination_alert = True
 
+        # Generate Review Reasons
         review_reasons = []
         unique_uoms = set()
         
@@ -127,19 +143,23 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
                 short_desc = item.description[:15] + "..." if item.description and len(item.description) > 15 else item.description
                 review_reasons.append(f"Low Conf: UOM on '{short_desc}'")
 
+        # Set Status String
         needs_review = len(review_reasons) > 0
         status = "NEEDS HUMAN REVIEW" if needs_review else "PASS"
         reasons_string = " | ".join(review_reasons) if needs_review else "N/A"
         uom_string = ", ".join(list(unique_uoms)) if unique_uoms else "N/A"
         
+        # Determine Routing Fallbacks
         first_line_orig = extracted_data.line_items[0].line_origin if len(extracted_data.line_items) > 0 else None
         first_line_dest = extracted_data.line_items[0].line_destination if len(extracted_data.line_items) > 0 else None
         qc_origin = first_line_orig if first_line_orig else extracted_data.origin
         qc_dest = first_line_dest if first_line_dest else extracted_data.destination
 
+        # Serialize custom and raw data for Database
         full_json_dump = extracted_data.model_dump_json()
         custom_json = json.dumps(extracted_data.custom_fields) if extracted_data.custom_fields else "{}"
 
+        # 5. Insert to SQLite Audit DB
         insert_audit_record((
             current_date, current_time, filename, raw_vendor, orig_supp, extracted_data.vendor_address, 
             extracted_data.bill_to, extracted_data.remit_to, extracted_data.invoice_number, extracted_data.date, 
@@ -150,12 +170,14 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
             status, reasons_string, file_proc_time, total_pages, batch_id, custom_json, full_json_dump
         ))
 
+        # 6. Populate Output Summary
         summary_results.append({
             "File Name": filename, "Vendor Name": raw_vendor, "Invoice #": extracted_data.invoice_number,
             "Variance": f"${variance:,.2f}", "Status": "✅ PASS" if status == "PASS" else "⚠️ NEEDS HUMAN REVIEW", 
             "Proc Time": f"{file_proc_time}s"
         })
         
+        # 7. Populate Output Details (UI Payload)
         def create_ui_row(page_num, material, desc, qty, uom, price, line_total):
             row = {
                 "File Name": filename, "Page #": page_num, "Original Supplier": orig_supp, 
@@ -163,6 +185,7 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
                 "Description": desc, "Qty": qty, "UOM": uom, "Price": price, "Line Total": line_total, 
                 "Inv# Conf": extracted_data.invoice_number_confidence, "Total Conf": extracted_data.total_amount_confidence, 
                 "Variance": variance, "Proc Time": f"{file_proc_time}s"
+                # Note: "Status" is intentionally excluded here to save payload size, as UI does not render it.
             }
             for col in list(custom_fields.keys()): row[col] = extracted_data.custom_fields.get(col, "Not Found")
             return row
@@ -182,6 +205,7 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
 
     return {"summary": summary_results, "details": detail_results, "total_file_pages": total_pages}
 
+
 def generate_excel_from_db(batch_id: str, custom_cols: list):
     os.makedirs(AUDIT_FOLDER, exist_ok=True)
     excel_path = os.path.join(AUDIT_FOLDER, f"{batch_id}.xlsx")
@@ -194,6 +218,7 @@ def generate_excel_from_db(batch_id: str, custom_cols: list):
 
     wb = openpyxl.Workbook()
     
+    # Excel Sheet 1: Details
     ws_details = wb.active
     ws_details.title = "Invoice Details"
     details_headers = [
@@ -248,6 +273,7 @@ def generate_excel_from_db(batch_id: str, custom_cols: list):
             if fee.get('fee_amount'):
                 ws_details.append(create_excel_row(None, "FEE", fee.get('fee_name'), None, None, None, None, fee.get('fee_amount'), None, None))
 
+    # Excel Sheet 2: QC Summary
     ws_qc = wb.create_sheet(title="QC Summary")
     qc_headers = [
         "file_name", "vendor_name", "original_supplier_name", "invoice_number", 
@@ -259,6 +285,7 @@ def generate_excel_from_db(batch_id: str, custom_cols: list):
     for _, row in df.iterrows():
         ws_qc.append([row.get(h, '') for h in qc_headers])
 
+    # Styling for Headers
     header_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
     header_font = Font(color="FFFFFF", bold=True)
     for sheet in [ws_details, ws_qc]:
