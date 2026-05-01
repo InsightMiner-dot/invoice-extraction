@@ -89,7 +89,8 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
     for img in base64_images:
         content_array.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}})
 
-    # 3. Call Azure OpenAI via Instructor
+    # 3. Call Azure OpenAI via Instructor (WITH STRICT LLM TIMERS)
+    llm_start_time = time.time()
     try:
         extracted_doc = await client.chat.completions.create(
             model=DEPLOYMENT, response_model=InvoiceDocument, 
@@ -97,6 +98,10 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
         )
     except Exception as e:
         return {"error": str(e), "filename": filename}
+
+    # Calculate exact LLM time and seconds per page
+    llm_total_time = round(time.time() - llm_start_time, 2)
+    sec_per_page = round(llm_total_time / total_pages, 2) if total_pages > 0 else llm_total_time
 
     file_proc_time = round(time.time() - start_time, 2)
     
@@ -169,11 +174,13 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
         )
         await asyncio.to_thread(insert_audit_record, audit_tuple)
 
-        # 6. Populate Output Summary
+        # 6. Populate Output Summary (Now includes LLM stats)
         summary_results.append({
             "File Name": filename, "Vendor Name": raw_vendor, "Invoice #": extracted_data.invoice_number,
             "Variance": f"${variance:,.2f}", "Status": "✅ PASS" if status == "PASS" else "⚠️ NEEDS HUMAN REVIEW", 
-            "Proc Time": f"{file_proc_time}s"
+            "Proc Time": f"{file_proc_time}s",
+            "LLM Time": f"{llm_total_time}s",
+            "Sec/Page": f"{sec_per_page}s"
         })
         
         # 7. Populate Output Details
