@@ -4,6 +4,7 @@ import time
 from datetime import datetime
 import re
 import json
+import asyncio
 from fuzzywuzzy import process
 from openai import AsyncAzureOpenAI
 import instructor
@@ -23,17 +24,15 @@ client = instructor.from_openai(AsyncAzureOpenAI(
     azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
     api_key=os.getenv("AZURE_OPENAI_API_KEY"),
     api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview"),
-    max_retries=3
+    max_retries=5
 ))
 DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 
-async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str, max_pages: int, dpi: int, aliases: dict, custom_fields: dict):
-    start_time = time.time()
-    
+# Threaded PDF to Base64 to prevent blocking
+def render_pdf_to_base64(file_bytes: bytes, max_pages: int, dpi: int):
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     base64_images = []
     raw_pdf_text_list = []
-    
     total_pages = len(doc)
     pages = min(total_pages, max_pages)
     
@@ -42,27 +41,39 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
         pix = page.get_pixmap(dpi=dpi)
         base64_images.append(base64.b64encode(pix.tobytes("jpeg")).decode('utf-8'))
         raw_pdf_text_list.append(page.get_text("text"))
+        del pix
         
     doc.close()
-    
-    clean_raw_text = re.sub(r'\s+', '', "".join(raw_pdf_text_list)).lower()
+    return base64_images, total_pages, "".join(raw_pdf_text_list)
 
-    sys_prompt = "Extract invoice data row by row. Start a new invoice record if invoice numbers change."
+async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str, max_pages: int, dpi: int, aliases: dict, custom_fields: dict):
+    start_time = time.time()
+    
+    # 1. Process PDF in background thread
+    base64_images, total_pages, raw_pdf_text = await asyncio.to_thread(
+        render_pdf_to_base64, file_bytes, max_pages, dpi
+    )
+    clean_raw_text = re.sub(r'\s+', '', raw_pdf_text).lower()
+
+    # 2. EXACT ORIGINAL SYSTEM PROMPT
+    system_prompt = "You are an expert accountant processing a document that may contain multiple distinct invoices. STRICT PAGING RULES: 1) If the same invoice number continues across multiple pages, combine all line items, taxes, and totals into a SINGLE invoice record. 2) If you see a NEW invoice number, start a NEW invoice record. CRITICAL RULE AGAINST DUPLICATES: Never extract the same tax or fee twice. ANTI-LAZINESS RULE: DO NOT BE LAZY. You must extract every single line item row by row."
+    
     if aliases:
         alias_str = "\n".join([f"- {k}: Also look for '{v}'" for k, v in aliases.items()])
-        sys_prompt += f"\n\nSTANDARD FIELD ALIASES:\n{alias_str}"
+        system_prompt += f"\n\nSTANDARD FIELD ALIASES:\n{alias_str}"
+        
     if custom_fields:
         rules_str = "\n".join([f"- Field Key: '{k}' | Definition & Aliases: {v}" for k, v in custom_fields.items()])
-        sys_prompt += f"\n\nSTRICT CUSTOM RULES:\n{rules_str}"
+        system_prompt += f"\n\nSTRICT CUSTOM RULES:\n{rules_str}"
 
-    content = [{"type": "text", "text": "Extract data. Note page numbers."}]
+    content_array = [{"type": "text", "text": "Extract data from this multi-page document. Evaluate confidence ('High', 'Medium', 'Low'). Note page numbers."}]
     for img in base64_images:
-        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}})
+        content_array.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}})
 
     try:
         extracted_doc = await client.chat.completions.create(
             model=DEPLOYMENT, response_model=InvoiceDocument, 
-            messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": content}]
+            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": content_array}]
         )
     except Exception as e:
         return {"error": str(e), "filename": filename}
@@ -77,66 +88,106 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
     summary_results = []
     detail_results = []
 
-    for inv in extracted_doc.invoices:
-        raw_vendor = inv.vendor_name
-        if master_list and raw_vendor not in ['N/A', 'ERROR', '']:
-            match = process.extractOne(raw_vendor, master_list)
-            orig_supp = match[0] if match and match[1] >= 95 else standardize_vendor(raw_vendor)
+    for extracted_data in extracted_doc.invoices:
+        raw_vendor = extracted_data.vendor_name
+        
+        # Original Supplier Matching
+        if master_list and raw_vendor and raw_vendor not in ['N/A', 'ERROR', '']:
+            match_result = process.extractOne(raw_vendor, master_list)
+            orig_supp = match_result[0] if match_result and match_result[1] >= 95 else standardize_vendor(raw_vendor)
         else:
             orig_supp = standardize_vendor(raw_vendor)
 
-        # --- UPDATED VARIANCE MATH ---
-        # Variance = Invoice Total - Sum of Line Totals
-        calc_line_sum = sum(item.line_total for item in inv.line_items if item.line_total is not None)
-        variance = round(inv.total_amount - calc_line_sum, 2)
+        # EXACT ORIGINAL MATH
+        calculated_line_sum = sum(item.line_total for item in extracted_data.line_items if item.line_total is not None)
+        safe_ship = extracted_data.shipping_handling or 0.0
+        safe_total_tax = sum(tax.tax_amount for tax in extracted_data.taxes if tax.tax_amount is not None)
+        safe_fees = sum(fee.fee_amount for fee in extracted_data.additional_fees if fee.fee_amount is not None)
+        
+        total_calculated = calculated_line_sum + safe_total_tax + safe_ship + safe_fees
+        variance = round(extracted_data.total_amount - total_calculated, 2)
 
-        reasons = []
-        if variance != 0.0: reasons.append(f"Math Variance of {variance}")
-        if inv.invoice_number and re.sub(r'\s+', '', inv.invoice_number).lower() not in clean_raw_text:
-            reasons.append("HALLUCINATION: Inv # not in doc")
+        # EXACT ORIGINAL REASON/STATUS LOGIC
+        hallucination_alert = False
+        if extracted_data.invoice_number:
+            clean_inv = re.sub(r'\s+', '', extracted_data.invoice_number).lower()
+            if clean_inv and clean_inv not in clean_raw_text:
+                hallucination_alert = True
+
+        review_reasons = []
+        unique_uoms = set()
         
-        needs_review = len(reasons) > 0
+        if variance != 0.0: review_reasons.append(f"Math Variance of {variance}")
+        if hallucination_alert: review_reasons.append("HALLUCINATION: Inv # not in doc")
+        if extracted_data.invoice_number_confidence == "Low": review_reasons.append("Low Conf: Invoice #")
+        if extracted_data.origin_confidence == "Low": review_reasons.append("Low Conf: Origin")
+        if extracted_data.destination_confidence == "Low": review_reasons.append("Low Conf: Destination")
+        if extracted_data.total_amount_confidence == "Low": review_reasons.append("Low Conf: Total Amount")
+        if len(extracted_data.line_items) == 0: review_reasons.append("Missing: 0 Line Items Found")
         
-        # --- UPDATED STATUS STRING ---
-        status = "NEEDS REVIEW" if needs_review else "PASS"
+        for item in extracted_data.line_items:
+            if item.uom: unique_uoms.add(item.uom)
+            if item.uom_confidence == "Low":
+                short_desc = item.description[:15] + "..." if item.description and len(item.description) > 15 else item.description
+                review_reasons.append(f"Low Conf: UOM on '{short_desc}'")
+
+        needs_review = len(review_reasons) > 0
+        status = "FAIL - NEEDS REVIEW" if needs_review else "PASS"
+        reasons_string = " | ".join(review_reasons) if needs_review else "N/A"
+        uom_string = ", ".join(list(unique_uoms)) if unique_uoms else "N/A"
         
-        custom_json = json.dumps(inv.custom_fields) if inv.custom_fields else "{}"
-        
-        line_items_list = []
-        for item in inv.line_items:
-            line_items_list.append({
-                "page_number": item.page_number, "material": item.material, "description": item.description,
-                "quantity": item.quantity, "uom": item.uom, "uom_confidence": item.uom_confidence,
-                "unit_price": item.unit_price, "line_total": item.line_total
-            })
-        line_items_json = json.dumps(line_items_list)
+        # ORIGINAL ORIGIN/DESTINATION FALLBACK LOGIC
+        first_line_orig = extracted_data.line_items[0].line_origin if len(extracted_data.line_items) > 0 else None
+        first_line_dest = extracted_data.line_items[0].line_destination if len(extracted_data.line_items) > 0 else None
+        qc_origin = first_line_orig if first_line_orig else extracted_data.origin
+        qc_dest = first_line_dest if first_line_dest else extracted_data.destination
+
+        # Serialize full JSON for robust Excel generation later
+        full_json_dump = extracted_data.model_dump_json()
+        custom_json = json.dumps(extracted_data.custom_fields) if extracted_data.custom_fields else "{}"
 
         insert_audit_record((
-            current_date, current_time, filename, raw_vendor, orig_supp, inv.vendor_address, inv.bill_to, inv.remit_to, inv.invoice_number, inv.date, inv.currency, 
-            str(inv.origin), None, None, str(inv.destination), None, None, inv.subtotal, inv.shipping_handling or 0.0, inv.total_amount, calc_line_sum, variance, 
-            inv.invoice_number_confidence, inv.origin_confidence, inv.destination_confidence, inv.total_amount_confidence, "N/A", status, " | ".join(reasons) if needs_review else "N/A", 
-            file_proc_time, total_pages, batch_id, custom_json, line_items_json
+            current_date, current_time, filename, raw_vendor, orig_supp, extracted_data.vendor_address, 
+            extracted_data.bill_to, extracted_data.remit_to, extracted_data.invoice_number, extracted_data.date, 
+            extracted_data.currency, str(qc_origin), None, None, str(qc_dest), None, None, 
+            extracted_data.subtotal, safe_ship, extracted_data.total_amount, total_calculated, variance, 
+            extracted_data.invoice_number_confidence, extracted_data.origin_confidence, 
+            extracted_data.destination_confidence, extracted_data.total_amount_confidence, uom_string, 
+            status, reasons_string, file_proc_time, total_pages, batch_id, custom_json, full_json_dump
         ))
 
         summary_results.append({
-            "File Name": filename, "Vendor Name": raw_vendor, "Invoice #": inv.invoice_number,
-            "Variance": f"${variance:,.2f}", "Status": "✅ PASS" if status == "PASS" else "⚠️ NEEDS REVIEW", 
-            "Proc Time": f"{file_proc_time}s", "Total Pages": total_pages
+            "File Name": filename, "Vendor Name": raw_vendor, "Invoice #": extracted_data.invoice_number,
+            "Variance": f"${variance:,.2f}", "Status": "✅ PASS" if status == "PASS" else "⚠️ FAIL", 
+            "Proc Time": f"{file_proc_time}s"
         })
         
-        custom_cols = list(custom_fields.keys())
-        for item in inv.line_items:
-            row_data = {
-                "File Name": filename, "Page #": item.page_number, "Vendor Name": raw_vendor, 
-                "Original Supplier": orig_supp, "Invoice Number": inv.invoice_number, "Material": item.material,
-                "Description": item.description, "Qty": item.quantity, "UOM": item.uom, "Price": item.unit_price, 
-                "Line Total": item.line_total, "Origin": inv.origin, "Dest": inv.destination,
-                "Inv# Conf": inv.invoice_number_confidence, "Total Conf": inv.total_amount_confidence, 
-                "Proc Time": f"{file_proc_time}s", "Status": "✅ PASS" if status == "PASS" else "⚠️ NEEDS REVIEW", "Variance": variance
+        # --- UI Details Table Generator ---
+        # Helper function replicating the exact original `create_row_dict`
+        def create_ui_row(page_num, material, desc, qty, uom, price, line_total):
+            row = {
+                "File Name": filename, "Page #": page_num, "Original Supplier": orig_supp, 
+                "Invoice Number": extracted_data.invoice_number, "Material": material,
+                "Description": desc, "Qty": qty, "UOM": uom, "Price": price, "Line Total": line_total, 
+                "Inv# Conf": extracted_data.invoice_number_confidence, "Total Conf": extracted_data.total_amount_confidence, 
+                "Variance": variance, "Proc Time": f"{file_proc_time}s", "Status": status
             }
-            for col in custom_cols:
-                row_data[col] = inv.custom_fields.get(col, "Not Found") if inv.custom_fields else "Not Found"
-            detail_results.append(row_data)
+            for col in list(custom_fields.keys()): row[col] = extracted_data.custom_fields.get(col, "Not Found")
+            return row
+
+        if len(extracted_data.line_items) == 0:
+            detail_results.append(create_ui_row(None, None, "NO ITEMS FOUND", None, None, None, 0.0))
+        else:
+            for item in extracted_data.line_items:
+                detail_results.append(create_ui_row(item.page_number, item.material, item.description, item.quantity, item.uom, item.unit_price, item.line_total))
+        
+        # Re-inject Taxes/Shipping/Fees visually for the UI Table
+        if safe_ship > 0:
+            detail_results.append(create_ui_row(None, "SHIPPING", extracted_data.shipping_name or "Shipping", None, None, None, safe_ship))
+        for tax in extracted_data.taxes:
+            if tax.tax_amount: detail_results.append(create_ui_row(None, "TAX", tax.tax_name, None, None, None, tax.tax_amount))
+        for fee in extracted_data.additional_fees:
+            if fee.fee_amount: detail_results.append(create_ui_row(None, "FEE", fee.fee_name, None, None, None, fee.fee_amount))
 
     return {"summary": summary_results, "details": detail_results, "total_file_pages": total_pages}
 
@@ -153,59 +204,81 @@ def generate_excel_from_db(batch_id: str, custom_cols: list):
 
     wb = openpyxl.Workbook()
     
-    # SHEET 1: LINE ITEMS
+    # EXACT ORIGINAL EXCEL SHEET HEADERS
     ws_details = wb.active
     ws_details.title = "Invoice Details"
-    
     details_headers = [
-        "File Name", "Page #", "Vendor Name", "Original Supplier Name", "Invoice Number", "Date", "Currency",
-        "Material", "Description", "Quantity", "UOM", "Unit Price", "Line Total",
-        "Subtotal", "Invoice Total", "Variance", "Inv# Conf", "Total Conf", "UOM Conf",
-        "Proc Time", "Status", "Reason for Review"
+        "File Name", "Page #", "Vendor Name", "Original Supplier Name", "Vendor Address", "Bill To", "Remit To",
+        "Origin", "Destination", "Invoice Number", "Date", "Currency", 
+        "Material", "Description", "Quantity", "UOM", "Unit Price", "Line Total", "Subtotal", "Invoice Total",
+        "Inv# Conf", "Origin Conf", "Dest Conf", "UOM Conf", "Total Conf", "Status", "Reason for Review"
     ]
     excel_headers = details_headers.copy()
     if custom_cols: excel_headers.extend(custom_cols)
     ws_details.append(excel_headers)
     
     for _, row in df.iterrows():
-        cf_data = {}
-        if 'custom_fields' in df.columns and pd.notna(row['custom_fields']):
-            try: cf_data = json.loads(row['custom_fields'])
-            except: pass
+        try:
+            full_data = json.loads(row['line_items']) # We saved the full dump here
+        except:
+            continue
             
-        if 'line_items' in df.columns and pd.notna(row['line_items']):
-            try:
-                line_items = json.loads(row['line_items'])
-                if not line_items: line_items = [{}] 
-            except: line_items = [{}]
-        else:
-            line_items = [{}]
-
-        for item in line_items:
-            base_row = [
-                row['file_name'], item.get('page_number', ''), row['vendor_name'], row['original_supplier_name'],
-                row['invoice_number'], row['invoice_date'], row['currency'],
-                item.get('material', ''), item.get('description', 'NO ITEMS FOUND'), item.get('quantity', ''),
-                item.get('uom', ''), item.get('unit_price', ''), item.get('line_total', ''),
-                row['subtotal'], row['extracted_total'], row['variance'], row['invoice_number_conf'], 
-                row['total_amount_conf'], item.get('uom_confidence', ''),
-                row['processing_time'], row['status'], row['reason_for_review']
+        def create_excel_row(page_num, material, desc, qty, uom, uom_conf, price, line_total, line_orig, line_dest):
+            final_orig = line_orig if line_orig else full_data.get('origin', '')
+            final_dest = line_dest if line_dest else full_data.get('destination', '')
+            base = [
+                row['file_name'], page_num, row['vendor_name'], row['original_supplier_name'],
+                full_data.get('vendor_address', ''), full_data.get('bill_to', ''), full_data.get('remit_to', ''),
+                final_orig, final_dest, row['invoice_number'], row['invoice_date'], row['currency'],
+                material, desc, qty, uom, price, line_total, row['subtotal'], row['extracted_total'],
+                row['invoice_number_conf'], row['origin_conf'], row['destination_conf'], uom_conf,
+                row['total_amount_conf'], row['status'], row['reason_for_review']
             ]
-            for col in custom_cols: base_row.append(cf_data.get(col, "Not Found"))
-            ws_details.append(base_row)
+            cf_dict = full_data.get('custom_fields', {})
+            for col in custom_cols: base.append(cf_dict.get(col, "Not Found"))
+            return base
 
-    # SHEET 2: QC SUMMARY (Variance is explicitly present here)
+        line_items = full_data.get('line_items', [])
+        if not line_items:
+            ws_details.append(create_excel_row(None, None, "NO ITEMS FOUND", None, None, None, None, 0.0, None, None))
+        else:
+            for item in line_items:
+                ws_details.append(create_excel_row(
+                    item.get('page_number'), item.get('material'), item.get('description'), item.get('quantity'),
+                    item.get('uom'), item.get('uom_confidence'), item.get('unit_price'), item.get('line_total'),
+                    item.get('line_origin'), item.get('line_destination')
+                ))
+        
+        # Inject Shipping, Taxes, Fees into Excel exactly like original
+        safe_ship = full_data.get('shipping_handling')
+        if safe_ship and float(safe_ship) > 0:
+            ws_details.append(create_excel_row(None, "SHIPPING", full_data.get('shipping_name') or "Shipping", None, None, None, None, float(safe_ship), None, None))
+            
+        for tax in full_data.get('taxes', []):
+            if tax.get('tax_amount'):
+                ws_details.append(create_excel_row(None, "TAX", tax.get('tax_name'), None, None, None, None, tax.get('tax_amount'), None, None))
+                
+        for fee in full_data.get('additional_fees', []):
+            if fee.get('fee_amount'):
+                ws_details.append(create_excel_row(None, "FEE", fee.get('fee_name'), None, None, None, None, fee.get('fee_amount'), None, None))
+
+    # EXACT ORIGINAL QC SUMMARY HEADERS
     ws_qc = wb.create_sheet(title="QC Summary")
-    qc_headers = ["file_name", "vendor_name", "invoice_number", "origin", "destination", "status", "extracted_total", "variance", "processing_time", "reason_for_review"]
-    ws_qc.append(qc_headers)
+    qc_headers = [
+        "file_name", "vendor_name", "original_supplier_name", "invoice_number", 
+        "origin", "destination", "status", "reason_for_review", 
+        "extracted_total", "calculated_sum", "variance"
+    ]
+    ws_qc.append(["File Name", "Vendor Name", "Original Supplier Name", "Invoice Number", "Origin", "Destination", "Status", "Reason for Review", "Extracted Total", "Calculated Sum", "Variance"])
+    
     for _, row in df.iterrows():
-        ws_qc.append([row[h] for h in qc_headers if h in df.columns])
+        ws_qc.append([row.get(h, '') for h in qc_headers])
 
     header_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
     header_font = Font(color="FFFFFF", bold=True)
     for sheet in [ws_details, ws_qc]:
         sheet.freeze_panes = "A2"
-        for cell in sheet[1]: cell.fill = header_fill; cell.font = header_font
+        for cell in sheet[1]: cell.fill = header_fill; cell.font = header_font; cell.alignment = Alignment(horizontal="center", vertical="center")
 
     wb.save(excel_path)
     return True
