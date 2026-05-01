@@ -5,8 +5,6 @@ from datetime import datetime
 import re
 import json
 import asyncio
-import io
-from PIL import Image
 from fuzzywuzzy import process
 from openai import AsyncAzureOpenAI
 import instructor
@@ -30,43 +28,36 @@ client = instructor.from_openai(AsyncAzureOpenAI(
 ))
 DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 
-# --- STABLE INGESTION (Everything converts to Base64 Images) ---
+# --- HYPER-OPTIMIZED INGESTION (Uses ONLY PyMuPDF for PDFs and Images) ---
 def render_file_to_base64(file_bytes: bytes, filename: str, max_pages: int, dpi: int):
     base64_images = []
     raw_pdf_text_list = []
-    total_pages = 1
     
+    # Map the extension for PyMuPDF
     ext = filename.split('.')[-1].lower()
+    if ext == 'jpg': ext = 'jpeg'
+    elif ext == 'tif': ext = 'tiff'
     
-    # 1. STRICTLY PDF LOGIC (Uses PyMuPDF to get images AND text)
-    if ext == 'pdf':
-        doc = fitz.open(stream=file_bytes, filetype="pdf")
-        total_pages = len(doc)
-        pages = min(total_pages, max_pages)
-        
-        for p in range(pages):
-            page = doc[p]
-            pix = page.get_pixmap(dpi=dpi)
-            base64_images.append(base64.b64encode(pix.tobytes("jpeg")).decode('utf-8'))
-            raw_pdf_text_list.append(page.get_text("text"))
-            del pix
-            
-        doc.close()
-        
-    # 2. STRICTLY IMAGE LOGIC (Uses Pillow safely)
-    elif ext in ['png', 'jpg', 'jpeg', 'tif', 'tiff']:
-        try:
-            img = Image.open(io.BytesIO(file_bytes))
-            if img.mode != 'RGB':
-                img = img.convert('RGB')
-                
-            img_byte_arr = io.BytesIO()
-            img.save(img_byte_arr, format='JPEG', quality=85)
-            
-            base64_images.append(base64.b64encode(img_byte_arr.getvalue()).decode('utf-8'))
-        except Exception as e:
-            print(f"Failed to process image {filename} with Pillow: {e}")
+    # Default to pdf if the extension is totally unknown
+    if ext not in ['pdf', 'png', 'jpeg', 'tiff']:
+        ext = 'pdf'
 
+    # PyMuPDF seamlessly opens PDFs AND Images!
+    doc = fitz.open(stream=file_bytes, filetype=ext)
+    total_pages = len(doc)
+    pages = min(total_pages, max_pages)
+    
+    for p in range(pages):
+        page = doc[p]
+        # alpha=False automatically strips transparency from PNGs, preventing JPEG crashes
+        pix = page.get_pixmap(dpi=dpi, alpha=False)
+        base64_images.append(base64.b64encode(pix.tobytes("jpeg")).decode('utf-8'))
+        
+        # This extracts text for PDFs. For images, it safely returns an empty string.
+        raw_pdf_text_list.append(page.get_text("text"))
+        del pix
+        
+    doc.close()
     return base64_images, total_pages, "".join(raw_pdf_text_list)
 
 
