@@ -21,6 +21,7 @@ async function fetchAPI(endpoint, options = {}) {
 // 2. SETTINGS TABLES LOGIC (ALIASES & CUSTOM)
 // ==========================================
 
+// Pre-defined list of your schema's standard fields for the dropdown menu
 const standardFields = [
     "invoice_number", "date", "vendor_name", "vendor_address", 
     "bill_to", "remit_to", "origin", "destination", "currency", 
@@ -35,6 +36,8 @@ function addRow(tableId) {
     const tr = document.createElement('tr');
     
     let keyHtml = "";
+    
+    // If it's the Alias table, generate a Dropdown (<select>)
     if (tableId === 'aliasTable') {
         let optionsHtml = standardFields.map(f => `<option value="${f}">${f}</option>`).join('');
         keyHtml = `<select style="width: 100%; box-sizing: border-box; padding: 5px;">
@@ -42,6 +45,7 @@ function addRow(tableId) {
                         ${optionsHtml}
                    </select>`;
     } else {
+        // If it's the Custom Field table, generate a standard text input
         keyHtml = `<input type="text" style="width: 100%; box-sizing: border-box; padding: 5px;" placeholder="New Field Name...">`;
     }
 
@@ -58,6 +62,7 @@ function getTableData(tableId) {
     const rows = document.querySelectorAll(`#${tableId} tbody tr`);
     if (rows) {
         rows.forEach(row => {
+            // Check for either a select dropdown OR a text input
             const keyElement = row.cells[0].querySelector('input, select');
             const valElement = row.cells[1].querySelector('input');
             
@@ -155,13 +160,15 @@ if (extractBtn) {
         try {
             if (errorBox) errorBox.style.display = 'none';
 
+            // 1. Check Files
             const fileInputElement = document.getElementById('pdfFiles');
             if (!fileInputElement || !fileInputElement.files || fileInputElement.files.length === 0) {
-                alert("❌ Please upload at least one file in Step 2.");
+                alert("❌ Please upload at least one PDF file in Step 2.");
                 return;
             }
             const files = Array.from(fileInputElement.files);
 
+            // 2. Gather Settings
             const maxPages = document.getElementById('configMaxPages').value || "15";
             const dpi = document.getElementById('configDPI').value || "150";
             const concurrencyLimit = parseInt(document.getElementById('configBatchSize').value) || 5; 
@@ -169,10 +176,12 @@ if (extractBtn) {
             const customFieldsDict = getTableData('customTable');
             const customColKeys = Object.keys(customFieldsDict);
 
+            // 3. Generate Dynamic Headers (Status column is intentionally excluded here per your request)
             let baseHeaders = `<th>File Name</th><th>Page #</th><th>Supplier</th><th>Inv #</th><th>Material</th><th>Description</th><th>Qty</th><th>UOM</th><th>Price</th><th>Line Total</th><th>Inv# Conf</th><th>Total Conf</th><th>Variance</th><th>Proc Time</th>`;
             customColKeys.forEach(col => { baseHeaders += `<th style="color: #3498db;">${col}</th>`; });
             if (headerRow) headerRow.innerHTML = baseHeaders;
 
+            // 4. Lock UI and Reset
             extractBtn.disabled = true;
             extractBtn.innerText = "⏳ Extracting... Please Wait";
             if (progContainer) progContainer.style.display = 'block';
@@ -187,11 +196,13 @@ if (extractBtn) {
             let totalPagesExtracted = 0;
             const batchId = "BATCH_" + Date.now();
             
+            // 5. Start Global Timer
             const startTime = Date.now();
             const timerInterval = setInterval(() => { 
                 if (progTimer) progTimer.innerText = `Time: ${Math.floor((Date.now() - startTime)/1000)}s`; 
             }, 1000);
 
+            // 6. THE CONCURRENT LOOP
             for (let i = 0; i < total; i += concurrencyLimit) {
                 const chunk = files.slice(i, i + concurrencyLimit);
                 if (progStats) progStats.innerText = `Extracting batch... (${processed} of ${total} finished)`;
@@ -214,9 +225,10 @@ if (extractBtn) {
                                 totalPagesExtracted += response.data.total_file_pages;
                             }
                             
+                            // Append to QC Summary (Status column is kept here)
                             if (summaryBody) {
                                 response.data.summary.forEach(row => {
-                                    // --- NEW STATUS CLASS CHECK ---
+                                    // Highlight red if it says NEEDS HUMAN REVIEW
                                     const statusClass = row["Status"].includes('NEEDS HUMAN REVIEW') ? 'status-fail' : 'status-pass';
                                     const tr = document.createElement('tr');
                                     tr.innerHTML = `<td>${row["File Name"]}</td><td>${row["Vendor Name"]}</td><td>${row["Invoice #"] || 'N/A'}</td><td>${row["Variance"]}</td><td>${row["Proc Time"]}</td><td class="${statusClass}">${row["Status"]}</td>`;
@@ -224,6 +236,7 @@ if (extractBtn) {
                                 });
                             }
                             
+                            // Append to Line Level Details (Status logic entirely removed)
                             if (detailsBody) {
                                 response.data.details.forEach(row => {
                                     let customCells = "";
@@ -259,9 +272,11 @@ if (extractBtn) {
                     if (progFill) progFill.style.width = `${(processed / total) * 100}%`;
                 });
 
+                // Wait for chunk to finish before moving to next batch
                 await Promise.all(chunkPromises);
             }
 
+            // 7. Cleanup & Trigger Excel
             clearInterval(timerInterval);
             const totalTimeSeconds = Math.floor((Date.now() - startTime) / 1000);
 
@@ -279,6 +294,7 @@ if (extractBtn) {
                 console.error("Excel generation failed on server", e);
             }
 
+            // 8. Finish UI Update
             if (progStats) progStats.innerText = "✅ Extraction Complete!";
             if (finalRunStats) {
                 finalRunStats.innerHTML = `📊 Batch Complete! &nbsp; | &nbsp; Total Files: ${total} &nbsp; | &nbsp; Total Pages: ${totalPagesExtracted} &nbsp; | &nbsp; Total Time: ${totalTimeSeconds}s`;
