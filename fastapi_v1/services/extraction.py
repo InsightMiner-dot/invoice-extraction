@@ -5,6 +5,8 @@ from datetime import datetime
 import re
 import json
 import asyncio
+import io
+from PIL import Image
 from fuzzywuzzy import process
 from openai import AsyncAzureOpenAI
 import instructor
@@ -28,35 +30,58 @@ client = instructor.from_openai(AsyncAzureOpenAI(
 ))
 DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 
-# Threaded PDF to Base64 to prevent blocking the main server thread
-def render_pdf_to_base64(file_bytes: bytes, max_pages: int, dpi: int):
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
+# --- INGESTION UPDATE: Threaded File to Base64 (Strictly splits PDF and Image processing) ---
+def render_file_to_base64(file_bytes: bytes, filename: str, max_pages: int, dpi: int):
     base64_images = []
     raw_pdf_text_list = []
-    total_pages = len(doc)
-    pages = min(total_pages, max_pages)
+    total_pages = 1
     
-    for p in range(pages):
-        page = doc[p]
-        pix = page.get_pixmap(dpi=dpi)
-        base64_images.append(base64.b64encode(pix.tobytes("jpeg")).decode('utf-8'))
-        raw_pdf_text_list.append(page.get_text("text"))
-        del pix
+    ext = filename.split('.')[-1].lower()
+    
+    # 1. STRICTLY PDF LOGIC (Uses PyMuPDF)
+    if ext == 'pdf':
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        total_pages = len(doc)
+        pages = min(total_pages, max_pages)
         
-    doc.close()
+        for p in range(pages):
+            page = doc[p]
+            pix = page.get_pixmap(dpi=dpi)
+            base64_images.append(base64.b64encode(pix.tobytes("jpeg")).decode('utf-8'))
+            raw_pdf_text_list.append(page.get_text("text"))
+            del pix
+            
+        doc.close()
+        
+    # 2. STRICTLY IMAGE LOGIC (Uses Pillow safely)
+    elif ext in ['png', 'jpg', 'jpeg', 'tif', 'tiff']:
+        try:
+            img = Image.open(io.BytesIO(file_bytes))
+            # Convert to RGB to prevent crashes from transparent PNGs or CMYK TIFFs
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+                
+            img_byte_arr = io.BytesIO()
+            img.save(img_byte_arr, format='JPEG', quality=85)
+            
+            base64_images.append(base64.b64encode(img_byte_arr.getvalue()).decode('utf-8'))
+            # Images don't have embedded text, so raw_pdf_text_list remains empty
+        except Exception as e:
+            print(f"Failed to process image {filename} with Pillow: {e}")
+
     return base64_images, total_pages, "".join(raw_pdf_text_list)
 
 
 async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str, max_pages: int, dpi: int, aliases: dict, custom_fields: dict):
     start_time = time.time()
     
-    # 1. Extract PDF Images & Text in background
+    # 1. Extract File in background (Now passes filename for the router)
     base64_images, total_pages, raw_pdf_text = await asyncio.to_thread(
-        render_pdf_to_base64, file_bytes, max_pages, dpi
+        render_file_to_base64, file_bytes, filename, max_pages, dpi
     )
-    clean_raw_text = re.sub(r'\s+', '', raw_pdf_text).lower()
+    clean_raw_text = re.sub(r'\s+', '', raw_pdf_text).lower() if raw_pdf_text else ""
 
-    # 2. Strict Anti-Hallucination System Prompt
+    # 2. Strict Anti-Hallucination System Prompt (UNTOUCHED)
     system_prompt = (
         "You are an expert accountant processing a document that may contain multiple distinct invoices. "
         "STRICT PAGING RULES: 1) If the same invoice number continues across multiple pages, combine all line items, taxes, and totals into a SINGLE invoice record. 2) If you see a NEW invoice number, start a NEW invoice record. "
@@ -79,7 +104,7 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
     for img in base64_images:
         content_array.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}})
 
-    # 3. Call Azure OpenAI via Instructor
+    # 3. Call Azure OpenAI via Instructor (UNTOUCHED)
     try:
         extracted_doc = await client.chat.completions.create(
             model=DEPLOYMENT, response_model=InvoiceDocument, 
@@ -98,18 +123,17 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
     summary_results = []
     detail_results = []
 
-    # 4. Process Each Extracted Invoice
+    # 4. Process Each Extracted Invoice (UNTOUCHED)
     for extracted_data in extracted_doc.invoices:
         raw_vendor = extracted_data.vendor_name
         
-        # Fuzzy Match Vendor
         if master_list and raw_vendor and raw_vendor not in ['N/A', 'ERROR', '']:
             match_result = process.extractOne(raw_vendor, master_list)
             orig_supp = match_result[0] if match_result and match_result[1] >= 95 else standardize_vendor(raw_vendor)
         else:
             orig_supp = standardize_vendor(raw_vendor)
 
-        # Variance Math (Line Items + Taxes + Shipping + Fees)
+        # Variance Math
         calculated_line_sum = sum(item.line_total for item in extracted_data.line_items if item.line_total is not None)
         safe_ship = extracted_data.shipping_handling or 0.0
         safe_total_tax = sum(tax.tax_amount for tax in extracted_data.taxes if tax.tax_amount is not None)
@@ -118,14 +142,13 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
         total_calculated = calculated_line_sum + safe_total_tax + safe_ship + safe_fees
         variance = round(extracted_data.total_amount - total_calculated, 2)
 
-        # Hallucination Check (Verify Invoice # against raw PDF text)
+        # Hallucination Check (Safely skips images since clean_raw_text is empty)
         hallucination_alert = False
-        if extracted_data.invoice_number:
+        if extracted_data.invoice_number and clean_raw_text:
             clean_inv = re.sub(r'\s+', '', extracted_data.invoice_number).lower()
             if clean_inv and clean_inv not in clean_raw_text:
                 hallucination_alert = True
 
-        # Generate Review Reasons
         review_reasons = []
         unique_uoms = set()
         
@@ -143,19 +166,16 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
                 short_desc = item.description[:15] + "..." if item.description and len(item.description) > 15 else item.description
                 review_reasons.append(f"Low Conf: UOM on '{short_desc}'")
 
-        # Set Status String
         needs_review = len(review_reasons) > 0
         status = "NEEDS HUMAN REVIEW" if needs_review else "PASS"
         reasons_string = " | ".join(review_reasons) if needs_review else "N/A"
         uom_string = ", ".join(list(unique_uoms)) if unique_uoms else "N/A"
         
-        # Determine Routing Fallbacks
         first_line_orig = extracted_data.line_items[0].line_origin if len(extracted_data.line_items) > 0 else None
         first_line_dest = extracted_data.line_items[0].line_destination if len(extracted_data.line_items) > 0 else None
         qc_origin = first_line_orig if first_line_orig else extracted_data.origin
         qc_dest = first_line_dest if first_line_dest else extracted_data.destination
 
-        # Serialize custom and raw data for Database
         full_json_dump = extracted_data.model_dump_json()
         custom_json = json.dumps(extracted_data.custom_fields) if extracted_data.custom_fields else "{}"
 
@@ -177,7 +197,7 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
             "Proc Time": f"{file_proc_time}s"
         })
         
-        # 7. Populate Output Details (UI Payload)
+        # 7. Populate Output Details
         def create_ui_row(page_num, material, desc, qty, uom, price, line_total):
             row = {
                 "File Name": filename, "Page #": page_num, "Original Supplier": orig_supp, 
@@ -185,7 +205,6 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
                 "Description": desc, "Qty": qty, "UOM": uom, "Price": price, "Line Total": line_total, 
                 "Inv# Conf": extracted_data.invoice_number_confidence, "Total Conf": extracted_data.total_amount_confidence, 
                 "Variance": variance, "Proc Time": f"{file_proc_time}s"
-                # Note: "Status" is intentionally excluded here to save payload size, as UI does not render it.
             }
             for col in list(custom_fields.keys()): row[col] = extracted_data.custom_fields.get(col, "Not Found")
             return row
@@ -218,7 +237,6 @@ def generate_excel_from_db(batch_id: str, custom_cols: list):
 
     wb = openpyxl.Workbook()
     
-    # Excel Sheet 1: Details
     ws_details = wb.active
     ws_details.title = "Invoice Details"
     details_headers = [
@@ -273,7 +291,6 @@ def generate_excel_from_db(batch_id: str, custom_cols: list):
             if fee.get('fee_amount'):
                 ws_details.append(create_excel_row(None, "FEE", fee.get('fee_name'), None, None, None, None, fee.get('fee_amount'), None, None))
 
-    # Excel Sheet 2: QC Summary
     ws_qc = wb.create_sheet(title="QC Summary")
     qc_headers = [
         "file_name", "vendor_name", "original_supplier_name", "invoice_number", 
@@ -285,7 +302,6 @@ def generate_excel_from_db(batch_id: str, custom_cols: list):
     for _, row in df.iterrows():
         ws_qc.append([row.get(h, '') for h in qc_headers])
 
-    # Styling for Headers
     header_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
     header_font = Font(color="FFFFFF", bold=True)
     for sheet in [ws_details, ws_qc]:
