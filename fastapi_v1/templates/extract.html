@@ -11,13 +11,13 @@
     <!-- novalidate prevents the browser from strictly blocking the DPI input -->
     <form id="uploadForm" novalidate>
         
-        <!-- STEP 1: CONFIGURATION (NOW AN EXPANDER) -->
+        <!-- STEP 1: CONFIGURATION (EXPANDER) -->
         <details open style="margin-bottom: 20px; padding: 15px; border: 1px solid #3498db; border-radius: 5px; background: #eaf2f8;">
             <summary style="font-weight: bold; cursor: pointer; color: #2980b9; font-size: 1.1rem; margin-top: 0; outline: none;">⚙️ Step 1: Configuration, Aliases & Custom Fields</summary>
             
             <div style="display: flex; gap: 20px; margin-top: 15px; flex-wrap: wrap;">
                 <div>
-                    <label><strong>Max Pages per PDF:</strong></label><br>
+                    <label><strong>Max Pages per Document:</strong></label><br>
                     <input type="number" id="configMaxPages" value="15" style="padding: 5px; width: 80px;">
                 </div>
                 <div>
@@ -56,10 +56,10 @@
             </div>
         </details>
 
-        <!-- STEP 2: UPLOAD FILES (PDF ONLY RESTORED) -->
+        <!-- --- INGESTION UPDATE: STEP 2 (SUPPORTS IMAGES & PDFS) --- -->
         <div style="margin-bottom: 20px; padding: 15px; border: 2px dashed #3498db; border-radius: 8px; background-color: #fafdff;">
-            <label style="font-weight: bold; font-size: 1.1rem; color: #2c3e50; display: block; margin-bottom: 10px;">📂 Step 2: Upload Invoice PDFs</label>
-            <input type="file" id="pdfFiles" name="files" multiple accept="application/pdf" style="width: 100%; cursor: pointer;">
+            <label style="font-weight: bold; font-size: 1.1rem; color: #2c3e50; display: block; margin-bottom: 10px;">📂 Step 2: Upload Invoices (PDF or Images)</label>
+            <input type="file" id="pdfFiles" name="files" multiple accept=".pdf, .png, .jpg, .jpeg, .tiff, .tif" style="width: 100%; cursor: pointer;">
         </div>
         
         <!-- STEP 3: VIEWER GRID (EXPANDER) -->
