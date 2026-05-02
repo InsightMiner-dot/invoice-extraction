@@ -188,31 +188,55 @@ if (extractBtn) {
         const errorBox = document.getElementById('errorAlertBox');
         const errorText = document.getElementById('errorAlertText');
 
+        let batchId = "BATCH_" + Date.now();
+        let customColKeys = [];
+        let processed = 0;
+        let totalPagesExtracted = 0;
+        let startTime = Date.now();
+        let timerInterval = null;
+        let isStopped = false;
+
+        // DYNAMIC STOP BUTTON CREATION
+        let stopBtn = document.getElementById('stopBtn');
+        if (!stopBtn) {
+            stopBtn = document.createElement('button');
+            stopBtn.id = 'stopBtn';
+            stopBtn.style = "background-color: #e74c3c; color: white; padding: 10px 15px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; margin-left: 10px;";
+            extractBtn.parentNode.insertBefore(stopBtn, extractBtn.nextSibling);
+        }
+        stopBtn.innerText = "🛑 Stop & Download Partial";
+        stopBtn.style.display = 'inline-block';
+        stopBtn.disabled = false;
+        
+        stopBtn.onclick = () => {
+            isStopped = true;
+            stopBtn.innerText = "⏳ Stopping after current batch...";
+            stopBtn.disabled = true;
+        };
+
         try {
             if (errorBox) errorBox.style.display = 'none';
 
-            // 1. Check Files
             const fileInputElement = document.getElementById('pdfFiles');
             if (!fileInputElement || !fileInputElement.files || fileInputElement.files.length === 0) {
                 alert("❌ Please upload at least one file in Step 2.");
+                stopBtn.style.display = 'none';
                 return;
             }
             const files = Array.from(fileInputElement.files);
 
-            // 2. Gather Settings
             const maxPages = document.getElementById('configMaxPages').value || "15";
             const dpi = document.getElementById('configDPI').value || "150";
-            const concurrencyLimit = parseInt(document.getElementById('configBatchSize').value) || 5; 
+            // Defaulting concurrency to 15
+            const concurrencyLimit = parseInt(document.getElementById('configBatchSize').value) || 15; 
             const aliasesDict = getTableData('aliasTable');
             const customFieldsDict = getTableData('customTable');
-            const customColKeys = Object.keys(customFieldsDict);
+            customColKeys = Object.keys(customFieldsDict);
 
-            // 3. Generate Dynamic Headers (Supplier column removed)
             let baseHeaders = `<th>File Name</th><th>Page #</th><th>Inv #</th><th>Material</th><th>Description</th><th>Qty</th><th>UOM</th><th>Price</th><th>Line Total</th><th>Inv# Conf</th><th>Total Conf</th><th>Variance</th><th>Proc Time</th>`;
             customColKeys.forEach(col => { baseHeaders += `<th style="color: #3498db;">${col}</th>`; });
             if (headerRow) headerRow.innerHTML = baseHeaders;
 
-            // 4. Lock UI and Reset
             extractBtn.disabled = true;
             extractBtn.innerText = "⏳ Extracting... Please Wait";
             if (progContainer) progContainer.style.display = 'block';
@@ -223,18 +247,18 @@ if (extractBtn) {
             if (progFill) progFill.style.width = '0%';
             
             const total = files.length;
-            let processed = 0;
-            let totalPagesExtracted = 0;
-            const batchId = "BATCH_" + Date.now();
             
-            // 5. Start Global Timer
-            const startTime = Date.now();
-            const timerInterval = setInterval(() => { 
+            timerInterval = setInterval(() => { 
                 if (progTimer) progTimer.innerText = `Time: ${Math.floor((Date.now() - startTime)/1000)}s`; 
             }, 1000);
 
-            // 6. THE CONCURRENT LOOP
+            // MAIN LOOP
             for (let i = 0; i < total; i += concurrencyLimit) {
+                if (isStopped) {
+                    if (progStats) progStats.innerText = `Extraction stopped by user. Saving ${processed} files...`;
+                    break;
+                }
+
                 const chunk = files.slice(i, i + concurrencyLimit);
                 if (progStats) progStats.innerText = `Extracting batch... (${processed} of ${total} finished)`;
                 
@@ -256,7 +280,6 @@ if (extractBtn) {
                                 totalPagesExtracted += response.data.total_file_pages;
                             }
                             
-                            // Append Summary (Now rendering LLM Time and Sec/Page)
                             if (summaryBody) {
                                 response.data.summary.forEach(row => {
                                     const statusClass = row["Status"].includes('NEEDS HUMAN REVIEW') ? 'status-fail' : 'status-pass';
@@ -275,7 +298,6 @@ if (extractBtn) {
                                 });
                             }
                             
-                            // Append Line Level Details (Supplier row logic removed)
                             if (detailsBody) {
                                 response.data.details.forEach(row => {
                                     let customCells = "";
@@ -313,40 +335,43 @@ if (extractBtn) {
                 await Promise.all(chunkPromises);
             }
 
-            // 7. Cleanup & Trigger Excel
-            clearInterval(timerInterval);
-            const totalTimeSeconds = Math.floor((Date.now() - startTime) / 1000);
-
-            if (progStats) progStats.innerText = "Generating Excel File...";
-            
-            const excelForm = new FormData();
-            excelForm.append('batch_id', batchId);
-            excelForm.append('custom_fields', JSON.stringify(customColKeys));
-            
-            try {
-                await fetchAPI('/api/generate-excel', { method: 'POST', body: excelForm });
-                const downloadBtn = document.getElementById('downloadExcelBtn');
-                if (downloadBtn) downloadBtn.href = `/api/download-excel/${batchId}`;
-            } catch(e) {
-                console.error("Excel generation failed on server", e);
-            }
-
-            // 8. Finish UI Update
-            if (progStats) progStats.innerText = "✅ Extraction Complete!";
-            if (finalRunStats) {
-                finalRunStats.innerHTML = `📊 Batch Complete! &nbsp; | &nbsp; Total Files: ${total} &nbsp; | &nbsp; Total Pages: ${totalPagesExtracted} &nbsp; | &nbsp; Total Time: ${totalTimeSeconds}s`;
-                finalRunStats.style.display = 'block';
-            }
-            if (resultsContainer) resultsContainer.style.display = 'block';
-            
-            extractBtn.innerText = "🚀 Step 4: Start Extraction";
-            extractBtn.disabled = false;
-
         } catch (fatalError) {
             if (errorText) errorText.innerText = `Critical UI Error: ${fatalError.message}`;
             if (errorBox) errorBox.style.display = 'block';
+        } finally {
+            // FAIL-SAFE EXCEL GENERATOR (Always runs, even if stopped or crashed mid-way)
+            clearInterval(timerInterval);
+            const totalTimeSeconds = Math.floor((Date.now() - startTime) / 1000);
+
+            if (processed > 0) {
+                if (progStats) progStats.innerText = "Generating Excel File for processed items...";
+                
+                const excelForm = new FormData();
+                excelForm.append('batch_id', batchId);
+                excelForm.append('custom_fields', JSON.stringify(customColKeys));
+                
+                try {
+                    await fetchAPI('/api/generate-excel', { method: 'POST', body: excelForm });
+                    const downloadBtn = document.getElementById('downloadExcelBtn');
+                    if (downloadBtn) downloadBtn.href = `/api/download-excel/${batchId}`;
+                } catch(e) {
+                    console.error("Excel generation failed on server", e);
+                }
+
+                if (progStats) progStats.innerText = isStopped ? "⚠️ Partial Extraction Complete!" : "✅ Extraction Complete!";
+                if (finalRunStats) {
+                    finalRunStats.innerHTML = `📊 Batch Complete! &nbsp; | &nbsp; Files Processed: ${processed} &nbsp; | &nbsp; Total Pages: ${totalPagesExtracted} &nbsp; | &nbsp; Total Time: ${totalTimeSeconds}s`;
+                    finalRunStats.style.display = 'block';
+                }
+                if (resultsContainer) resultsContainer.style.display = 'block';
+            } else {
+                if (progStats) progStats.innerText = "Extraction stopped before any files finished.";
+            }
+            
+            // Clean up UI buttons
             extractBtn.innerText = "🚀 Step 4: Start Extraction";
             extractBtn.disabled = false;
+            stopBtn.style.display = 'none';
         }
     });
 }
