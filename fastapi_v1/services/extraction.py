@@ -162,7 +162,6 @@ async def process_single_invoice(file_bytes: bytes, filename: str, batch_id: str
         custom_json = json.dumps(extracted_data.custom_fields) if extracted_data.custom_fields else "{}"
 
         # 5. Insert to SQLite Audit DB (Threaded to prevent blocking)
-        # Passing None for Original Supplier Name to match DB Schema securely
         audit_tuple = (
             current_date, current_time, filename, raw_vendor, None, extracted_data.vendor_address, 
             extracted_data.bill_to, extracted_data.remit_to, extracted_data.invoice_number, extracted_data.date, 
@@ -225,12 +224,12 @@ def generate_excel_from_db(batch_id: str, custom_cols: list):
     
     ws_details = wb.active
     ws_details.title = "Invoice Details"
-    # Original Supplier Name removed from headers
+    # REMOVED: "Status" and "Reason for Review" from line level headers
     details_headers = [
         "File Name", "Page #", "Vendor Name", "Vendor Address", "Bill To", "Remit To",
         "Origin", "Destination", "Invoice Number", "Date", "Currency", 
         "Material", "Description", "Quantity", "UOM", "Unit Price", "Line Total", "Subtotal", "Invoice Total",
-        "Inv# Conf", "Origin Conf", "Dest Conf", "UOM Conf", "Total Conf", "Status", "Reason for Review"
+        "Inv# Conf", "Origin Conf", "Dest Conf", "UOM Conf", "Total Conf"
     ]
     excel_headers = details_headers.copy()
     if custom_cols: excel_headers.extend(custom_cols)
@@ -243,13 +242,15 @@ def generate_excel_from_db(batch_id: str, custom_cols: list):
         def create_excel_row(page_num, material, desc, qty, uom, uom_conf, price, line_total, line_orig, line_dest):
             final_orig = line_orig if line_orig else full_data.get('origin', '')
             final_dest = line_dest if line_dest else full_data.get('destination', '')
+            
+            # REMOVED: status and reason_for_review from the line level export
             base = [
                 row['file_name'], page_num, row['vendor_name'],
                 full_data.get('vendor_address', ''), full_data.get('bill_to', ''), full_data.get('remit_to', ''),
                 final_orig, final_dest, row['invoice_number'], row['invoice_date'], row['currency'],
                 material, desc, qty, uom, price, line_total, row['subtotal'], row['extracted_total'],
                 row['invoice_number_conf'], row['origin_conf'], row['destination_conf'], uom_conf,
-                row['total_amount_conf'], row['status'], row['reason_for_review']
+                row['total_amount_conf']
             ]
             cf_dict = full_data.get('custom_fields', {})
             for col in custom_cols: base.append(cf_dict.get(col, "Not Found"))
@@ -279,7 +280,7 @@ def generate_excel_from_db(batch_id: str, custom_cols: list):
                 ws_details.append(create_excel_row(None, "FEE", fee.get('fee_name'), None, None, None, None, fee.get('fee_amount'), None, None))
 
     ws_qc = wb.create_sheet(title="QC Summary")
-    # Original Supplier Name removed from headers
+    # Status and Reason for Review safely kept here at the Summary level
     qc_headers = [
         "file_name", "vendor_name", "invoice_number", 
         "origin", "destination", "status", "reason_for_review", 
