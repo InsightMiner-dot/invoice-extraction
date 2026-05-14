@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- 1. THE EXACT REQUESTED SCHEMA ---
+# --- 1. SCHEMA ---
 class LineItem(BaseModel):
     material: Optional[str] = Field(None, description="Material ID, Item Code, or SKU")
     description: Optional[str] = Field(None, description="Description of the item/service")
@@ -84,14 +84,18 @@ def process_invoice(file_path: str):
     conf_resolver = ConfidenceMapper(result)
     page_count = len(result.pages) if result.pages else 1
 
-    # Step 2: Instructor Extraction with Guardrails
+    # Step 2: Instructor Extraction with Guardrails & Tax Logic
     print("Status: Extracting structured data via LLM...")
-    
     system_prompt = (
         "You are a strict data extraction engine for a financial system. "
         "GUARDRAILS: This document may contain noise such as attached receipts, "
         "marketing pages, or terms and conditions. IGNORE all noise. Extract data ONLY "
         "from the primary invoice document. Do not merge receipt data into the invoice. "
+        "CRITICAL RULE FOR CHARGES & TAXES: Any additional fees found outside the main table "
+        "(such as 'Tax', 'HST (On)', 'Freight Charge', 'Handling', or 'Special Charges') "
+        "MUST be extracted as separate rows and appended to the `line_items` array. "
+        "For these specific charge rows, put the name of the fee in the 'description' field "
+        "and the value in the 'amount' field. Leave material, quantity, and unit_price as NULL. "
         "If a field is not explicitly on the invoice, return NULL. Do not infer or calculate."
     )
 
@@ -107,7 +111,6 @@ def process_invoice(file_path: str):
 
     # Step 3: Archive the Markdown
     supplier_str = extracted_data.supplier_name or "Unknown_Supplier"
-    # Clean supplier name to make it a safe folder/file name
     safe_supplier = re.sub(r'[^\w\-_\. ]', '_', supplier_str).replace(' ', '_')
     date_str = datetime.datetime.now().strftime("%Y-%m-%d")
     
@@ -117,52 +120,93 @@ def process_invoice(file_path: str):
     
     with open(md_filename, "w", encoding="utf-8") as md_file:
         md_file.write(result.content)
-    print(f"Status: Markdown archived to {md_filename}")
 
-    # Step 4: Flatten the Data for CSV Export
+    # Step 4: Flatten the Data
     all_rows = []
+    header_data = {"file_name": file_name, "pages": page_count}
     
-    # 4A. Calculate confidence for Header/Invoice level fields
-    header_data = {
-        "file_name": file_name,
-        "pages": page_count
-    }
-    
-    # Extract everything EXCEPT the line items to build the header
     for field, value in extracted_data.model_dump(exclude={'line_items'}).items():
         header_data[field] = value
         header_data[f"{field}_conf"] = conf_resolver.get_phrase_confidence(value)
 
-    # 4B. Merge Header Data with Line Items
     if not extracted_data.line_items:
-        # If no line items were found, still return the header info
         all_rows.append(header_data)
     else:
         for item in extracted_data.line_items:
-            # Copy header data so it repeats for every line item row
             row_data = header_data.copy()
-            # Add line item specific fields and their confidence
             for field, value in item.model_dump().items():
                 row_data[field] = value
                 row_data[f"{field}_conf"] = conf_resolver.get_phrase_confidence(value)
             all_rows.append(row_data)
 
-    return pd.DataFrame(all_rows), extracted_data
+    df = pd.DataFrame(all_rows)
 
-# --- 4. EXECUTION ---
+    # --- NEW: STEP 5 - COLUMN REORDERING AND RENAMING ---
+    
+    # 5A. Define the exact Pythonic column order
+    base_order = [
+        "file_name", "supplier_name", "supplier_address", "invoice_number", 
+        "invoice_date", "remit_to", "shipper", "bill_to", "origin", 
+        "destination", "material", "description", "quantity", "uom", 
+        "unit_price", "amount", "subtotal", "invoice_total", "currency", "pages"
+    ]
+    
+    # Ensure all base columns exist to prevent KeyError
+    for col in base_order:
+        if col not in df.columns:
+            df[col] = None
+
+    # 5B. Extract all confidence columns (any column ending in _conf)
+    conf_cols = [col for col in df.columns if col.endswith('_conf')]
+    
+    # 5C. Reorder DataFrame: Base columns first, then confidence columns at the end
+    df = df[base_order + conf_cols]
+    
+    # 5D. Rename the columns to exactly match your requested UI string format
+    rename_map = {
+        "file_name": "File name",
+        "supplier_name": "Supplier name",
+        "supplier_address": "Supplier Address",
+        "invoice_number": "Invoice number",
+        "invoice_date": "Invoice date",
+        "remit_to": "Remit To (full address)",
+        "shipper": "Shipper(Full address)",
+        "bill_to": "Bill to(full address)",
+        "origin": "origin (full add)",
+        "destination": "Destination,(full address)",
+        "material": "Material",
+        "description": "Description",
+        "quantity": "Quantity",
+        "uom": "UOM",
+        "unit_price": "Unit Price",
+        "amount": "Amount",
+        "subtotal": "SubTotal",
+        "invoice_total": "Invoice Total",
+        "currency": "Currency",
+        "pages": "Pages"
+    }
+    
+    # Also rename the confidence columns so they match the newly capitalized names
+    # e.g., 'supplier_name_conf' becomes 'Supplier name_conf'
+    rename_conf_map = {f"{k}_conf": f"{v}_conf" for k, v in rename_map.items()}
+    rename_map.update(rename_conf_map)
+    
+    df = df.rename(columns=rename_map)
+
+    return df, extracted_data
+
+# --- 6. EXECUTION ---
 if __name__ == "__main__":
     FILE_PATH = "sample_invoice.pdf" 
     
     try:
         df, raw_obj = process_invoice(FILE_PATH)
         
-        print("\n--- EXTRACTION SUCCESS ---")
-        
         # Save to CSV
         safe_inv_num = raw_obj.invoice_number if raw_obj.invoice_number else "export"
         csv_filename = f"invoice_{safe_inv_num}.csv"
         df.to_csv(csv_filename, index=False)
-        print(f"✅ Tabular data saved to: {csv_filename}")
+        print(f"\n✅ Success! Data saved to: {csv_filename}")
         
     except Exception as e:
         print(f"Critical Error: {e}")
