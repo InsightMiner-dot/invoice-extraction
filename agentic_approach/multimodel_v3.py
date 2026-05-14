@@ -20,7 +20,6 @@ class LineItem(BaseModel):
     material: Optional[str] = Field(None, description="Material ID, Item Code, or SKU")
     description: Optional[str] = Field(None, description="Description of the item, service, or fee")
     quantity: Optional[float] = Field(None, description="Quantity")
-    # THE FIX: Explicitly forbid carrying over the UOM
     uom: Optional[str] = Field(None, description="Unit of Measure. Do NOT carry over from previous rows. Return NULL if missing on this specific line.")
     unit_price: Optional[float] = Field(None, description="Unit Price")
     amount: Optional[float] = Field(None, description="Line total amount")
@@ -102,7 +101,6 @@ def run_qc_checks(invoice_obj: UnifiedInvoice, conf_mapper: ConfidenceMapper) ->
 
 # --- 4. ASYNC EXTRACTION ENGINE ---
 async def process_single_invoice_async(file_path: str, di_client: DocumentIntelligenceClient, ai_client, semaphore: asyncio.Semaphore):
-    """Processes a single invoice asynchronously to enable fast batch processing."""
     
     async with semaphore:
         file_name = os.path.basename(file_path)
@@ -120,36 +118,35 @@ async def process_single_invoice_async(file_path: str, di_client: DocumentIntell
             conf_resolver = ConfidenceMapper(result)
             page_count = len(result.pages) if result.pages else 1
 
-            # Step 2: Instructor Extraction (Async)
+            # Step 2: Instructor Extraction (Strict Mode)
             system_prompt = (
-                "You are a strict data extraction engine for a financial system. "
+                "You are a strict, literal data extraction engine for a financial system. "
+                "ABSOLUTE RULE: ZERO INFERENCE AND ZERO HALLUCINATION. You must operate as a dumb copy-paste tool. "
+                "If a field is not explicitly physically printed on the document, you MUST return NULL. Do not guess, do not assume, do not calculate, and do not use outside knowledge. "
                 "GUARDRAILS: This document may contain noise such as attached receipts. IGNORE all noise. "
-                "MULTI-PAGE SCANNING: You must thoroughly scan ALL pages of the provided document text to find "
-                "the required fields, especially Origin, Destination, and other addresses. They may be located "
-                "at the very end of a multi-page document. "
+                "MULTI-PAGE SCANNING: You must thoroughly scan ALL pages of the document text to find "
+                "required fields (Origin, Destination). "
                 "ROW INDEPENDENCE: Treat every line item independently. DO NOT carry over, copy, or inherit values "
                 "(especially UOM or Quantities) from one row to the next. If a value is not explicitly printed on that specific line, return NULL. "
-                "RULE FOR CHARGES: Any additional fees (such as 'Tax', 'HST (On)', 'Freight') MUST be extracted "
-                "as separate rows and appended to the `line_items` array (put fee name in 'description', value in 'amount'). "
-                "CRITICAL RESTRICTION: DO NOT extract 'Subtotal', 'Total', 'Invoice Total', 'Amount Due', or 'Balance Due' "
-                "as line item rows! These final summation amounts must strictly remain ONLY in the `subtotal` and `invoice_total` "
-                "header fields. Do not add them to the `line_items` array. Do not infer or calculate missing fields."
+                "RULE FOR CHARGES: Additional fees ('Tax', 'Freight') MUST be extracted as separate rows ONLY IF they have an explicit monetary amount printed. "
+                "ANTI-CALCULATION GUARDRAIL: DO NOT calculate fees based on percentage notes (e.g., '3.5% convenience fee applies'). If a fee has no explicit dollar amount physically printed next to it, YOU MUST IGNORE IT. Do absolutely no math. "
+                "CRITICAL RESTRICTION: DO NOT extract 'Subtotal', 'Total', or 'Amount Due' as line items. They strictly belong in the header fields."
             )
 
             extracted_data = await ai_client.chat.completions.create(
                 model="gpt-4o-mini", 
                 response_model=UnifiedInvoice,
                 max_retries=3,
+                temperature=0.0, # THE FIX: Locks the model to the most probable, strict tokens
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": result.content}
                 ]
             )
 
-            # NEW: Step 2.5: Apply Quality Control Checks
+            # Step 2.5: Apply Quality Control Checks
             qc_results = run_qc_checks(extracted_data, conf_resolver)
             
-            # Create a summary row for the QC Sheet
             summary_row = {
                 "File Name": file_name,
                 "Invoice Number": extracted_data.invoice_number,
@@ -178,7 +175,6 @@ async def process_single_invoice_async(file_path: str, di_client: DocumentIntell
                 header_data[field] = value
                 header_data[f"{field}_conf"] = conf_resolver.get_phrase_confidence(value)
 
-            # Append QC status to detailed rows so it's visible on a row-by-row level as well
             header_data["qc_status"] = qc_results["qc_status"]
 
             if not extracted_data.line_items:
@@ -193,7 +189,7 @@ async def process_single_invoice_async(file_path: str, di_client: DocumentIntell
 
             df = pd.DataFrame(all_rows)
 
-            # Step 5: COLUMN REORDERING AND RENAMING (Now including qc_status)
+            # Step 5: COLUMN REORDERING AND RENAMING
             base_order = [
                 "file_name", "qc_status", "supplier_name", "supplier_address", "invoice_number", 
                 "invoice_date", "remit_to", "shipper", "bill_to", "origin", 
@@ -223,20 +219,16 @@ async def process_single_invoice_async(file_path: str, di_client: DocumentIntell
             df = df.rename(columns=rename_map)
 
             print(f"[{file_name}] ✅ Successfully extracted {len(all_rows)} rows. QC Status: {qc_results['qc_status']}")
-            
-            # RETURN BOTH DFS FOR MULTI-SHEET EXPORT
             return df, summary_row
             
         except Exception as e:
             print(f"[{file_name}] ❌ Failed: {str(e)}")
             return None
 
-
 # --- 5. BATCH PROCESSOR ORCHESTRATION ---
 async def process_folder_batch(input_folder: str, output_excel: str):
     print(f"\n--- Starting Batch Processing for folder: {input_folder} ---")
     
-    # 1. Gather Supported Files
     supported_extensions = ('.pdf', '.png', '.jpg', '.jpeg', '.tiff')
     files_to_process = [
         os.path.join(input_folder, f) for f in os.listdir(input_folder) 
@@ -249,7 +241,6 @@ async def process_folder_batch(input_folder: str, output_excel: str):
 
     print(f"Found {len(files_to_process)} documents. Initializing async clients...")
 
-    # 2. Initialize Async Clients
     di_client = DocumentIntelligenceClient(
         endpoint=os.getenv("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT"),
         credential=AzureKeyCredential(os.getenv("AZURE_DOCUMENT_INTELLIGENCE_KEY"))
@@ -263,20 +254,15 @@ async def process_folder_batch(input_folder: str, output_excel: str):
         )
     )
 
-    # 3. Setup Concurrency Limit
     semaphore = asyncio.Semaphore(5) 
     
-    # 4. Fire Async Tasks
     tasks = [
         process_single_invoice_async(file_path, di_client, ai_client, semaphore)
         for file_path in files_to_process
     ]
     
-    # 5. Gather Results
     results = await asyncio.gather(*tasks)
     
-    # 6. Merge & Export
-    # Unpack the tuples (df, summary_row) that process_single_invoice_async returns
     valid_dfs = [res[0] for res in results if res is not None]
     valid_summaries = [res[1] for res in results if res is not None]
     
@@ -284,17 +270,13 @@ async def process_folder_batch(input_folder: str, output_excel: str):
         master_df = pd.concat(valid_dfs, ignore_index=True)
         summary_df = pd.DataFrame(valid_summaries)
         
-        # EXPORT TO MULTI-SHEET EXCEL
         with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
-            # Sheet 1: The high-level QC pass/fail report
             summary_df.to_excel(writer, sheet_name='QC_Summary', index=False)
-            # Sheet 2: The standard flattened line items
             master_df.to_excel(writer, sheet_name='Line_Items_Details', index=False)
             
         print(f"\n✅ Batch Complete! Extracted a total of {len(master_df)} rows across {len(summary_df)} files.")
         print(f"✅ Master Excel Report saved to: {output_excel}")
         
-        # Quick terminal summary
         pass_count = len(summary_df[summary_df['QC Status'] == 'PASS'])
         review_count = len(summary_df[summary_df['QC Status'] == 'REVIEW'])
         print(f"📊 QC Report: {pass_count} Passed STP | {review_count} Flagged for Human Review")
@@ -305,13 +287,8 @@ async def process_folder_batch(input_folder: str, output_excel: str):
 
 # --- 6. EXECUTION ENTRY POINT ---
 if __name__ == "__main__":
-    # Point this to your folder full of invoices
     INPUT_DIRECTORY = "./invoice_batch"  
-    
-    # NOTE: Output must be .xlsx to support multiple sheets!
     MASTER_OUTPUT_EXCEL = "master_extracted_invoices.xlsx"
     
     os.makedirs(INPUT_DIRECTORY, exist_ok=True)
-    
-    # Execute the async event loop
     asyncio.run(process_folder_batch(INPUT_DIRECTORY, MASTER_OUTPUT_EXCEL))
