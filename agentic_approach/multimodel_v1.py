@@ -11,10 +11,9 @@ from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.ai.documentintelligence.models import AnalyzeDocumentRequest
 from dotenv import load_dotenv
 
-# Load credentials from .env file
 load_dotenv()
 
-# --- 1. SCHEMA (WITH TAG AUDITING & ANTI-LAZINESS) ---
+# --- 1. SCHEMA (Original, Clean Structure) ---
 class LineItem(BaseModel):
     material: Optional[str] = Field(None, description="Material ID, Item Code, or SKU")
     description: Optional[str] = Field(None, description="Description of the item/service/fee")
@@ -24,39 +23,21 @@ class LineItem(BaseModel):
     amount: Optional[float] = Field(None, description="Line total amount")
 
 class UnifiedInvoice(BaseModel):
-    # Anti-Laziness Anchor
-    total_rows_in_markdown: int = Field(description="Count the exact number of line item rows visible in the markdown table before extracting them.")
-    
     supplier_name: Optional[str] = Field(None, description="Name of the issuing vendor/supplier")
     supplier_address: Optional[str] = Field(None, description="Full address of the supplier")
-    
     invoice_number: Optional[str] = Field(None)
-    invoice_number_tag: Optional[str] = Field(None, description="The exact label found in text (e.g., 'Invoice No:', 'Bill #')")
-    
     invoice_date: Optional[str] = Field(None)
-    
     remit_to: Optional[str] = Field(None, description="Full address where payment should be sent")
-    remit_to_tag: Optional[str] = Field(None, description="The exact label found (e.g., 'Remit To:', 'Pay To:')")
-    
     shipper: Optional[str] = Field(None, description="Full address of the shipper")
-    shipper_tag: Optional[str] = Field(None, description="The exact label found (e.g., 'Shipper:', 'Consignor:')")
-    
     bill_to: Optional[str] = Field(None, description="Full address of the entity being billed")
-    bill_to_tag: Optional[str] = Field(None, description="The exact label found (e.g., 'Bill To:', 'Sold To:')")
-    
     origin: Optional[str] = Field(None, description="Full starting/origin address")
-    origin_tag: Optional[str] = Field(None, description="The exact label found (e.g., 'Origin:', 'Pickup:')")
-    
     destination: Optional[str] = Field(None, description="Full destination/delivery address")
-    destination_tag: Optional[str] = Field(None, description="The exact label found (e.g., 'Destination:', 'Delivery To:')")
-    
     subtotal: Optional[float] = Field(None)
     invoice_total: Optional[float] = Field(None, description="Grand total of the invoice")
     currency: Optional[str] = Field(None)
-    
     line_items: List[LineItem]
 
-# --- 2. CONFIDENCE RESOLVER (WORD-LEVEL) ---
+# --- 2. CONFIDENCE RESOLVER ---
 class ConfidenceMapper:
     def __init__(self, analyze_result):
         self.word_map = {}
@@ -91,7 +72,7 @@ def process_invoice(file_path: str):
         )
     )
 
-    # Step 1: Azure Layout (OCR to Markdown)
+    # Step 1: Azure Layout
     print(f"Status: Analyzing layout for {file_name}...")
     with open(file_path, "rb") as f:
         poller = di_client.begin_analyze_document(
@@ -103,25 +84,20 @@ def process_invoice(file_path: str):
     conf_resolver = ConfidenceMapper(result)
     page_count = len(result.pages) if result.pages else 1
 
-    # Step 2: Instructor Extraction with Balanced Guardrails
+    # Step 2: Instructor Extraction (Strict, Stable Prompt)
     print("Status: Extracting structured data via LLM...")
     system_prompt = (
         "You are a strict data extraction engine for a financial system. "
-        "GUARDRAILS: Ignore irrelevant noise like attached receipts or terms and conditions pages. "
-        "MULTI-PAGE ADDRESS RULE: The fields 'Remit To', 'Shipper', 'Bill To', 'Origin', and 'Destination' "
-        "may not be on the first page. You are authorized to scan ALL pages to find these specific fields, "
-        "but ONLY extract them if they are explicitly tagged or clearly identifiable (e.g., 'Remit To:', 'Consignee:'). "
+        "GUARDRAILS: This document may contain noise such as attached receipts. IGNORE all noise. "
         "RULE FOR CHARGES: Any additional fees (such as 'Tax', 'HST (On)', 'Freight') MUST be extracted "
         "as separate rows and appended to the `line_items` array (put fee name in 'description', value in 'amount'). "
-        "CRITICAL RESTRICTION: DO NOT extract 'Subtotal', 'Total', or 'Balance Due' as line item rows. "
-        "STRICT TABLE EXTRACTION: You must extract EVERY SINGLE ROW present in the "
-        "markdown table. Process it row-by-row and do NOT stop early. "
-        "NO HALLUCINATIONS: You must strictly avoid hallucinating. DO NOT invent, split, or duplicate rows. "
-        "The extracted line items must perfectly match the physical document."
+        "CRITICAL RESTRICTION: DO NOT extract 'Subtotal', 'Total', 'Invoice Total', 'Amount Due', or 'Balance Due' "
+        "as line item rows! These final summation amounts must strictly remain ONLY in the `subtotal` and `invoice_total` "
+        "header fields. Do not add them to the `line_items` array. Do not infer or calculate missing fields."
     )
 
     extracted_data = ai_client.chat.completions.create(
-        model="gpt-4o-mini", # Use gpt-4o for massive 50+ page documents if mini fails
+        model="gpt-4o-mini",
         response_model=UnifiedInvoice,
         max_retries=3,
         messages=[
@@ -129,8 +105,6 @@ def process_invoice(file_path: str):
             {"role": "user", "content": result.content}
         ]
     )
-    
-    print(f"Status: LLM counted {extracted_data.total_rows_in_markdown} rows in markdown and extracted {len(extracted_data.line_items)} line items.")
 
     # Step 3: Archive the Markdown
     supplier_str = extracted_data.supplier_name or "Unknown_Supplier"
@@ -143,14 +117,12 @@ def process_invoice(file_path: str):
     
     with open(md_filename, "w", encoding="utf-8") as md_file:
         md_file.write(result.content)
-    print(f"Status: Markdown archived to {md_filename}")
 
     # Step 4: Flatten the Data
     all_rows = []
     header_data = {"file_name": file_name, "pages": page_count}
     
-    exclude_fields = {'line_items', 'total_rows_in_markdown'}
-    for field, value in extracted_data.model_dump(exclude=exclude_fields).items():
+    for field, value in extracted_data.model_dump(exclude={'line_items'}).items():
         header_data[field] = value
         header_data[f"{field}_conf"] = conf_resolver.get_phrase_confidence(value)
 
@@ -168,15 +140,9 @@ def process_invoice(file_path: str):
 
     # Step 5: COLUMN REORDERING AND RENAMING
     base_order = [
-        "file_name", "supplier_name", "supplier_address", 
-        "invoice_number", "invoice_number_tag", 
-        "invoice_date", 
-        "remit_to", "remit_to_tag", 
-        "shipper", "shipper_tag", 
-        "bill_to", "bill_to_tag", 
-        "origin", "origin_tag", 
-        "destination", "destination_tag", 
-        "material", "description", "quantity", "uom", 
+        "file_name", "supplier_name", "supplier_address", "invoice_number", 
+        "invoice_date", "remit_to", "shipper", "bill_to", "origin", 
+        "destination", "material", "description", "quantity", "uom", 
         "unit_price", "amount", "subtotal", "invoice_total", "currency", "pages"
     ]
     
@@ -188,23 +154,10 @@ def process_invoice(file_path: str):
     df = df[base_order + conf_cols]
     
     rename_map = {
-        "file_name": "File name", 
-        "supplier_name": "Supplier name", 
-        "supplier_address": "Supplier Address",
-        "invoice_number": "Invoice number", 
-        "invoice_number_tag": "Invoice Number Tag",
-        "invoice_date": "Invoice date", 
-        "remit_to": "Remit To (full address)", 
-        "remit_to_tag": "Remit To Tag",
-        "shipper": "Shipper(Full address)", 
-        "shipper_tag": "Shipper Tag",
-        "bill_to": "Bill to(full address)", 
-        "bill_to_tag": "Bill To Tag",
-        "origin": "origin (full add)", 
-        "origin_tag": "Origin Tag",
-        "destination": "Destination,(full address)", 
-        "destination_tag": "Destination Tag",
-        "material": "Material", "description": "Description",
+        "file_name": "File name", "supplier_name": "Supplier name", "supplier_address": "Supplier Address",
+        "invoice_number": "Invoice number", "invoice_date": "Invoice date", "remit_to": "Remit To (full address)",
+        "shipper": "Shipper(Full address)", "bill_to": "Bill to(full address)", "origin": "origin (full add)",
+        "destination": "Destination,(full address)", "material": "Material", "description": "Description",
         "quantity": "Quantity", "uom": "UOM", "unit_price": "Unit Price", "amount": "Amount",
         "subtotal": "SubTotal", "invoice_total": "Invoice Total", "currency": "Currency", "pages": "Pages"
     }
@@ -220,15 +173,13 @@ if __name__ == "__main__":
     FILE_PATH = "sample_invoice.pdf" 
     
     try:
-        print(f"--- Starting Extraction Pipeline ---")
         df, raw_obj = process_invoice(FILE_PATH)
         
         # Save to CSV
         safe_inv_num = raw_obj.invoice_number if raw_obj.invoice_number else "export"
         csv_filename = f"invoice_{safe_inv_num}.csv"
         df.to_csv(csv_filename, index=False)
-        
-        print(f"\n✅ Success! Data perfectly flattened and saved to: {csv_filename}")
+        print(f"\n✅ Success! Data saved to: {csv_filename}")
         
     except Exception as e:
-        print(f"\n❌ Critical Error: {e}")
+        print(f"Critical Error: {e}")
