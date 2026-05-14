@@ -15,32 +15,34 @@ from dotenv import load_dotenv
 # Load credentials from .env file
 load_dotenv()
 
-# --- 1. SCHEMA (NATURAL ALIAS DESCRIPTIONS) ---
+# --- 1. SCHEMA (STRICTLY USER ALIASES ONLY) ---
 class LineItem(BaseModel):
-    material: Optional[str] = Field(None, description="Material ID, Item Code, SKU, Part No, or Product Code")
+    material: Optional[str] = Field(None, description="Material ID, Item Code, or SKU")
     description: Optional[str] = Field(None, description="Description of the item, service, or fee")
-    quantity: Optional[float] = Field(None, description="Quantity, Qty, Vol, or Weight")
-    uom: Optional[str] = Field(None, description="Unit of Measure, Unit, or Per")
-    unit_price: Optional[float] = Field(None, description="Unit Price, Rate, or Price/Unit")
-    amount: Optional[float] = Field(None, description="Line total amount, Ext Price, Line Total, or Net Amount")
+    quantity: Optional[float] = Field(None, description="Quantity")
+    uom: Optional[str] = Field(None, description="Unit of Measure")
+    unit_price: Optional[float] = Field(None, description="Unit Price")
+    amount: Optional[float] = Field(None, description="Line total amount")
 
 class UnifiedInvoice(BaseModel):
-    supplier_name: Optional[str] = Field(None, description="Name of the issuing vendor, supplier, Biller, or Merchant")
+    supplier_name: Optional[str] = Field(None, description="Name of the issuing vendor or supplier")
     supplier_address: Optional[str] = Field(None, description="Full complete supplier address")
     
-    invoice_number: Optional[str] = Field(None, description="Unique Invoice number, Inv no, Inv #, Invoice#, or Bill #")
-    invoice_date: Optional[str] = Field(None, description="Invoice date, Inv Date, Billing Date, or Date Issued")
+    # EXACT ALIASES AS REQUESTED
+    invoice_number: Optional[str] = Field(None, description="Unique Invoice number. Aliases: Inv no, Inv #")
+    invoice_date: Optional[str] = Field(None, description="Invoice date")
     
-    remit_to: Optional[str] = Field(None, description="Full complete 'Remit To', 'Pay To', or 'Remittance' address")
-    shipper: Optional[str] = Field(None, description="Full complete 'Shipper', 'Consignor', or 'Sender' address")
-    bill_to: Optional[str] = Field(None, description="Full complete 'Bill To', 'Sold To', 'Customer', or 'Billed To' address")
+    remit_to: Optional[str] = Field(None, description="Full complete 'Remit To' address")
+    shipper: Optional[str] = Field(None, description="Full complete 'Shipper' address")
+    bill_to: Optional[str] = Field(None, description="Full complete 'Bill To' address")
     
-    origin: Optional[str] = Field(None, description="Full complete 'Origin', 'Ship From', 'Pickup', or 'Generator' address")
-    destination: Optional[str] = Field(None, description="Full complete 'Destination', 'Consignee', 'Deliver To', 'Designated', or 'Ship To' address")
+    # EXACT ALIASES AS REQUESTED
+    origin: Optional[str] = Field(None, description="Full complete 'Origin' address. Aliases: Ship From, Pickup, Generator")
+    destination: Optional[str] = Field(None, description="Full complete 'Destination' address. Aliases: Consignee, Deliver To, Designated")
     
-    subtotal: Optional[float] = Field(None, description="Subtotal before tax, Total Before Tax, or Net Total")
-    invoice_total: Optional[float] = Field(None, description="Grand total of the invoice, Total Due, Balance Due, or Final Total")
-    currency: Optional[str] = Field(None, description="Currency code like USD, CAD, or INR")
+    subtotal: Optional[float] = Field(None, description="Subtotal before tax")
+    invoice_total: Optional[float] = Field(None, description="Grand total of the invoice")
+    currency: Optional[str] = Field(None, description="Currency code (e.g., USD, CAD)")
     
     line_items: List[LineItem]
 
@@ -86,6 +88,9 @@ async def process_single_invoice_async(file_path: str, di_client: DocumentIntell
             system_prompt = (
                 "You are a strict data extraction engine for a financial system. "
                 "GUARDRAILS: This document may contain noise such as attached receipts. IGNORE all noise. "
+                "MULTI-PAGE SCANNING: You must thoroughly scan ALL pages of the provided document text to find "
+                "the required fields, especially Origin, Destination, and other addresses. They may be located "
+                "at the very end of a multi-page document. "
                 "RULE FOR CHARGES: Any additional fees (such as 'Tax', 'HST (On)', 'Freight') MUST be extracted "
                 "as separate rows and appended to the `line_items` array (put fee name in 'description', value in 'amount'). "
                 "CRITICAL RESTRICTION: DO NOT extract 'Subtotal', 'Total', 'Invoice Total', 'Amount Due', or 'Balance Due' "
@@ -94,7 +99,7 @@ async def process_single_invoice_async(file_path: str, di_client: DocumentIntell
             )
 
             extracted_data = await ai_client.chat.completions.create(
-                model="gpt-4o-mini",
+                model="gpt-4o-mini", # Note: For highly complex multi-page files, gpt-4o performs cross-page scanning better than mini
                 response_model=UnifiedInvoice,
                 max_retries=3,
                 messages=[
@@ -135,7 +140,7 @@ async def process_single_invoice_async(file_path: str, di_client: DocumentIntell
 
             df = pd.DataFrame(all_rows)
 
-            # Step 5: COLUMN REORDERING AND RENAMING (Clean Headers)
+            # Step 5: COLUMN REORDERING AND RENAMING
             base_order = [
                 "file_name", "supplier_name", "supplier_address", "invoice_number", 
                 "invoice_date", "remit_to", "shipper", "bill_to", "origin", 
@@ -203,7 +208,7 @@ async def process_folder_batch(input_folder: str, output_csv: str):
         )
     )
 
-    # 3. Setup Concurrency Limit (Prevents API 429 Rate Limit errors)
+    # 3. Setup Concurrency Limit
     semaphore = asyncio.Semaphore(5) 
     
     # 4. Fire Async Tasks
