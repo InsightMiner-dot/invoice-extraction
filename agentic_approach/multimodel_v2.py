@@ -15,12 +15,13 @@ from dotenv import load_dotenv
 # Load credentials from .env file
 load_dotenv()
 
-# --- 1. SCHEMA (STRICTLY USER ALIASES ONLY) ---
+# --- 1. SCHEMA (STRICTLY USER ALIASES + ANTI-CARRY-OVER) ---
 class LineItem(BaseModel):
     material: Optional[str] = Field(None, description="Material ID, Item Code, or SKU")
     description: Optional[str] = Field(None, description="Description of the item, service, or fee")
     quantity: Optional[float] = Field(None, description="Quantity")
-    uom: Optional[str] = Field(None, description="Unit of Measure")
+    # THE FIX: Explicitly forbid carrying over the UOM
+    uom: Optional[str] = Field(None, description="Unit of Measure. Do NOT carry over from previous rows. Return NULL if missing on this specific line.")
     unit_price: Optional[float] = Field(None, description="Unit Price")
     amount: Optional[float] = Field(None, description="Line total amount")
 
@@ -28,7 +29,6 @@ class UnifiedInvoice(BaseModel):
     supplier_name: Optional[str] = Field(None, description="Name of the issuing vendor or supplier")
     supplier_address: Optional[str] = Field(None, description="Full complete supplier address")
     
-    # EXACT ALIASES AS REQUESTED
     invoice_number: Optional[str] = Field(None, description="Unique Invoice number. Aliases: Inv no, Inv #")
     invoice_date: Optional[str] = Field(None, description="Invoice date")
     
@@ -36,7 +36,6 @@ class UnifiedInvoice(BaseModel):
     shipper: Optional[str] = Field(None, description="Full complete 'Shipper' address")
     bill_to: Optional[str] = Field(None, description="Full complete 'Bill To' address")
     
-    # EXACT ALIASES AS REQUESTED
     origin: Optional[str] = Field(None, description="Full complete 'Origin' address. Aliases: Ship From, Pickup, Generator")
     destination: Optional[str] = Field(None, description="Full complete 'Destination' address. Aliases: Consignee, Deliver To, Designated")
     
@@ -85,12 +84,15 @@ async def process_single_invoice_async(file_path: str, di_client: DocumentIntell
             page_count = len(result.pages) if result.pages else 1
 
             # Step 2: Instructor Extraction (Async)
+            # THE FIX: Added the "ROW INDEPENDENCE" rule
             system_prompt = (
                 "You are a strict data extraction engine for a financial system. "
                 "GUARDRAILS: This document may contain noise such as attached receipts. IGNORE all noise. "
                 "MULTI-PAGE SCANNING: You must thoroughly scan ALL pages of the provided document text to find "
                 "the required fields, especially Origin, Destination, and other addresses. They may be located "
                 "at the very end of a multi-page document. "
+                "ROW INDEPENDENCE: Treat every line item independently. DO NOT carry over, copy, or inherit values "
+                "(especially UOM or Quantities) from one row to the next. If a value is not explicitly printed on that specific line, return NULL. "
                 "RULE FOR CHARGES: Any additional fees (such as 'Tax', 'HST (On)', 'Freight') MUST be extracted "
                 "as separate rows and appended to the `line_items` array (put fee name in 'description', value in 'amount'). "
                 "CRITICAL RESTRICTION: DO NOT extract 'Subtotal', 'Total', 'Invoice Total', 'Amount Due', or 'Balance Due' "
@@ -99,7 +101,7 @@ async def process_single_invoice_async(file_path: str, di_client: DocumentIntell
             )
 
             extracted_data = await ai_client.chat.completions.create(
-                model="gpt-4o-mini", # Note: For highly complex multi-page files, gpt-4o performs cross-page scanning better than mini
+                model="gpt-4o-mini", 
                 response_model=UnifiedInvoice,
                 max_retries=3,
                 messages=[
