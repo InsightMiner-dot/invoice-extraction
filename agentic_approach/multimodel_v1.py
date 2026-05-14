@@ -92,17 +92,18 @@ def process_invoice(file_path: str):
     # Step 2: Instructor Extraction with STRICT Guardrails
     print("Status: Extracting structured data via LLM...")
     system_prompt = (
-        "You are a strict data extraction engine for a financial system. "
-        "GUARDRAILS: This document may contain noise such as attached receipts or terms pages. IGNORE all noise. "
-        "RULE FOR CHARGES: Any additional fees (such as 'Tax', 'HST (On)', 'Freight') MUST be extracted "
-        "as separate rows and appended to the `line_items` array (put fee name in 'description', value in 'amount'). "
-        "CRITICAL RESTRICTION: DO NOT extract 'Subtotal', 'Total', 'Invoice Total', 'Amount Due', or 'Balance Due' "
-        "as line item rows! These final summation amounts must strictly remain ONLY in the `subtotal` and `invoice_total` "
-        "header fields. "
-        "CRITICAL RULE FOR TABLES (ANTI-LAZINESS): You MUST extract EVERY SINGLE ROW present in the markdown table. "
-        "Process the table row-by-row. DO NOT stop early. DO NOT truncate the output. If there are 40 rows in the "
-        "markdown, you must output 40 JSON objects. Failure to extract every row will cause critical financial calculation errors."
-    )
+            "You are a strict data extraction engine for a financial system. "
+            "GUARDRAILS: Ignore irrelevant noise like attached receipts or terms and conditions pages. "
+            "MULTI-PAGE ADDRESS RULE: The fields 'Remit To', 'Shipper', 'Bill To', 'Origin', and 'Destination' "
+            "may not be on the first page. You are authorized to scan ALL pages to find these specific fields, "
+            "but ONLY extract them if they are explicitly tagged or clearly identifiable (e.g., 'Remit To:', 'Consignee:'). "
+            "RULE FOR CHARGES: Any additional fees (such as 'Tax', 'HST (On)', 'Freight') MUST be extracted "
+            "as separate rows and appended to the `line_items` array (put fee name in 'description', value in 'amount'). "
+            "CRITICAL RESTRICTION: DO NOT extract 'Subtotal', 'Total', or 'Balance Due' as line item rows. "
+            "STRICT TABLE EXTRACTION (NO MISSING, NO INVENTING): You must extract EVERY SINGLE ROW present in the "
+            "markdown table. Process it row-by-row and do NOT stop early. HOWEVER, you must strictly avoid hallucinating. "
+            "DO NOT invent, split, or duplicate rows. The extracted line items must perfectly match the physical document."
+        )
 
     extracted_data = ai_client.chat.completions.create(
         model="gpt-4o-mini", # Switch to "gpt-4o" here if invoices are 50+ pages long
