@@ -11,9 +11,10 @@ from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.ai.documentintelligence.models import AnalyzeDocumentRequest
 from dotenv import load_dotenv
 
+# Load credentials from .env file
 load_dotenv()
 
-# --- 1. SCHEMA ---
+# --- 1. SCHEMA (WITH ANTI-LAZINESS COUNT TRICK) ---
 class LineItem(BaseModel):
     material: Optional[str] = Field(None, description="Material ID, Item Code, or SKU")
     description: Optional[str] = Field(None, description="Description of the item/service/fee")
@@ -23,6 +24,10 @@ class LineItem(BaseModel):
     amount: Optional[float] = Field(None, description="Line total amount")
 
 class UnifiedInvoice(BaseModel):
+    # The Anti-Laziness Anchor: Forces the LLM to count the rows before extracting them
+    total_rows_in_markdown: int = Field(
+        description="Count the exact number of line item rows visible in the markdown table before extracting them."
+    )
     supplier_name: Optional[str] = Field(None, description="Name of the issuing vendor/supplier")
     supplier_address: Optional[str] = Field(None, description="Full address of the supplier")
     invoice_number: Optional[str] = Field(None)
@@ -37,7 +42,7 @@ class UnifiedInvoice(BaseModel):
     currency: Optional[str] = Field(None)
     line_items: List[LineItem]
 
-# --- 2. CONFIDENCE RESOLVER ---
+# --- 2. CONFIDENCE RESOLVER (WORD-LEVEL) ---
 class ConfidenceMapper:
     def __init__(self, analyze_result):
         self.word_map = {}
@@ -72,7 +77,7 @@ def process_invoice(file_path: str):
         )
     )
 
-    # Step 1: Azure Layout
+    # Step 1: Azure Layout (OCR to Markdown)
     print(f"Status: Analyzing layout for {file_name}...")
     with open(file_path, "rb") as f:
         poller = di_client.begin_analyze_document(
@@ -84,20 +89,23 @@ def process_invoice(file_path: str):
     conf_resolver = ConfidenceMapper(result)
     page_count = len(result.pages) if result.pages else 1
 
-    # Step 2: Instructor Extraction with STRICT Negative Constraints
+    # Step 2: Instructor Extraction with STRICT Guardrails
     print("Status: Extracting structured data via LLM...")
     system_prompt = (
         "You are a strict data extraction engine for a financial system. "
-        "GUARDRAILS: This document may contain noise such as attached receipts. IGNORE all noise. "
+        "GUARDRAILS: This document may contain noise such as attached receipts or terms pages. IGNORE all noise. "
         "RULE FOR CHARGES: Any additional fees (such as 'Tax', 'HST (On)', 'Freight') MUST be extracted "
         "as separate rows and appended to the `line_items` array (put fee name in 'description', value in 'amount'). "
         "CRITICAL RESTRICTION: DO NOT extract 'Subtotal', 'Total', 'Invoice Total', 'Amount Due', or 'Balance Due' "
         "as line item rows! These final summation amounts must strictly remain ONLY in the `subtotal` and `invoice_total` "
-        "header fields. Do not add them to the `line_items` array. Do not infer or calculate missing fields."
+        "header fields. "
+        "CRITICAL RULE FOR TABLES (ANTI-LAZINESS): You MUST extract EVERY SINGLE ROW present in the markdown table. "
+        "Process the table row-by-row. DO NOT stop early. DO NOT truncate the output. If there are 40 rows in the "
+        "markdown, you must output 40 JSON objects. Failure to extract every row will cause critical financial calculation errors."
     )
 
     extracted_data = ai_client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4o-mini", # Switch to "gpt-4o" here if invoices are 50+ pages long
         response_model=UnifiedInvoice,
         max_retries=3,
         messages=[
@@ -105,6 +113,8 @@ def process_invoice(file_path: str):
             {"role": "user", "content": result.content}
         ]
     )
+
+    print(f"Status: LLM counted {extracted_data.total_rows_in_markdown} rows in markdown and extracted {len(extracted_data.line_items)} line items.")
 
     # Step 3: Archive the Markdown
     supplier_str = extracted_data.supplier_name or "Unknown_Supplier"
@@ -117,12 +127,15 @@ def process_invoice(file_path: str):
     
     with open(md_filename, "w", encoding="utf-8") as md_file:
         md_file.write(result.content)
+    print(f"Status: Markdown archived to {md_filename}")
 
     # Step 4: Flatten the Data
     all_rows = []
     header_data = {"file_name": file_name, "pages": page_count}
     
-    for field, value in extracted_data.model_dump(exclude={'line_items'}).items():
+    # Extract header fields (excluding line_items and our temporary count variable)
+    exclude_fields = {'line_items', 'total_rows_in_markdown'}
+    for field, value in extracted_data.model_dump(exclude=exclude_fields).items():
         header_data[field] = value
         header_data[f"{field}_conf"] = conf_resolver.get_phrase_confidence(value)
 
@@ -170,16 +183,19 @@ def process_invoice(file_path: str):
 
 # --- 6. EXECUTION ---
 if __name__ == "__main__":
+    # Replace with your test file path
     FILE_PATH = "sample_invoice.pdf" 
     
     try:
+        print(f"--- Starting Extraction Pipeline ---")
         df, raw_obj = process_invoice(FILE_PATH)
         
         # Save to CSV
         safe_inv_num = raw_obj.invoice_number if raw_obj.invoice_number else "export"
         csv_filename = f"invoice_{safe_inv_num}.csv"
         df.to_csv(csv_filename, index=False)
-        print(f"\n✅ Success! Data saved to: {csv_filename}")
+        
+        print(f"\n✅ Success! Data perfectly flattened and saved to: {csv_filename}")
         
     except Exception as e:
-        print(f"Critical Error: {e}")
+        print(f"\n❌ Critical Error: {e}")
