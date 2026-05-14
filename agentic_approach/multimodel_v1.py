@@ -3,64 +3,60 @@ import pandas as pd
 import instructor
 from openai import AzureOpenAI
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict
+from typing import List, Optional
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
-from azure.ai.documentintelligence.models import AnalyzeDocumentRequest, ContentFormat
+from azure.ai.documentintelligence.models import AnalyzeDocumentRequest
 from dotenv import load_dotenv
 
+# Load credentials from .env file
 load_dotenv()
 
-# --- 1. Dynamic Pydantic Schema ---
+# --- 1. THE DYNAMIC SCHEMA ---
+# This is the "Master Template". Add or remove fields here; 
+# the rest of the code adjusts automatically.
 class LineItem(BaseModel):
     description: Optional[str] = Field(None, description="Exact text of the item description")
-    qty: Optional[float] = Field(None, description="Quantity as written")
-    uom: Optional[str] = Field(None, description="Unit of measure")
-    amount: Optional[float] = Field(None, description="Line total")
-    charge_type: Optional[str] = Field(None, description="Transport/Rental specific category")
+    qty: Optional[float] = Field(None, description="Quantity")
+    uom: Optional[str] = Field(None, description="Unit of measure (e.g., kg, kwh)")
+    amount: Optional[float] = Field(None, description="Line total amount")
+    charge_type: Optional[str] = Field(None, description="Category: e.g., Freight, Rent, Energy")
 
 class UnifiedInvoice(BaseModel):
-    invoice_number: Optional[str] = None
-    vendor_name: Optional[str] = None
+    invoice_number: Optional[str] = Field(None, description="The unique ID of the invoice")
+    vendor_name: Optional[str] = Field(None, description="Name of the issuing company")
     line_items: List[LineItem]
 
-# --- 2. The Confidence Resolver Engine ---
+# --- 2. THE CONFIDENCE RESOLVER ---
+# Maps LLM strings back to Azure's Word-Level OCR confidence
 class ConfidenceMapper:
-    """Matches LLM output back to Azure OCR Confidence scores."""
     def __init__(self, analyze_result):
-        self.cell_map = {}
-        # We build a dictionary of {text: confidence} from the raw Azure tables
-        for table in analyze_result.tables:
-            for cell in table.cells:
-                # Clean text to ensure better matching
-                clean_text = cell.content.strip().lower()
-                self.cell_map[clean_text] = cell.confidence
+        self.word_map = {}
+        if analyze_result.pages:
+            for page in analyze_result.pages:
+                if page.words:
+                    for word in page.words:
+                        # Clean word for better matching
+                        clean_text = word.content.strip().lower()
+                        self.word_map[clean_text] = word.confidence
 
-    def get_conf(self, value):
-        if value is None: return 0.0
-        search_val = str(value).strip().lower()
-        # Returns the actual Azure confidence, or 0.5 if it's a partial match/hallucination
-        return self.cell_map.get(search_val, 0.5)
+    def get_phrase_confidence(self, value):
+        if value is None or str(value).strip() == "":
+            return 0.0
+        
+        search_vals = str(value).strip().lower().split()
+        confidences = [self.word_map.get(w, 0.5) for w in search_vals]
+        
+        return round(sum(confidences) / len(confidences), 2) if confidences else 0.5
 
-# --- 3. Main Extraction Logic ---
-def run_dynamic_extraction(file_path: str):
-    # A. Azure Document Intelligence (Layout)
+# --- 3. THE EXTRACTION ENGINE ---
+def process_invoice(file_path: str):
+    # A. Initialize Azure Clients
     di_client = DocumentIntelligenceClient(
-        endpoint=os.getenv("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT"), 
+        endpoint=os.getenv("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT"),
         credential=AzureKeyCredential(os.getenv("AZURE_DOCUMENT_INTELLIGENCE_KEY"))
     )
     
-    with open(file_path, "rb") as f:
-        poller = di_client.begin_analyze_document(
-            "prebuilt-layout", 
-            AnalyzeDocumentRequest(bytes_source=f.read()),
-            output_content_format=ContentFormat.MARKDOWN
-        )
-    result = poller.result()
-    markdown_content = result.content
-    conf_resolver = ConfidenceMapper(result)
-
-    # B. Instructor + Azure OpenAI
     ai_client = instructor.from_openai(
         AzureOpenAI(
             azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
@@ -69,55 +65,66 @@ def run_dynamic_extraction(file_path: str):
         )
     )
 
-    # STRICT INSTRUCTIONS to avoid LLM "filling in" data
+    # B. Step 1: Azure Layout (OCR to Markdown)
+    print(f"Status: Analyzing layout for {os.path.basename(file_path)}...")
+    with open(file_path, "rb") as f:
+        poller = di_client.begin_analyze_document(
+            "prebuilt-layout",
+            AnalyzeDocumentRequest(bytes_source=f.read()),
+            output_content_format="markdown" # Stable string literal
+        )
+    result = poller.result()
+    conf_resolver = ConfidenceMapper(result)
+
+    # C. Step 2: Instructor Extraction (LLM Reasoning)
+    print("Status: Extracting structured data via LLM...")
     extracted_data = ai_client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4o-mini", # Deployment name
         response_model=UnifiedInvoice,
+        max_retries=3,
         messages=[
             {
-                "role": "system", 
+                "role": "system",
                 "content": (
-                    "You are a strict data extraction engine. "
-                    "1. Extract ONLY information visible in the text. "
-                    "2. If a field is not explicitly stated, return NULL. "
-                    "3. DO NOT guess, calculate, or infer missing values. "
-                    "4. If a table row is incomplete, leave the missing columns as NULL."
+                    "Strictly extract visible text into the schema. "
+                    "Do NOT calculate totals. Do NOT fill in missing data. "
+                    "Return NULL for any field not explicitly present in the text."
                 )
             },
-            {"role": "user", "content": markdown_content}
+            {"role": "user", "content": result.content}
         ]
     )
 
-    # C. Dynamic DataFrame Generation with Real Confidence
-    rows = []
+    # D. Step 3: Dynamic DataFrame Creation
+    all_rows = []
     for item in extracted_data.line_items:
-        row_dict = {}
-        # Dynamically iterate through Pydantic fields (no hard-coding names)
-        for field_name, value in item.model_dump().items():
-            row_dict[field_name] = value
-            # Add the ACTUAL Azure confidence score for this specific cell
-            row_dict[f"{field_name}_conf"] = conf_resolver.get_conf(value)
-        rows.append(row_dict)
+        row_data = {}
+        # Dynamic loop through Pydantic fields to prevent hardcoding
+        for field, value in item.model_dump().items():
+            row_data[field] = value
+            # Calculate the ACTUAL OCR confidence for this specific value
+            row_data[f"{field}_conf"] = conf_resolver.get_phrase_confidence(value)
+        all_rows.append(row_data)
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(all_rows), extracted_data
 
-# --- 4. Execution ---
+# --- 4. EXECUTION ---
 if __name__ == "__main__":
-    # Ensure this file exists in your directory
-    FILE_TO_PROCESS = "test_invoice.pdf" 
+    # Path to your test file
+    FILE_PATH = "invoice_sample.pdf" 
     
     try:
-        final_df = run_dynamic_extraction(FILE_TO_PROCESS)
+        df, raw_obj = process_invoice(FILE_PATH)
         
-        # Displaying the result
-        print("\n--- DYNAMIC EXTRACTION WITH REAL CONFIDENCE ---")
-        # Format for better visibility in console
+        print("\n--- EXTRACTION RESULTS ---")
+        print(f"Vendor: {raw_obj.vendor_name}")
+        print(f"Invoice #: {raw_obj.invoice_number}")
+        print("-" * 30)
+        
+        # Display the DataFrame
         pd.set_option('display.max_columns', None)
         pd.set_option('display.width', 1000)
-        print(final_df)
-        
-        # Export for your UI
-        # final_df.to_csv("extraction_results.csv", index=False)
+        print(df)
         
     except Exception as e:
-        print(f"Error occurred: {e}")
+        print(f"Critical Error: {e}")
