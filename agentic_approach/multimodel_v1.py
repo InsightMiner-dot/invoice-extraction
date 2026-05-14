@@ -16,7 +16,7 @@ load_dotenv()
 # --- 1. SCHEMA ---
 class LineItem(BaseModel):
     material: Optional[str] = Field(None, description="Material ID, Item Code, or SKU")
-    description: Optional[str] = Field(None, description="Description of the item/service")
+    description: Optional[str] = Field(None, description="Description of the item/service/fee")
     quantity: Optional[float] = Field(None)
     uom: Optional[str] = Field(None, description="Unit of Measure")
     unit_price: Optional[float] = Field(None)
@@ -84,19 +84,16 @@ def process_invoice(file_path: str):
     conf_resolver = ConfidenceMapper(result)
     page_count = len(result.pages) if result.pages else 1
 
-    # Step 2: Instructor Extraction with Guardrails & Tax Logic
+    # Step 2: Instructor Extraction with STRICT Negative Constraints
     print("Status: Extracting structured data via LLM...")
     system_prompt = (
         "You are a strict data extraction engine for a financial system. "
-        "GUARDRAILS: This document may contain noise such as attached receipts, "
-        "marketing pages, or terms and conditions. IGNORE all noise. Extract data ONLY "
-        "from the primary invoice document. Do not merge receipt data into the invoice. "
-        "CRITICAL RULE FOR CHARGES & TAXES: Any additional fees found outside the main table "
-        "(such as 'Tax', 'HST (On)', 'Freight Charge', 'Handling', or 'Special Charges') "
-        "MUST be extracted as separate rows and appended to the `line_items` array. "
-        "For these specific charge rows, put the name of the fee in the 'description' field "
-        "and the value in the 'amount' field. Leave material, quantity, and unit_price as NULL. "
-        "If a field is not explicitly on the invoice, return NULL. Do not infer or calculate."
+        "GUARDRAILS: This document may contain noise such as attached receipts. IGNORE all noise. "
+        "RULE FOR CHARGES: Any additional fees (such as 'Tax', 'HST (On)', 'Freight') MUST be extracted "
+        "as separate rows and appended to the `line_items` array (put fee name in 'description', value in 'amount'). "
+        "CRITICAL RESTRICTION: DO NOT extract 'Subtotal', 'Total', 'Invoice Total', 'Amount Due', or 'Balance Due' "
+        "as line item rows! These final summation amounts must strictly remain ONLY in the `subtotal` and `invoice_total` "
+        "header fields. Do not add them to the `line_items` array. Do not infer or calculate missing fields."
     )
 
     extracted_data = ai_client.chat.completions.create(
@@ -141,9 +138,7 @@ def process_invoice(file_path: str):
 
     df = pd.DataFrame(all_rows)
 
-    # --- NEW: STEP 5 - COLUMN REORDERING AND RENAMING ---
-    
-    # 5A. Define the exact Pythonic column order
+    # Step 5: COLUMN REORDERING AND RENAMING
     base_order = [
         "file_name", "supplier_name", "supplier_address", "invoice_number", 
         "invoice_date", "remit_to", "shipper", "bill_to", "origin", 
@@ -151,46 +146,24 @@ def process_invoice(file_path: str):
         "unit_price", "amount", "subtotal", "invoice_total", "currency", "pages"
     ]
     
-    # Ensure all base columns exist to prevent KeyError
     for col in base_order:
         if col not in df.columns:
             df[col] = None
 
-    # 5B. Extract all confidence columns (any column ending in _conf)
     conf_cols = [col for col in df.columns if col.endswith('_conf')]
-    
-    # 5C. Reorder DataFrame: Base columns first, then confidence columns at the end
     df = df[base_order + conf_cols]
     
-    # 5D. Rename the columns to exactly match your requested UI string format
     rename_map = {
-        "file_name": "File name",
-        "supplier_name": "Supplier name",
-        "supplier_address": "Supplier Address",
-        "invoice_number": "Invoice number",
-        "invoice_date": "Invoice date",
-        "remit_to": "Remit To (full address)",
-        "shipper": "Shipper(Full address)",
-        "bill_to": "Bill to(full address)",
-        "origin": "origin (full add)",
-        "destination": "Destination,(full address)",
-        "material": "Material",
-        "description": "Description",
-        "quantity": "Quantity",
-        "uom": "UOM",
-        "unit_price": "Unit Price",
-        "amount": "Amount",
-        "subtotal": "SubTotal",
-        "invoice_total": "Invoice Total",
-        "currency": "Currency",
-        "pages": "Pages"
+        "file_name": "File name", "supplier_name": "Supplier name", "supplier_address": "Supplier Address",
+        "invoice_number": "Invoice number", "invoice_date": "Invoice date", "remit_to": "Remit To (full address)",
+        "shipper": "Shipper(Full address)", "bill_to": "Bill to(full address)", "origin": "origin (full add)",
+        "destination": "Destination,(full address)", "material": "Material", "description": "Description",
+        "quantity": "Quantity", "uom": "UOM", "unit_price": "Unit Price", "amount": "Amount",
+        "subtotal": "SubTotal", "invoice_total": "Invoice Total", "currency": "Currency", "pages": "Pages"
     }
     
-    # Also rename the confidence columns so they match the newly capitalized names
-    # e.g., 'supplier_name_conf' becomes 'Supplier name_conf'
     rename_conf_map = {f"{k}_conf": f"{v}_conf" for k, v in rename_map.items()}
     rename_map.update(rename_conf_map)
-    
     df = df.rename(columns=rename_map)
 
     return df, extracted_data
