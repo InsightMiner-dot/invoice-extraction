@@ -15,11 +15,12 @@ from dotenv import load_dotenv
 # --- OVERRIDE ENV VARIABLES ---
 load_dotenv(override=True)
 
-# --- 1. SCHEMA (STRICTLY USER ALIASES + ROW INDEPENDENCE) ---
+# --- 1. SCHEMA (STRICTLY USER ALIASES + ANTI-CARRY-OVER) ---
 class LineItem(BaseModel):
     material: Optional[str] = Field(None, description="Material ID, Item Code, or SKU")
     description: Optional[str] = Field(None, description="Description of the item, service, or fee")
     quantity: Optional[float] = Field(None, description="Quantity")
+    # THE FIX: Explicitly forbid carrying over the UOM
     uom: Optional[str] = Field(None, description="Unit of Measure. Do NOT carry over from previous rows. Return NULL if missing on this specific line.")
     unit_price: Optional[float] = Field(None, description="Unit Price")
     amount: Optional[float] = Field(None, description="Line total amount")
@@ -83,12 +84,12 @@ def run_qc_checks(invoice_obj: UnifiedInvoice, conf_mapper: ConfidenceMapper) ->
         if conf < threshold: reasons.append(f"Low Destination Confidence ({conf})")
 
     # C. Math Reconciliation Check
-    if invoice_obj.invoice_total and invoice_obj.line_items:
+    if invoice_obj.invoice_total is not None and invoice_obj.line_items:
         calc_total = sum([item.amount for item in invoice_obj.line_items if item.amount])
         # Margin of error of 0.05 for rounding differences
         if abs(calc_total - invoice_obj.invoice_total) > 0.05:
             reasons.append(f"Math Error: Lines sum to {calc_total}, Total is {invoice_obj.invoice_total}")
-    elif not invoice_obj.invoice_total:
+    elif invoice_obj.invoice_total is None:
         reasons.append("Missing Grand Total for Math Check")
 
     if reasons:
@@ -101,13 +102,14 @@ def run_qc_checks(invoice_obj: UnifiedInvoice, conf_mapper: ConfidenceMapper) ->
 
 # --- 4. ASYNC EXTRACTION ENGINE ---
 async def process_single_invoice_async(file_path: str, di_client: DocumentIntelligenceClient, ai_client, semaphore: asyncio.Semaphore):
+    """Processes a single invoice asynchronously to enable fast batch processing."""
     
     async with semaphore:
         file_name = os.path.basename(file_path)
         print(f"[{file_name}] Started processing...")
         
         try:
-            # 1. Azure Layout
+            # Step 1: Azure Layout (Async)
             with open(file_path, "rb") as f:
                 poller = await di_client.begin_analyze_document(
                     "prebuilt-layout",
@@ -118,17 +120,20 @@ async def process_single_invoice_async(file_path: str, di_client: DocumentIntell
             conf_resolver = ConfidenceMapper(result)
             page_count = len(result.pages) if result.pages else 1
 
-            # 2. Instructor LLM
+            # Step 2: Instructor Extraction (Async)
             system_prompt = (
                 "You are a strict data extraction engine for a financial system. "
                 "GUARDRAILS: This document may contain noise such as attached receipts. IGNORE all noise. "
-                "MULTI-PAGE SCANNING: You must thoroughly scan ALL pages to find required fields, especially "
-                "Origin, Destination, and other addresses. They may be located at the end of the document. "
+                "MULTI-PAGE SCANNING: You must thoroughly scan ALL pages of the provided document text to find "
+                "the required fields, especially Origin, Destination, and other addresses. They may be located "
+                "at the very end of a multi-page document. "
                 "ROW INDEPENDENCE: Treat every line item independently. DO NOT carry over, copy, or inherit values "
-                "(especially UOM or Quantities) from previous rows. If not explicitly on that line, return NULL. "
-                "RULE FOR CHARGES: Additional fees ('Tax', 'Freight') MUST be extracted as separate rows. "
-                "CRITICAL RESTRICTION: DO NOT extract 'Subtotal', 'Total', 'Invoice Total' as line item rows! "
-                "These summation amounts must strictly remain ONLY in the header fields."
+                "(especially UOM or Quantities) from one row to the next. If a value is not explicitly printed on that specific line, return NULL. "
+                "RULE FOR CHARGES: Any additional fees (such as 'Tax', 'HST (On)', 'Freight') MUST be extracted "
+                "as separate rows and appended to the `line_items` array (put fee name in 'description', value in 'amount'). "
+                "CRITICAL RESTRICTION: DO NOT extract 'Subtotal', 'Total', 'Invoice Total', 'Amount Due', or 'Balance Due' "
+                "as line item rows! These final summation amounts must strictly remain ONLY in the `subtotal` and `invoice_total` "
+                "header fields. Do not add them to the `line_items` array. Do not infer or calculate missing fields."
             )
 
             extracted_data = await ai_client.chat.completions.create(
@@ -140,11 +145,11 @@ async def process_single_invoice_async(file_path: str, di_client: DocumentIntell
                     {"role": "user", "content": result.content}
                 ]
             )
-            
-            # 3. Run Quality Control
+
+            # NEW: Step 2.5: Apply Quality Control Checks
             qc_results = run_qc_checks(extracted_data, conf_resolver)
             
-            # Create a summary row for this specific invoice
+            # Create a summary row for the QC Sheet
             summary_row = {
                 "File Name": file_name,
                 "Invoice Number": extracted_data.invoice_number,
@@ -153,7 +158,7 @@ async def process_single_invoice_async(file_path: str, di_client: DocumentIntell
                 "QC Reasons": qc_results["qc_reasons"]
             }
 
-            # 4. Archive the Markdown
+            # Step 3: Archive the Markdown
             supplier_str = extracted_data.supplier_name or "Unknown_Supplier"
             safe_supplier = re.sub(r'[^\w\-_\. ]', '_', supplier_str).replace(' ', '_')
             date_str = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -165,7 +170,7 @@ async def process_single_invoice_async(file_path: str, di_client: DocumentIntell
             with open(md_filename, "w", encoding="utf-8") as md_file:
                 md_file.write(result.content)
 
-            # 5. Flatten the Details Data
+            # Step 4: Flatten the Data
             all_rows = []
             header_data = {"file_name": file_name, "pages": page_count}
             
@@ -173,9 +178,9 @@ async def process_single_invoice_async(file_path: str, di_client: DocumentIntell
                 header_data[field] = value
                 header_data[f"{field}_conf"] = conf_resolver.get_phrase_confidence(value)
 
-            # Append QC data so it's also available on the detailed rows if needed
+            # Append QC status to detailed rows so it's visible on a row-by-row level as well
             header_data["qc_status"] = qc_results["qc_status"]
-            
+
             if not extracted_data.line_items:
                 all_rows.append(header_data)
             else:
@@ -188,26 +193,28 @@ async def process_single_invoice_async(file_path: str, di_client: DocumentIntell
 
             df = pd.DataFrame(all_rows)
 
-            # 6. Column Formatting
+            # Step 5: COLUMN REORDERING AND RENAMING (Now including qc_status)
             base_order = [
                 "file_name", "qc_status", "supplier_name", "supplier_address", "invoice_number", 
                 "invoice_date", "remit_to", "shipper", "bill_to", "origin", 
                 "destination", "material", "description", "quantity", "uom", 
                 "unit_price", "amount", "subtotal", "invoice_total", "currency", "pages"
             ]
+            
             for col in base_order:
-                if col not in df.columns: df[col] = None
+                if col not in df.columns:
+                    df[col] = None
 
             conf_cols = [col for col in df.columns if col.endswith('_conf')]
             df = df[base_order + conf_cols]
             
             rename_map = {
-                "file_name": "File name", "qc_status": "QC Status", "supplier_name": "Supplier name", 
-                "supplier_address": "Supplier Address", "invoice_number": "Invoice number", 
-                "invoice_date": "Invoice date", "remit_to": "Remit To", "shipper": "Shipper", 
-                "bill_to": "Bill To", "origin": "Origin", "destination": "Destination", 
-                "material": "Material", "description": "Description", "quantity": "Quantity", 
-                "uom": "UOM", "unit_price": "Unit Price", "amount": "Amount",
+                "file_name": "File name", "qc_status": "QC Status", "supplier_name": "Supplier name", "supplier_address": "Supplier Address",
+                "invoice_number": "Invoice number", "invoice_date": "Invoice date", 
+                "remit_to": "Remit To", "shipper": "Shipper", "bill_to": "Bill To", 
+                "origin": "Origin", "destination": "Destination", 
+                "material": "Material", "description": "Description",
+                "quantity": "Quantity", "uom": "UOM", "unit_price": "Unit Price", "amount": "Amount",
                 "subtotal": "SubTotal", "invoice_total": "Invoice Total", "currency": "Currency", "pages": "Pages"
             }
             
@@ -215,9 +222,9 @@ async def process_single_invoice_async(file_path: str, di_client: DocumentIntell
             rename_map.update(rename_conf_map)
             df = df.rename(columns=rename_map)
 
-            print(f"[{file_name}] ✅ Finished. Status: {qc_results['qc_status']}")
+            print(f"[{file_name}] ✅ Successfully extracted {len(all_rows)} rows. QC Status: {qc_results['qc_status']}")
             
-            # RETURN BOTH THE DATAFRAME AND THE SUMMARY ROW
+            # RETURN BOTH DFS FOR MULTI-SHEET EXPORT
             return df, summary_row
             
         except Exception as e:
@@ -229,13 +236,20 @@ async def process_single_invoice_async(file_path: str, di_client: DocumentIntell
 async def process_folder_batch(input_folder: str, output_excel: str):
     print(f"\n--- Starting Batch Processing for folder: {input_folder} ---")
     
+    # 1. Gather Supported Files
     supported_extensions = ('.pdf', '.png', '.jpg', '.jpeg', '.tiff')
-    files_to_process = [os.path.join(input_folder, f) for f in os.listdir(input_folder) if f.lower().endswith(supported_extensions)]
+    files_to_process = [
+        os.path.join(input_folder, f) for f in os.listdir(input_folder) 
+        if f.lower().endswith(supported_extensions)
+    ]
     
     if not files_to_process:
         print("No valid files found in the directory.")
         return
 
+    print(f"Found {len(files_to_process)} documents. Initializing async clients...")
+
+    # 2. Initialize Async Clients
     di_client = DocumentIntelligenceClient(
         endpoint=os.getenv("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT"),
         credential=AzureKeyCredential(os.getenv("AZURE_DOCUMENT_INTELLIGENCE_KEY"))
@@ -249,12 +263,20 @@ async def process_folder_batch(input_folder: str, output_excel: str):
         )
     )
 
+    # 3. Setup Concurrency Limit
     semaphore = asyncio.Semaphore(5) 
     
-    tasks = [process_single_invoice_async(f, di_client, ai_client, semaphore) for f in files_to_process]
+    # 4. Fire Async Tasks
+    tasks = [
+        process_single_invoice_async(file_path, di_client, ai_client, semaphore)
+        for file_path in files_to_process
+    ]
+    
+    # 5. Gather Results
     results = await asyncio.gather(*tasks)
     
-    # Separate the Details DataFrames and the Summary Rows
+    # 6. Merge & Export
+    # Unpack the tuples (df, summary_row) that process_single_invoice_async returns
     valid_dfs = [res[0] for res in results if res is not None]
     valid_summaries = [res[1] for res in results if res is not None]
     
@@ -262,30 +284,34 @@ async def process_folder_batch(input_folder: str, output_excel: str):
         master_df = pd.concat(valid_dfs, ignore_index=True)
         summary_df = pd.DataFrame(valid_summaries)
         
-        # --- EXCEL MULTI-SHEET EXPORT ---
+        # EXPORT TO MULTI-SHEET EXCEL
         with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
-            # Save the Summary to the first sheet
+            # Sheet 1: The high-level QC pass/fail report
             summary_df.to_excel(writer, sheet_name='QC_Summary', index=False)
-            # Save the Details to the second sheet
+            # Sheet 2: The standard flattened line items
             master_df.to_excel(writer, sheet_name='Line_Items_Details', index=False)
             
-        print(f"\n✅ Batch Complete! Extracted {len(master_df)} line items across {len(summary_df)} invoices.")
-        print(f"✅ Master Multi-Sheet Excel saved to: {output_excel}")
+        print(f"\n✅ Batch Complete! Extracted a total of {len(master_df)} rows across {len(summary_df)} files.")
+        print(f"✅ Master Excel Report saved to: {output_excel}")
         
-        # Print a quick terminal summary of the QC
+        # Quick terminal summary
         pass_count = len(summary_df[summary_df['QC Status'] == 'PASS'])
         review_count = len(summary_df[summary_df['QC Status'] == 'REVIEW'])
         print(f"📊 QC Report: {pass_count} Passed STP | {review_count} Flagged for Human Review")
     else:
-        print("\n❌ Batch failed: No data could be extracted.")
+        print("\n❌ Batch failed: No data could be extracted from any documents.")
         
     await di_client.close()
 
 # --- 6. EXECUTION ENTRY POINT ---
 if __name__ == "__main__":
+    # Point this to your folder full of invoices
     INPUT_DIRECTORY = "./invoice_batch"  
-    # Notice we changed the output to .xlsx
-    MASTER_OUTPUT_EXCEL = "master_extracted_invoices.xlsx" 
+    
+    # NOTE: Output must be .xlsx to support multiple sheets!
+    MASTER_OUTPUT_EXCEL = "master_extracted_invoices.xlsx"
     
     os.makedirs(INPUT_DIRECTORY, exist_ok=True)
+    
+    # Execute the async event loop
     asyncio.run(process_folder_batch(INPUT_DIRECTORY, MASTER_OUTPUT_EXCEL))
