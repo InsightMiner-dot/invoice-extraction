@@ -15,32 +15,32 @@ from dotenv import load_dotenv
 # Load credentials from .env file
 load_dotenv()
 
-# --- 1. SCHEMA (WITH ALIAS MAPPING) ---
+# --- 1. SCHEMA (NATURAL ALIAS DESCRIPTIONS) ---
 class LineItem(BaseModel):
-    material: Optional[str] = Field(None, description="Material ID, Item Code, or SKU. Aliases: Part No, Product Code.")
-    description: Optional[str] = Field(None, description="Description of the item/service/fee.")
-    quantity: Optional[float] = Field(None, description="Quantity. Aliases: Qty, Vol, Weight.")
-    uom: Optional[str] = Field(None, description="Unit of Measure. Aliases: Unit, Per.")
-    unit_price: Optional[float] = Field(None, description="Unit Price. Aliases: Rate, Price/Unit.")
-    amount: Optional[float] = Field(None, description="Line total amount. Aliases: Ext Price, Line Total, Net Amount.")
+    material: Optional[str] = Field(None, description="Material ID, Item Code, SKU, Part No, or Product Code")
+    description: Optional[str] = Field(None, description="Description of the item, service, or fee")
+    quantity: Optional[float] = Field(None, description="Quantity, Qty, Vol, or Weight")
+    uom: Optional[str] = Field(None, description="Unit of Measure, Unit, or Per")
+    unit_price: Optional[float] = Field(None, description="Unit Price, Rate, or Price/Unit")
+    amount: Optional[float] = Field(None, description="Line total amount, Ext Price, Line Total, or Net Amount")
 
 class UnifiedInvoice(BaseModel):
-    supplier_name: Optional[str] = Field(None, description="Name of the issuing vendor/supplier. Aliases: Vendor Name, Biller, Merchant.")
-    supplier_address: Optional[str] = Field(None, description="Full address of the supplier.")
+    supplier_name: Optional[str] = Field(None, description="Name of the issuing vendor, supplier, Biller, or Merchant")
+    supplier_address: Optional[str] = Field(None, description="Full complete supplier address")
     
-    invoice_number: Optional[str] = Field(None, description="The unique invoice number. Aliases: Inv no, Inv #, Invoice#, Bill #.")
-    invoice_date: Optional[str] = Field(None, description="Date of the invoice. Aliases: Inv Date, Billing Date, Date Issued.")
+    invoice_number: Optional[str] = Field(None, description="Unique Invoice number, Inv no, Inv #, Invoice#, or Bill #")
+    invoice_date: Optional[str] = Field(None, description="Invoice date, Inv Date, Billing Date, or Date Issued")
     
-    remit_to: Optional[str] = Field(None, description="Full address where payment should be sent. Aliases: Pay To, Remittance Address, Send Payment To.")
-    shipper: Optional[str] = Field(None, description="Full address of the shipper. Aliases: Shipper, Consignor, Sender.")
-    bill_to: Optional[str] = Field(None, description="Full address of the entity being billed. Aliases: Sold To, Customer, Billed To.")
+    remit_to: Optional[str] = Field(None, description="Full complete 'Remit To', 'Pay To', or 'Remittance' address")
+    shipper: Optional[str] = Field(None, description="Full complete 'Shipper', 'Consignor', or 'Sender' address")
+    bill_to: Optional[str] = Field(None, description="Full complete 'Bill To', 'Sold To', 'Customer', or 'Billed To' address")
     
-    origin: Optional[str] = Field(None, description="Full starting/origin address. Aliases: Ship From, Pickup, Generator, Origin.")
-    destination: Optional[str] = Field(None, description="Full destination/delivery address. Aliases: Consignee, Deliver To, Designated, Ship To, Final Destination.")
+    origin: Optional[str] = Field(None, description="Full complete 'Origin', 'Ship From', 'Pickup', or 'Generator' address")
+    destination: Optional[str] = Field(None, description="Full complete 'Destination', 'Consignee', 'Deliver To', 'Designated', or 'Ship To' address")
     
-    subtotal: Optional[float] = Field(None, description="Subtotal before tax. Aliases: Total Before Tax, Net Total.")
-    invoice_total: Optional[float] = Field(None, description="Grand total of the invoice. Aliases: Total Due, Balance Due, Final Total.")
-    currency: Optional[str] = Field(None, description="Currency code (e.g., USD, CAD, INR).")
+    subtotal: Optional[float] = Field(None, description="Subtotal before tax, Total Before Tax, or Net Total")
+    invoice_total: Optional[float] = Field(None, description="Grand total of the invoice, Total Due, Balance Due, or Final Total")
+    currency: Optional[str] = Field(None, description="Currency code like USD, CAD, or INR")
     
     line_items: List[LineItem]
 
